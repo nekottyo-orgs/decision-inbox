@@ -40,9 +40,61 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 
+JSON_TYPES = {str: 'string', list: 'array', dict: 'object', bool: 'boolean', int: 'number', float: 'number', type(None): 'null'}
+
+
+def field(kind=None, required=False, values=None, fields=None, nullable=False, note=''):
+    """項目の定義。kind は str / list / dict (None なら型を問わない)、fields は dict 自身か list の各要素が持つ項目"""
+    return {'kind': kind, 'required': required, 'values': values, 'fields': fields, 'nullable': nullable, 'note': note}
+
+
+def type_text(rule):
+    if rule['values']:
+        return ' / '.join(rule['values'])
+    text = JSON_TYPES.get(rule['kind'], '') if rule['kind'] else ''
+    if rule['fields'] is not None:
+        names = ', '.join(key + ('' if item['required'] else '?') + (': ' + type_text(item) if type_text(item) else '') for key, item in rule['fields'].items())
+        text = '{' + names + '}' if rule['kind'] is not list else '[{' + names + '}]'
+    return text + (' | null' if rule['nullable'] else '')
+
+
+def shape_problems(value, fields, path=''):
+    """型違い・必須欠落・未知の項目・許されない値を、見つけた分すべて文章で返す"""
+    if not isinstance(value, dict):
+        return [f"{path or 'JSON'} は {type_text(field(dict, fields=fields))} を指定してください (受け取った型: {JSON_TYPES.get(type(value), type(value).__name__)})"]
+    problems = []
+    for key, rule in fields.items():
+        here = f'{path}.{key}' if path else key
+        if key not in value:
+            if rule['required']:
+                problems.append(f'{here} は必須です' + (f' ({type_text(rule)})' if type_text(rule) else ''))
+            continue
+        item = value[key]
+        received = JSON_TYPES.get(type(item), type(item).__name__)
+        if item is None and rule['nullable']:
+            continue
+        if rule['values'] is not None:
+            if item not in rule['values']:
+                problems.append(f"{here} は {type_text(rule)} のいずれかを指定してください (受け取った型: {received}, 値: {json.dumps(item, ensure_ascii=False)[:40]})")
+        elif rule['kind'] and not isinstance(item, rule['kind']):
+            problems.append(f'{here} は {type_text(rule)} を指定してください (受け取った型: {received})')
+        elif rule['fields'] is not None and rule['kind'] is list:
+            for index, element in enumerate(item):
+                problems += shape_problems(element, rule['fields'], f'{here}[{index}]')
+        elif rule['fields'] is not None:
+            problems += shape_problems(item, rule['fields'], here)
+    problems += [f"{path + '.' if path else ''}{key} は未知の項目です (指定できるのは {', '.join(fields)})" for key in sorted(value.keys() - fields.keys())]
+    return problems
+
+
+def check_shape(value, fields):
+    problems = shape_problems(value, fields)
+    if problems:
+        raise AppError(400, 'JSON の項目を確認してください: ' + '; '.join(problems))
+
+
 def object_fields(value, required, optional=()):
-    if not isinstance(value, dict) or not set(required) <= value.keys() or value.keys() - set(required) - set(optional):
-        raise AppError(400, 'JSON の項目を確認してください')
+    check_shape(value, {**{key: field() for key in optional}, **{key: field(required=True) for key in required}})
 
 
 def text(value, name, maximum, empty=False):
@@ -67,15 +119,41 @@ def url(value, image=False):
     return value
 
 
+PRIORITIES = ('urgent', 'normal', 'later')
+LINK_KINDS = ('pr', 'issue', 'other')
+# add / POST /api/decisions / update が受ける項目。型・必須・許す値の検査と add --help の一覧は、どちらもこの表から作る。文字数や URL の形は validate_request が見る
+REQUEST_FIELDS = {
+    'title': field(str, True), 'source': field(str, True), 'reason': field(str, True),
+    'options': field(list, True, fields={key: field(str, True) for key in ('id', 'title', 'benefits', 'concerns')}, note='候補。id は重複しない値'),
+    'recommended': field(str, True, note='options のどれかの id'),
+    'recommendation': field(str, True),
+    'background': field(str), 'priority': field(str, values=PRIORITIES, note='既定 normal'), 'urgency_reason': field(str),
+    'deadline': field(str, nullable=True, note='timezone 付き ISO 8601'),
+    'links': field(list, fields={'url': field(str, True), 'label': field(str, True), 'kind': field(str, True, values=LINK_KINDS)}, note='url は http(s)'),
+    'files': field(list, fields={'path': field(str, True), 'label': field(str, True)}, note='path は .. を含まない絶対パス'),
+    'image': field(dict, nullable=True, fields={'url': field(str, True), 'alt': field(str, True)}),
+    'request_key': field(str, note='英数字と _ . : / -。元依頼ごとに一定にして、再送でも変えない'),
+}
+CHANGEABLE_FIELDS = tuple(key for key in REQUEST_FIELDS if key != 'request_key')
+ADD_EXAMPLE = {
+    'title': 'レビューの進め方を決める', 'source': 'frontdesk', 'reason': 'どちらで進めるかが決まらず作業が止まっている',
+    'options': [{'id': 'minimal', 'title': '影響範囲を限定する', 'benefits': '確認が早い', 'concerns': '追加作業が残る'}, {'id': 'full', 'title': 'まとめて対応する', 'benefits': '残作業が減る', 'concerns': '公開が遅れる'}],
+    'recommended': 'minimal', 'recommendation': '現在の作業への影響を抑えるため',
+}
+
+
+def add_help():
+    def lines(required):
+        return [f"  {key}: {type_text(rule)}" + (f"  ({rule['note']})" if rule['note'] else '') for key, rule in REQUEST_FIELDS.items() if rule['required'] is required]
+    return '\n'.join(['JSON の最上位は object。未知の項目は拒否する。型・必須・許す値の不正は、error に項目名・期待する型・受け取った型を全件並べる。文字数・件数・URL の形の不正は 1 件ずつ返す', '', '必須の項目:', *lines(True), '任意の項目:', *lines(False), '', '最小の例 (そのまま add を通る):', json.dumps(ADD_EXAMPLE, ensure_ascii=False, indent=2)])
+
+
 def validate_request(payload):
-    object_fields(payload, ('title', 'source', 'reason', 'options', 'recommended', 'recommendation'), ('background', 'priority', 'urgency_reason', 'deadline', 'links', 'files', 'image', 'request_key'))
+    check_shape(payload, REQUEST_FIELDS)
     item = {key: text(payload[key], key, maximum) for key, maximum in [('title', 200), ('source', 200), ('reason', 4000), ('recommendation', 4000)]}
     for key, maximum in [('background', 12000), ('urgency_reason', 2000)]:
         item[key] = text(payload.get(key, ''), key, maximum, empty=True)
-    priority = payload.get('priority', 'normal')
-    if priority not in ('urgent', 'normal', 'later'):
-        raise AppError(400, '優先度が不正です')
-    item['priority'] = priority
+    item['priority'] = payload.get('priority', 'normal')
     deadline = payload.get('deadline')
     if deadline is not None:
         text(deadline, 'deadline', 64)
@@ -88,44 +166,38 @@ def validate_request(payload):
             raise AppError(400, '期限は timezone 付き ISO 8601 で指定してください') from None
     item['deadline'] = deadline
     options = payload['options']
-    if not isinstance(options, list) or not 2 <= len(options) <= 8:
+    if not 2 <= len(options) <= 8:
         raise AppError(400, '候補は 2〜8 件を指定してください')
     ids = set()
     item['options'] = []
     for option in options:
-        object_fields(option, ('id', 'title', 'benefits', 'concerns'))
         identifier = text(option['id'], '候補 ID', 64)
         if not re.fullmatch(r'[A-Za-z0-9_-]+', identifier) or identifier in ids:
             raise AppError(400, '候補 ID が不正または重複しています')
         ids.add(identifier)
         item['options'].append({'id': identifier, 'title': text(option['title'], '候補名', 300), 'benefits': text(option['benefits'], '利点', 2000, empty=True), 'concerns': text(option['concerns'], '懸念', 2000, empty=True)})
-    if not isinstance(payload['recommended'], str) or payload['recommended'] not in ids:
+    if payload['recommended'] not in ids:
         raise AppError(400, '推奨候補が見つかりません')
     item['recommended'] = payload['recommended']
     links = payload.get('links', [])
-    if not isinstance(links, list) or len(links) > 20:
+    if len(links) > 20:
         raise AppError(400, '関連リンクは 20 件までです')
     item['links'] = []
     for link in links:
-        object_fields(link, ('url', 'label', 'kind'))
-        if link['kind'] not in ('pr', 'issue', 'other'):
-            raise AppError(400, 'リンクの種別が不正です')
         item['links'].append({'url': url(link['url']), 'label': text(link['label'], 'リンク名', 200), 'kind': link['kind']})
     files = payload.get('files', [])
-    if not isinstance(files, list) or len(files) > 20:
+    if len(files) > 20:
         raise AppError(400, 'ファイルは 20 件までです')
     # 中身や存在は読むときに見る。登録時に見ると、下書きを消した後の update や再送が通らなくなる
     if files:
         item['files'] = []
         for entry in files:
-            object_fields(entry, ('path', 'label'))
             path = text(entry['path'], 'ファイルのパス', 4096)
             if not path.startswith('/') or '..' in path.split('/'):
                 raise AppError(400, 'ファイルは .. を含まない絶対パスで指定してください')
             item['files'].append({'path': path, 'label': text(entry['label'], 'ファイル名', 200)})
     image = payload.get('image')
     if image is not None:
-        object_fields(image, ('url', 'alt'))
         image = {'url': url(image['url'], image=True), 'alt': text(image['alt'], '画像の説明', 1000)}
     item['image'] = image
     if 'request_key' in payload:
@@ -492,7 +564,7 @@ class Store:
         changes = payload['changes']
         if isinstance(changes, dict) and 'request_key' in changes:
             raise AppError(400, 'request_key は変更できません。別の依頼は新しい request_key で add してください')
-        object_fields(changes, (), ('title', 'source', 'reason', 'background', 'priority', 'urgency_reason', 'deadline', 'options', 'recommended', 'recommendation', 'links', 'files', 'image'))
+        object_fields(changes, (), CHANGEABLE_FIELDS)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
@@ -920,9 +992,10 @@ def main(argv=None):
     serve.add_argument('--port', type=int, default=4317)
     serve.add_argument('--demo', action='store_true')
     serve.add_argument('--files-root', action='append', help='判断の files を読める場所。繰り返し指定できる (既定は CUE_FILES_ROOT を : で区切ったもの、無ければ FILES_ROOTS)')
-    add = commands.add_parser('add')
-    add.add_argument('--file', type=Path, required=True)
-    listing = commands.add_parser('list')
+    epilog_format = argparse.RawDescriptionHelpFormatter
+    add = commands.add_parser('add', help='判断を登録する', formatter_class=epilog_format, epilog=add_help())
+    add.add_argument('--file', type=Path, required=True, help='登録する判断の JSON ファイル')
+    listing = commands.add_parser('list', help='判断の一覧を JSON で出す', formatter_class=epilog_format, epilog='出力は JSON の object で、配列ではない: {"decisions": [判断, ...], "demo": false}。jq なら .decisions[]\n判断は登録時の項目に id, created_at, answer (未回答は null), revision, withdrawn (取り下げ済みでなければ null) などが付く')
     listing.add_argument('--include-withdrawn', action='store_true')
     update = commands.add_parser('update', help='未回答の判断の内容を差し替える')
     update.add_argument('--id', required=True)
@@ -971,7 +1044,7 @@ def main(argv=None):
     task = commands.add_parser('task', help='依頼の進み具合を管理する')
     task_commands = task.add_subparsers(dest='task_command', required=True)
     for name in ('add', 'move', 'update', 'delete', 'list'):
-        sub = task_commands.add_parser(name)
+        sub = task_commands.add_parser(name, formatter_class=epilog_format, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
         if name != 'list':
             sub.add_argument('--id', required=True)
         if name == 'add':
