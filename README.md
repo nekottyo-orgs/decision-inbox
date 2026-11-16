@@ -130,7 +130,7 @@ python3 app.py claim --worker front-desk --lease-seconds 3600
 python3 app.py complete --id DECISION_ID --token CLAIM_TOKEN
 ```
 
-`add --help` に必須・任意の項目と型、最小の JSON 例が、`list --help` に出力の形があります。`list` は配列ではなく `{"decisions": [...]}` の object を返すので、jq では `.decisions[]` を使ってください。JSON が不正なときは、項目名・期待する型・受け取った型が `error` に全件出ます。
+`add --help` に必須・任意の項目と型、最小の JSON 例が、`list --help` に出力の形があります。`list` は配列ではなく `{"decisions": [...]}` の object を返すので、jq では `.decisions[]` を使ってください。JSON が不正なときは、型・必須・許す値の問題について項目名・期待する型・受け取った型が `error` に全件出ます (文字数・件数・URL の形の問題は 1 件ずつです)。
 
 Web で回答すると「処理待ち」になり、claim で「対応中」、complete で「完了」になります。回答内容・メモ・状態は SQLite に保存され、再読み込みや server 再起動後も残ります。二重回答は拒否し、上書きしません。API と任意画像・期限等の全 payload は [API.md](API.md) を参照してください。
 

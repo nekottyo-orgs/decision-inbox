@@ -145,7 +145,7 @@ ADD_EXAMPLE = {
 def add_help():
     def lines(required):
         return [f"  {key}: {type_text(rule)}" + (f"  ({rule['note']})" if rule['note'] else '') for key, rule in REQUEST_FIELDS.items() if rule['required'] is required]
-    return '\n'.join(['JSON の最上位は object。未知の項目は拒否する。不正なときは error に、項目名・期待する型・受け取った型を全件並べる', '', '必須の項目:', *lines(True), '任意の項目:', *lines(False), '', '最小の例 (そのまま add を通る):', json.dumps(ADD_EXAMPLE, ensure_ascii=False, indent=2)])
+    return '\n'.join(['JSON の最上位は object。未知の項目は拒否する。型・必須・許す値の不正は、error に項目名・期待する型・受け取った型を全件並べる。文字数・件数・URL の形の不正は 1 件ずつ返す', '', '必須の項目:', *lines(True), '任意の項目:', *lines(False), '', '最小の例 (そのまま add を通る):', json.dumps(ADD_EXAMPLE, ensure_ascii=False, indent=2)])
 
 
 def validate_request(payload):
@@ -992,10 +992,10 @@ def main(argv=None):
     serve.add_argument('--port', type=int, default=4317)
     serve.add_argument('--demo', action='store_true')
     serve.add_argument('--files-root', action='append', help='判断の files を読める場所。繰り返し指定できる (既定は CUE_FILES_ROOT を : で区切ったもの、無ければ FILES_ROOTS)')
-    raw = argparse.RawDescriptionHelpFormatter
-    add = commands.add_parser('add', help='判断を登録する', formatter_class=raw, epilog=add_help())
+    epilog_format = argparse.RawDescriptionHelpFormatter
+    add = commands.add_parser('add', help='判断を登録する', formatter_class=epilog_format, epilog=add_help())
     add.add_argument('--file', type=Path, required=True, help='登録する判断の JSON ファイル')
-    listing = commands.add_parser('list', help='判断の一覧を JSON で出す', formatter_class=raw, epilog='出力は JSON の object で、配列ではない: {"decisions": [判断, ...], "demo": false}。jq なら .decisions[]\n判断は登録時の項目に id, created_at, answer (未回答は null), revision, withdrawn (取り下げ済みでなければ null) などが付く')
+    listing = commands.add_parser('list', help='判断の一覧を JSON で出す', formatter_class=epilog_format, epilog='出力は JSON の object で、配列ではない: {"decisions": [判断, ...], "demo": false}。jq なら .decisions[]\n判断は登録時の項目に id, created_at, answer (未回答は null), revision, withdrawn (取り下げ済みでなければ null) などが付く')
     listing.add_argument('--include-withdrawn', action='store_true')
     update = commands.add_parser('update', help='未回答の判断の内容を差し替える')
     update.add_argument('--id', required=True)
@@ -1044,7 +1044,7 @@ def main(argv=None):
     task = commands.add_parser('task', help='依頼の進み具合を管理する')
     task_commands = task.add_subparsers(dest='task_command', required=True)
     for name in ('add', 'move', 'update', 'delete', 'list'):
-        sub = task_commands.add_parser(name, formatter_class=raw, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
+        sub = task_commands.add_parser(name, formatter_class=epilog_format, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
         if name != 'list':
             sub.add_argument('--id', required=True)
         if name == 'add':

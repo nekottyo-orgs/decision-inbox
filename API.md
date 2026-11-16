@@ -114,7 +114,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
 
-入力不正の `error` には、項目名・期待する型 (または許す値)・受け取った型を全件 `; ` 区切りで 1 本の文字列に並べます。先頭は `JSON の項目を確認してください: ` で、項目名は `links[0].kind` のように添字・入れ子つきです。例は `{"error":"JSON の項目を確認してください: links[0] は {url: string, label: string, kind: pr / issue / other} を指定してください (受け取った型: string)"}` です。`add` / `POST /api/decisions` / `update` のほか、claim / report などの入力も欠けた項目と未知の項目の名前を返します。
+入力不正のうち型・必須・未知の項目・許す値の問題は、項目名・期待する型 (または許す値)・受け取った型を全件 `; ` 区切りで 1 本の `error` に並べる。先頭は `JSON の項目を確認してください: ` で、項目名は `links[0].kind` のように添字・入れ子つき。例は `{"error":"JSON の項目を確認してください: links[0] は {url: string, label: string, kind: pr / issue / other} を指定してください (受け取った型: string)"}`。文字数・件数・URL の形・deadline・recommended の不正は従来どおり 1 件ずつ返す。`add` / `POST /api/decisions` / `update` のほか、claim / report などの入力も欠けた項目と未知の項目の名前を返す。
 
 `tui` は対話端末で同じ Store を利用し、選択した回答を既存の回答保存処理に渡す。非 TTY では DB を作らずエラー終了。`--web-url` / `CUE_WEB_URL` は任意で loopback の http(s) URL のみ。Web の `?decision=<id>` は対象の未判断または判断済みを初期表示し、不明な ID では通常の優先度順表示になる。
 
