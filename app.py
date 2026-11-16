@@ -631,6 +631,22 @@ class Store:
             connection.execute("UPDATE decisions SET status='pending',reason='',next_step='',reported_at=NULL WHERE id=?", (identifier,))
         return self.get(identifier)
 
+    def close(self, identifier, payload):
+        # 終端は completed を流用する。status の CHECK を変えると旧 release が開けなくなるため。
+        # 閉じた判断は reason / reported_at が残ったままの completed で、通常の完了 (reason 空) と見分けられる。
+        object_fields(payload, ('decided_at', 'reported_at'))
+        decided_at = text(payload['decided_at'], 'decided_at', 64)
+        reported_at = text(payload['reported_at'], 'reported_at', 64)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            self.public(row, [])
+            if row['status'] not in ('blocked', 'failed') or row['decided_at'] != decided_at or row['reported_at'] != reported_at:
+                raise AppError(409, '停止理由が変更済み、または閉じられない状態です')
+            self.record(connection, row, 'close')
+            connection.execute("UPDATE decisions SET status='completed' WHERE id=?", (identifier,))
+        return self.get(identifier)
+
     def renew(self, identifier, payload):
         object_fields(payload, ('token',), ('lease_seconds',))
         seconds = validate_lease(payload.get('lease_seconds', 300))
@@ -768,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
                         # null を未指定扱いにすると全件 claim になり、絞り込みが黙って外れる
                         raise AppError(400, 'key_prefix は文字列で指定してください')
                     return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300), payload.get('key_prefix')))
-                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew|update|withdraw)', path)
+                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|close|renew|update|withdraw)', path)
                 if match:
                     if match[2] == 'complete':
                         object_fields(payload, ('token',))
@@ -942,6 +958,10 @@ def main(argv=None):
     retry.add_argument('--id', required=True)
     retry.add_argument('--decided-at', required=True)
     retry.add_argument('--reported-at', required=True)
+    close = commands.add_parser('close', help='停止した判断を完了扱いで閉じる')
+    close.add_argument('--id', required=True)
+    close.add_argument('--decided-at', required=True)
+    close.add_argument('--reported-at', required=True)
     renew = commands.add_parser('renew')
     renew.add_argument('--id', required=True)
     renew.add_argument('--token', required=True)
@@ -1015,6 +1035,8 @@ def main(argv=None):
             result = store.report(args.id, {'token': args.token, 'status': args.status, 'reason': args.reason, 'next_step': args.next_step})
         elif args.command == 'retry':
             result = store.retry(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
+        elif args.command == 'close':
+            result = store.close(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
         elif args.command == 'renew':
             result = store.renew(args.id, {'token': args.token, 'lease_seconds': args.lease_seconds})
         elif args.command == 'backup':

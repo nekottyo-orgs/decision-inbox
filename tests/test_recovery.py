@@ -117,6 +117,29 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn('token', json.dumps(self.store.list()))
         self.assertNotIn('token', ''.join(row['answer'] for row in rows))
 
+    def test_close_moves_only_stopped_decisions_to_completed(self):
+        item = self.answered()
+        self.error(409, lambda: self.store.close(item['id'], {**self.retry_payload(item), 'reported_at': 'なし'}))
+        stopped = self.report(item)
+        self.error(409, lambda: self.store.close(item['id'], {**self.retry_payload(stopped), 'reported_at': '古い報告'}))
+        self.error(409, lambda: self.store.close(item['id'], {**self.retry_payload(stopped), 'decided_at': '古い回答'}))
+        self.assertEqual(self.store.get(item['id']), stopped)
+        closed = self.store.close(item['id'], self.retry_payload(stopped))
+        self.assertEqual(closed['answer'], {**stopped['answer'], 'status': 'completed'})
+        self.assertEqual(self.store.ready(), [])
+        self.assertIsNone(self.store.claim('other')['decision'])
+        self.error(409, lambda: self.store.close(item['id'], self.retry_payload(stopped)))
+        self.error(409, lambda: self.store.retry(item['id'], self.retry_payload(stopped)))
+        failed = self.report(self.answered(), 'failed')
+        self.assertEqual(self.store.close(failed['id'], self.retry_payload(failed))['answer']['status'], 'completed')
+        with self.store.db() as connection:
+            rows = connection.execute('SELECT event FROM answer_history').fetchall()
+        self.assertEqual([row['event'] for row in rows], ['report', 'close', 'report', 'close'])
+        done = self.answered()
+        self.store.complete(done['id'], self.store.claim('worker')['token'])
+        self.error(409, lambda: self.store.close(done['id'], {'decided_at': done['answer']['decided_at'], 'reported_at': 'なし'}))
+        self.assertEqual(self.store.get(done['id'])['answer']['status'], 'completed')
+
     def test_retry_rejects_a_report_from_an_earlier_attempt(self):
         item = self.answered()
         first = self.report(item)
@@ -302,9 +325,12 @@ class RecoveryTests(unittest.TestCase):
         stopped = cli('report', '--id', item['id'], '--token', claim['token'], '--status', 'failed', '--reason', '確認が必要', '--next-step', '修正して再試行')
         retried = cli('retry', '--id', item['id'], '--decided-at', stopped['answer']['decided_at'], '--reported-at', stopped['answer']['reported_at'])
         self.assertEqual(retried['answer']['status'], 'pending')
+        stopped = cli('report', '--id', item['id'], '--token', cli('claim', '--worker', 'cli-worker')['token'], '--status', 'blocked', '--reason', '不要', '--next-step', 'なし')
+        closed = cli('close', '--id', item['id'], '--decided-at', stopped['answer']['decided_at'], '--reported-at', stopped['answer']['reported_at'])
+        self.assertEqual(closed['answer']['status'], 'completed')
         backup = Path(self.temp.name) / 'cli-backup.sqlite3'
         self.assertEqual(cli('backup', '--output', str(backup)), {'backup': str(backup)})
-        self.assertEqual(Store(backup).get(item['id']), retried)
+        self.assertEqual(Store(backup).get(item['id']), closed)
 
 
 if __name__ == '__main__':

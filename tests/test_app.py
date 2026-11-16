@@ -338,6 +338,16 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('POST', path + '/complete', {'token': claim['token']})[0], 409)
         self.assertEqual(self.request('POST', path + '/complete', {'token': new_claim['token']})[0], 200)
         self.assertEqual(self.request('POST', path + '/retry', retry)[0], 409)
+        self.assertEqual(self.request('POST', path + '/close', retry)[0], 409)
+        _, second, _ = self.request('POST', '/api/decisions', request_payload(request_key='http-recovery/2'))
+        second_path = '/api/decisions/' + second['id']
+        self.request('POST', second_path + '/answer', {'choice': 'minimal'})
+        _, claim, _ = self.request('POST', '/api/claim', {'worker': 'http-recovery'})
+        _, stopped, _ = self.request('POST', second_path + '/report', {'token': claim['token'], 'status': 'failed', 'reason': '不要', 'next_step': 'なし'})
+        stale = {key: stopped['answer'][key] for key in ('decided_at', 'reported_at')}
+        self.assertEqual(self.request('POST', second_path + '/close', {**stale, 'reported_at': '古い報告'})[0], 409)
+        status, closed, _ = self.request('POST', second_path + '/close', stale)
+        self.assertEqual((status, closed['answer']['status']), (200, 'completed'))
         self.assertEqual(self.request('POST', path + '/undo', {'decided_at': stopped['answer']['decided_at']})[0], 409)
 
     def test_cli_uses_same_database(self):
