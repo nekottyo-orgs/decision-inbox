@@ -27,7 +27,7 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 }
 ```
 
-必須は `title/source/reason/options/recommended/recommendation`。`priority` の既定は `normal`、`background/urgency_reason` は空文字、`links` と `files` (後述) は空配列、`deadline/image` は null。候補は 2〜8 件で重複しない ID。priority は `urgent/normal/later`。deadline は timezone 付き ISO 8601。リンクは http(s) URL、kind は `pr/issue/other`、label 必須。image は `{"url":"https://example.com/diagram.png","alt":"図の説明"}` または許可済み `/assets/` 内の静的画像参照。任意 HTML は受け付けない。body 上限は 128 KiB。title/source は 200 文字、reason/recommendation は 4000 文字、background は 12000 文字、urgency_reason は 2000 文字、memo は 2000 文字、リンクは 20 件まで。未知の項目・重複 JSON キーは拒否。
+必須は `title/source/reason/options/recommended/recommendation` (項目と型の一覧は `add --help` でも見られる)。`priority` の既定は `normal`、`background/urgency_reason` は空文字、`links` と `files` (後述) は空配列、`deadline/image` は null。候補は 2〜8 件で重複しない ID。priority は `urgent/normal/later`。deadline は timezone 付き ISO 8601。リンクは http(s) URL、kind は `pr/issue/other`、label 必須。image は `{"url":"https://example.com/diagram.png","alt":"図の説明"}` または許可済み `/assets/` 内の静的画像参照。任意 HTML は受け付けない。body 上限は 128 KiB。title/source は 200 文字、reason/recommendation は 4000 文字、background は 12000 文字、urgency_reason は 2000 文字、memo は 2000 文字、リンクは 20 件まで。未知の項目・重複 JSON キーは拒否。
 
 任意の `request_key` は 1〜200 文字の英数字と `_ . : / -` で指定。同じキーかつ既定値補完後の同一 JSON 内容なら同じ ID を返す。同じキーで内容が異なれば `409`。JSON オブジェクトのキー順は問わず、候補やリンクの配列順は内容の一部として扱う。キーなしは従来どおり毎回登録する。update 済みの判断には、現在の内容に加えて update 前のどの内容で再送しても同じ ID を返す。取り下げ済みの判断と同じキーで add すると `409` (置き換えるときは新しい request_key で add する)。
 
@@ -108,9 +108,13 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 
 `task` は依頼の進み具合を管理する機能で、書き込みは CLI が行い、判断への回答 (Web の `POST /api/decisions/{id}/answer` と TUI) だけは、その判断に紐付く human_decision の task を同じ transaction で todo へ移し、remaining の先頭に「Cue 回答済み: <choice>。」を足す。undo では task を戻さない。HTTP は一覧の `GET /api/tasks` (`list --json` と同じ形) だけを出し、Web の task 画面はこれを読み取り専用で表示する。lane は `todo` / `human_decision` / `worker` / `human_action` / `done`。`add` は同じ id で登録内容 (title / request / pane / run) が同じなら既存を返し、違えば 409。lane / result / remaining / decision_id は move / update で進むため比べず、再送しても既存の値は変わらない。`--decision` は 32 桁 hex 以外を 400、存在しない判断を 404 にする。不正な `--lane` は `list` / `list --json` / `add` / `move` とも 400。`update` は指定した項目だけを変え、空文字で消去する (`--decision` の空文字は関連付けの解除)。`list --json` は `{"lanes":[{"id","label","tasks":[...]}]}` を返し、各 task の `decision` は判断が無ければ null、あれば `{"title":"判断の題名","answered":false,"withdrawn":false}` (判断 ID が残っていて判断が見つからないときも null)。`--json` なしは lane ごとの文字の一覧を出す。task 系は DB を書き込み可で開くため、tasks 表が無い DB には表を足す (`PRAGMA user_version` は 2 のまま)。
 
+`add --help` で必須・任意の項目と型の一覧・最小 JSON 例、`list --help` と `task list --help` で出力の形 (`list` は `{"decisions":[...],"demo":false}` の object、`task list --json` は `{"lanes":[...]}`) を確認できる。
+
 `tui`、`watch`、`backup`、`task` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
+
+入力不正の `error` には、項目名・期待する型 (または許す値)・受け取った型を全件 `; ` 区切りで 1 本の文字列に並べます。先頭は `JSON の項目を確認してください: ` で、項目名は `links[0].kind` のように添字・入れ子つきです。例は `{"error":"JSON の項目を確認してください: links[0] は {url: string, label: string, kind: pr / issue / other} を指定してください (受け取った型: string)"}` です。`add` / `POST /api/decisions` / `update` のほか、claim / report などの入力も欠けた項目と未知の項目の名前を返します。
 
 `tui` は対話端末で同じ Store を利用し、選択した回答を既存の回答保存処理に渡す。非 TTY では DB を作らずエラー終了。`--web-url` / `CUE_WEB_URL` は任意で loopback の http(s) URL のみ。Web の `?decision=<id>` は対象の未判断または判断済みを初期表示し、不明な ID では通常の優先度順表示になる。
 
