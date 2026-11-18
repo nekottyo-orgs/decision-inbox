@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def isolated_env(temp):
-    # 端末に配線した pre-add を CLI のテストが踏まないようにする
-    return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks')}
+    # 端末に配線した pre-add と実 claims_dir を CLI のテストが踏まないようにする
+    return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks'), 'DECISION_INBOX_CLAIMS_DIR': str(Path(temp) / 'claims')}
 
 
 def request_payload(**changes):
@@ -381,7 +381,7 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn('Traceback', invalid_token.stderr)
         self.assertEqual(set(json.loads(invalid_token.stderr)), {'error'})
         self.assertEqual(Store(self.db).get(item['id']), before)
-        completed = cli('complete', '--id', item['id'], '--token', token)
+        completed = cli('complete', '--id', item['id'], f'--token={token}')
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout)['answer']['status'], 'completed')
         self.assertNotEqual(cli('complete', '--id', item['id'], '--token', 'wrong').returncode, 0)

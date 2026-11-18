@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local decision inbox, using only the Python standard library."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -385,6 +385,12 @@ class Store:
             connection.execute('''CREATE TABLE IF NOT EXISTS decision_changes (
                 id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
                 recorded_at TEXT NOT NULL, note TEXT NOT NULL, before TEXT)''')
+            # runs も同じく IF NOT EXISTS で足すだけで、user_version は上げない (理由は tasks と同じ)。
+            # 開いた行 = closed_at が NULL。同じ run_id と role の開いた行は 1 つだけにする
+            connection.execute('''CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, role TEXT NOT NULL, pane TEXT NOT NULL, socket TEXT NOT NULL,
+                opened_at TEXT NOT NULL, closed_at TEXT)''')
+            connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS runs_open ON runs(run_id, role) WHERE closed_at IS NULL')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -645,6 +651,43 @@ class Store:
                 raise AppError(404, 'task が見つかりません')
         return {'deleted': identifier}
 
+    def open_run(self, payload):
+        object_fields(payload, ('run_id', 'role', 'pane', 'socket'), ())
+        # text() でサロゲートも断る。socket のパスに decode できないバイトがあると SQLite が bind できない
+        for key, value in payload.items():
+            text(value, key, 200)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if connection.execute('SELECT 1 FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (payload['run_id'], payload['role'])).fetchone():
+                raise AppError(409, '同じ run_id と role の開いた run があります')
+            cursor = connection.execute('INSERT INTO runs(run_id,role,pane,socket,opened_at) VALUES(?,?,?,?,?)',
+                                        (payload['run_id'], payload['role'], payload['pane'], payload['socket'], utc_now()))
+            return dict(connection.execute('SELECT * FROM runs WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+    def close_run(self, run_id, role):
+        text(run_id, 'run_id', 200)
+        text(role, 'role', 200)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT id FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (run_id, role)).fetchone()
+            if not row:
+                raise AppError(404, '開いた run が見つかりません')
+            connection.execute('UPDATE runs SET closed_at=? WHERE id=?', (utc_now(), row['id']))
+            return dict(connection.execute('SELECT * FROM runs WHERE id=?', (row['id'],)).fetchone())
+
+    def runs(self, run_id=None, pane=None, socket=None, include_closed=False):
+        if run_id is None and (pane is None or socket is None):
+            raise AppError(400, '--run-id か、--pane と --socket の組を指定してください')
+        if run_id is not None and (pane is not None or socket is not None):
+            raise AppError(400, '--run-id と --pane / --socket は同時に指定できません')
+        for name, value in (('run_id', run_id), ('pane', pane), ('socket', socket)):
+            if value is not None:
+                text(value, name, 200)
+        where, values = ('run_id=?', (run_id,)) if run_id is not None else ('pane=? AND socket=?', (pane, socket))
+        with self.db() as connection:
+            rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
+            return {'runs': [dict(row) for row in rows]}
+
     def tasks(self, lane=None):
         if lane is not None and lane not in LANES:
             raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
@@ -660,7 +703,7 @@ class Store:
         rows = [row for row in rows if lane is None or row['lane'] == lane]
         return sorted(rows, key=lambda row: order.index(row['lane']) if row['lane'] in order else len(order))
 
-    def claim(self, worker, lease_seconds=300, key_prefix=None):
+    def claim(self, worker, lease_seconds=300, key_prefix=None, on_claim=None):
         text(worker, 'worker', 200)
         validate_lease(lease_seconds)
         clause, params = prefix_clause(key_prefix)
@@ -673,8 +716,14 @@ class Store:
             if row is None:
                 return {'decision': None}
             connection.execute("UPDATE decisions SET status='processing',worker=?,token=?,lease_until=? WHERE id=?", (worker, token, expires, row['id']))
-            decision = self.fetch(connection, row['id'])
-        return {'decision': decision, 'token': token, 'worker': worker, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            result = {'decision': self.fetch(connection, row['id']), 'token': token, 'worker': worker, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            # commit の前に呼ぶ。on_claim が失敗すれば claim ごと rollback され、token を失った claim が残らない
+            if on_claim:
+                on_claim(result)
+                # 書き込みに lease 以上かかると、成功を返しても complete / renew が token を断る claim になる
+                if time.time() >= expires:
+                    raise AppError(409, 'token ファイルの書き込み中に lease が切れました')
+        return result
 
     def report(self, identifier, payload):
         object_fields(payload, ('token', 'status', 'reason', 'next_step'))
@@ -721,7 +770,7 @@ class Store:
             connection.execute("UPDATE decisions SET status='completed' WHERE id=?", (identifier,))
         return self.get(identifier)
 
-    def renew(self, identifier, payload):
+    def renew(self, identifier, payload, on_renew=None):
         object_fields(payload, ('token',), ('lease_seconds',))
         seconds = validate_lease(payload.get('lease_seconds', 300))
         with self.db() as connection:
@@ -730,8 +779,36 @@ class Store:
             now = self.active(row, payload['token'])
             expires = max(row['lease_until'], now + seconds)
             connection.execute('UPDATE decisions SET lease_until=? WHERE id=?', (expires, identifier))
-            decision = self.fetch(connection, identifier)
-        return {'decision': decision, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            result = {'decision': self.fetch(connection, identifier), 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            # commit の前に呼ぶ。書き込みロックの中なので complete / report / 他の renew とファイル操作の順序が DB と揃う
+            if on_renew:
+                on_renew(result)
+                # claim と同じく、ファイル更新に lease 以上かかったら延長を成功扱いにしない
+                if time.time() >= expires:
+                    raise AppError(409, 'token ファイルの更新中に lease が切れました')
+        # commit は読み手のロック解放を busy timeout まで待つことがあり、その間に短い lease は切れうる
+        if time.time() >= expires:
+            raise AppError(409, '延長は保存しましたが lease は既に切れています。この token は使えません')
+        return result
+
+    def lease_of(self, identifier, token):
+        """claims_dir の掃除用。この DB に無い判断は None、あれば token が一致する claim の lease_until (無ければ 0)"""
+        with self.db() as connection:
+            row = connection.execute('SELECT token, lease_until FROM decisions WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            return None
+        matches = row['token'] and token.isascii() and secrets.compare_digest(row['token'], token)
+        return (row['lease_until'] or 0) if matches else 0
+
+    def holder(self, identifier, token):
+        # claims の active 判定。ファイルの expires_at でなく DB の現在の token と lease で決める
+        with self.db() as connection:
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+        try:
+            self.active(row, token)
+        except AppError:
+            return False
+        return True
 
     def complete(self, identifier, token):
         with self.db() as connection:
@@ -998,6 +1075,11 @@ def pre_add_hook():
     return path if path.is_file() and os.access(path, os.X_OK) else None
 
 
+def claims_dir(db):
+    override = os.environ.get('DECISION_INBOX_CLAIMS_DIR')
+    return Path(override).expanduser().absolute() if override else Path(db).expanduser().absolute().parent / 'claims'
+
+
 PRE_ADD_TIMEOUT = 10
 
 
@@ -1042,6 +1124,177 @@ def run_pre_add(item):
             raise AppError(400, 'pre-add が登録を断りました: ' + os.pread(errors.fileno(), 2000, 0).decode(errors='replace')[:500])
 
 
+def open_temp(directory):
+    # 末尾を .json にしない。claims の列挙と掃除が書きかけを拾わないため
+    path = Path(directory) / f'.claim-{secrets.token_hex(8)}.tmp'
+    return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), path
+
+
+def write_synced(descriptor, data):
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+        json.dump(data, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def fsync_dir(path):
+    # 一時ファイルの fsync だけでは link / replace で増えた名前が電源断で消えうる
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def unlink_temp(path):
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        # 警告は出せたら出す。2>&- で stderr が None だと print は stdout に書いて結果の JSON を壊し、
+        # 書き込みの失敗を投げると finally から claim の結果や元の例外を潰す
+        if sys.stderr is not None:
+            with suppress(OSError, ValueError):
+                print(json.dumps({'warning': f'token を含む一時ファイルを消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
+
+
+TOKEN_FILE_LIMIT = 65536
+
+
+def read_token_file(path, identifier):
+    try:
+        # O_NONBLOCK で開く。書き手の無い FIFO だと通常の open が戻らない
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError
+            raw = handle.read(TOKEN_FILE_LIMIT + 1)
+        # 上限で切ってから decode すると、切れ目の後ろが壊れていても通ってしまう
+        if len(raw) > TOKEN_FILE_LIMIT:
+            raise ValueError
+        data = json.loads(raw)
+    # 64 KiB 以内でも入れ子が深いと json が RecursionError を出す。claims の列挙で飛ばせるよう 400 に揃える
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        raise AppError(400, 'token ファイルを読めません') from None
+    if not isinstance(data, dict) or not isinstance(data.get('token'), str):
+        raise AppError(400, 'token ファイルの形式が不正です')
+    if identifier is not None and data.get('id') != identifier:
+        raise AppError(400, 'token ファイルの id が --id と一致しません')
+    return data
+
+
+CLAIM_FILE = re.compile(r'([0-9a-f]{32})-[0-9a-f]{16}\.json')
+
+
+def sweep_claims(store, directory, now):
+    # lease 期限から 24 時間は残す。session が消えた後に claims --id で探す余地を残すため
+    for path in Path(directory).glob('*.json'):
+        # claims_dir は env で他のファイルがある場所を指せるので、auto が作った名前と中身のものだけを消す
+        name = CLAIM_FILE.fullmatch(path.name)
+        try:
+            data = read_token_file(path, name and name[1])
+            expires = datetime.fromisoformat(data['expires_at']).timestamp()
+        except (AppError, KeyError, TypeError, ValueError):
+            continue
+        if not name or not isinstance(data.get('worker'), str):
+            continue
+        # --token や HTTP の renew はファイルの expires_at を書き換えないので DB の lease も見る。
+        # この DB に無い判断 (claims_dir を共有する別 DB の claim) は失効を確かめられないので残す
+        lease = store.lease_of(data['id'], data['token'])
+        if lease is not None and max(expires, lease) + 86400 < now:
+            path.unlink(missing_ok=True)
+
+
+def claim_to_file(store, args):
+    # 空文字を従来の経路へ落とすと、空の変数からパスを組んだ呼び手の token が stdout に出る
+    if not args.token_file:
+        raise AppError(400, '--token-file には auto かパスを指定してください')
+    directory = claims_dir(args.db)
+    if args.token_file == 'auto':
+        # 作るのは claims_dir だけにする。中間ディレクトリまで作ると、その名前を持つ祖先すべてを
+        # commit 前に fsync しないと電源断で token ファイルへ辿れなくなる
+        try:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        except FileNotFoundError:
+            raise AppError(400, f'claims_dir の親ディレクトリがありません: {directory.parent}') from None
+        sweep_claims(store, directory, time.time())
+        target = None
+    else:
+        target = Path(args.token_file).expanduser().absolute()
+    # claim より先に開く。開けないなら claim せず、token の行き場が無い claim を作らない
+    descriptor, temp = open_temp(directory if target is None else target.parent)
+    published = []
+
+    def save(result):
+        nonlocal descriptor
+        # claim ごとに別のファイル名にする。worker 名で固定すると、同じ worker 名で再 claim されたとき
+        # 旧プロセスが新しい token を読んで照合を通る経路ができる
+        final = target or directory / f"{result['decision']['id']}-{secrets.token_hex(8)}.json"
+        handle, descriptor = descriptor, None
+        write_synced(handle, {'id': result['decision']['id'], 'token': result['token'], 'worker': result['worker'], 'expires_at': result['expires_at']})
+        # rename でなく link にする。宛先が既にあれば上書きせず失敗させ、他の claim のファイルを壊さない
+        os.link(temp, final)
+        published.append(final)
+        fsync_dir(final.parent)
+        # claims_dir は対象なしの claim でも作られるので、作った回に限らず親も毎回 fsync する
+        if target is None:
+            fsync_dir(directory.parent)
+        result['token_file'] = str(final)
+
+    try:
+        result = store.claim(args.worker, args.lease_seconds, args.key_prefix, on_claim=save)
+    except BaseException:
+        for path in published:
+            # 後始末の失敗で元の例外を隠さない
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        # commit 後に一時名を消せなくても claim は成立しているので、結果は失わず警告だけ出す
+        # (残った .claim-*.tmp は列挙にも掃除にも掛からないので、token 入りのまま誰も消さない)
+        unlink_temp(temp)
+    result.pop('token', None)
+    return result
+
+
+def renew_with_file(store, args):
+    path = args.token_file
+    data = read_token_file(path, args.id)
+
+    def save(result):
+        # 書き込みロックの中で読み直す。ファイルが別経路で消え、同じ PATH に別の claim が入っていたら上書きしない
+        if read_token_file(path, args.id)['token'] != data['token']:
+            raise AppError(409, 'token ファイルが別の claim のものに置き換わっています')
+        descriptor, temp = open_temp(path.parent)
+        try:
+            write_synced(descriptor, {**data, 'expires_at': result['expires_at']})
+            os.replace(temp, path)
+            fsync_dir(path.parent)
+        finally:
+            unlink_temp(temp)
+
+    return store.renew(args.id, {'token': data['token'], 'lease_seconds': args.lease_seconds}, on_renew=save)
+
+
+def token_from(args):
+    return read_token_file(args.token_file, args.id)['token'] if args.token_file else args.token
+
+
+def list_claims(store, directory, identifier=None):
+    claims = []
+    for path in sorted(Path(directory).glob('*.json')) if Path(directory).is_dir() else []:
+        try:
+            data = read_token_file(path, None)
+        except AppError:
+            continue
+        if identifier is not None and data.get('id') != identifier:
+            continue
+        claims.append({'id': data.get('id'), 'token_file': str(path), 'worker': data.get('worker'), 'expires_at': data.get('expires_at'),
+                       'active': isinstance(data.get('id'), str) and store.holder(data['id'], data['token'])})
+    return {'claims': claims}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -1073,16 +1326,17 @@ def main(argv=None):
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)
     claim.add_argument('--key-prefix')
+    claim.add_argument('--token-file', help='token を stdout に出さずファイルへ保存する。auto は claims_dir に claim ごとの新しいファイルを作る')
+    claims = commands.add_parser('claims', help='claims_dir の token ファイルを列挙する (token の値は出さない)')
+    claims.add_argument('--id')
     commands.add_parser('hooks', help='pre-add の実行パスを JSON で出す')
     complete = commands.add_parser('complete')
     complete.add_argument('--id', required=True)
-    complete.add_argument('--token', required=True)
     undo = commands.add_parser('undo')
     undo.add_argument('--id', required=True)
     undo.add_argument('--decided-at', required=True)
     report = commands.add_parser('report')
     report.add_argument('--id', required=True)
-    report.add_argument('--token', required=True)
     report.add_argument('--status', choices=('blocked', 'failed'), required=True)
     report.add_argument('--reason', required=True)
     report.add_argument('--next-step', required=True)
@@ -1096,7 +1350,6 @@ def main(argv=None):
     close.add_argument('--reported-at', required=True)
     renew = commands.add_parser('renew')
     renew.add_argument('--id', required=True)
-    renew.add_argument('--token', required=True)
     renew.add_argument('--lease-seconds', type=int, default=300)
     backup = commands.add_parser('backup')
     backup.add_argument('--output', type=Path, required=True)
@@ -1118,6 +1371,25 @@ def main(argv=None):
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')
+    run = commands.add_parser('run', help='agent の実行 (run) と pane の対応を記録する')
+    run_commands = run.add_subparsers(dest='run_command', required=True)
+    for name in ('open', 'close', 'show'):
+        sub = run_commands.add_parser(name, help={'open': 'run を開く。同じ run_id と role の開いた行があれば断る', 'close': 'run を閉じて closed_at を入れる', 'show': 'run_id か pane と socket の組で引く。既定は開いた行だけ'}[name])
+        if name == 'show':
+            sub.add_argument('--run-id')
+            sub.add_argument('--pane')
+            sub.add_argument('--socket')
+            sub.add_argument('--all', action='store_true', help='閉じた行も出す')
+        else:
+            sub.add_argument('--run-id', required=True)
+            sub.add_argument('--role', required=True)
+        if name == 'open':
+            sub.add_argument('--pane', required=True)
+            sub.add_argument('--socket', required=True)
+    for sub in (complete, report, renew):
+        group = sub.add_mutually_exclusive_group(required=True)
+        group.add_argument('--token')
+        group.add_argument('--token-file', type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == 'hooks':
@@ -1145,6 +1417,15 @@ def main(argv=None):
                     pass
             return 0
         store = Store(args.db, readonly=args.command in ('watch', 'backup'))
+        if args.command == 'run':
+            if args.run_command == 'open':
+                result = store.open_run({'run_id': args.run_id, 'role': args.role, 'pane': args.pane, 'socket': args.socket})
+            elif args.run_command == 'close':
+                result = store.close_run(args.run_id, args.role)
+            else:
+                result = store.runs(args.run_id, args.pane, args.socket, args.all)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.command == 'task':
             result = run_task(store, args)
             if result is None:
@@ -1170,21 +1451,30 @@ def main(argv=None):
         elif args.command == 'list':
             result = {'decisions': store.list(args.include_withdrawn), 'demo': False}
         elif args.command == 'claim':
-            result = store.claim(args.worker, args.lease_seconds, args.key_prefix)
+            result = claim_to_file(store, args) if args.token_file is not None else store.claim(args.worker, args.lease_seconds, args.key_prefix)
+        elif args.command == 'claims':
+            result = list_claims(store, claims_dir(args.db), args.id)
         elif args.command == 'undo':
             result = store.undo(args.id, {'decided_at': args.decided_at})
         elif args.command == 'report':
-            result = store.report(args.id, {'token': args.token, 'status': args.status, 'reason': args.reason, 'next_step': args.next_step})
+            result = store.report(args.id, {'token': token_from(args), 'status': args.status, 'reason': args.reason, 'next_step': args.next_step})
+            if args.token_file:
+                args.token_file.unlink(missing_ok=True)
         elif args.command == 'retry':
             result = store.retry(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
         elif args.command == 'close':
             result = store.close(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
         elif args.command == 'renew':
-            result = store.renew(args.id, {'token': args.token, 'lease_seconds': args.lease_seconds})
+            if args.token_file:
+                result = renew_with_file(store, args)
+            else:
+                result = store.renew(args.id, {'token': args.token, 'lease_seconds': args.lease_seconds})
         elif args.command == 'backup':
             result = store.backup(args.output)
         else:
-            result = store.complete(args.id, args.token)
+            result = store.complete(args.id, token_from(args))
+            if args.token_file:
+                args.token_file.unlink(missing_ok=True)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (AppError, sqlite3.Error, OSError) as error:

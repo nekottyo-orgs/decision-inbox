@@ -89,6 +89,19 @@ python3 app.py task delete --id fix-login
 
 TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。完了の lane は既定で畳まれ、「完了 (件数)」だけが出ます。`d` で開閉します (Web でも完了は件数付きで畳まれています。開閉の状態は保存しません)。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済み / 取り下げを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
 
+## run と pane の対応を記録する
+
+agent の実行 (run) がどの pane・socket で動いているかを CLI で記録します。HTTP API はありません。`PRAGMA user_version` は 2 のままで、旧 release に戻してもそのまま動きます (runs 表は無視されます)。
+
+```sh
+python3 app.py run open --run-id RUN --role worker --pane 1-2 --socket /tmp/herdr.sock
+python3 app.py run show --run-id RUN
+python3 app.py run show --pane 1-2 --socket /tmp/herdr.sock
+python3 app.py run close --run-id RUN --role worker
+```
+
+同じ `run_id` と `role` の開いた行があると `open` は断ります。`show` は開いた行だけを出し、`--all` で閉じた行も出します。
+
 ## 配置と更新
 
 開発用 worktree と分離する配置例として、`~/.local/share/cue/releases/<commit SHA>/` に検証済みの版を保存し、`~/.local/share/cue/current` から参照できます。`~/.local/bin/decision-inbox` を `current/app.py` へのリンクにすると、開発用 worktree の移動や片づけに依存せず起動できます。DB は repo 外の user data directory に保持します。
@@ -127,7 +140,7 @@ herdr plugin link ~/.local/share/cue/current/herdr-plugin
 python3 app.py add --file request.json
 python3 app.py list
 python3 app.py claim --worker front-desk --lease-seconds 3600
-python3 app.py complete --id DECISION_ID --token CLAIM_TOKEN
+python3 app.py complete --id DECISION_ID --token=CLAIM_TOKEN
 ```
 
 `add --help` に必須・任意の項目と型、最小の JSON 例が、`list --help` に出力の形があります。`list` は配列ではなく `{"decisions": [...]}` の object を返すので、jq では `.decisions[]` を使ってください。JSON が不正なときは、型・必須・許す値の問題について項目名・期待する型・受け取った型が `error` に全件出ます (文字数・件数・URL の形の問題は 1 件ずつです)。
@@ -169,13 +182,13 @@ Claude の Monitor や Codex 側の通知機構は、この出力を受けて窓
 - decision ID による冪等処理と、外部副作用を起こす前の適用済み確認
 - 成功時だけの complete、失敗・承認待ちは理由と再開条件を report して自動再配送を止める運用
 
-claim は回答日時順の FIFO で、有効期限付き token を返します。長い処理は期限より前に renew し、返された新しい期限を確認してください。古い token や期限切れ token は renew / report / complete に使えません。更新に失敗した場合は副作用を止め、状態を再確認します。lease は所有権の永続保証ではないため、必ず decision ID で適用済みか確認してください。claim token は秘密として扱います。
+claim は回答日時順の FIFO で、有効期限付き token を返します。長い処理は期限より前に renew し、返された新しい期限を確認してください。古い token や期限切れ token は renew / report / complete に使えません。更新に失敗した場合は副作用を止め、状態を再確認します。lease は所有権の永続保証ではないため、必ず decision ID で適用済みか確認してください。claim token は秘密として扱います。token は `-` で始まることがあり、`--token TOKEN` と分けて渡すと option として読まれるので、`--token=TOKEN` の形で渡してください。
 
 処理を続けられない場合は、有効な token で status を `blocked` (承認・条件待ち) または `failed` (失敗) として report し、reason と next_step を記録します。これらの状態は claim と watch の対象から外れ、人が明示的に再処理を依頼するまで待ちます。再処理では元の回答内容を維持し、古い報告に対する操作は拒否します。
 
 ```sh
-decision-inbox renew --id DECISION_ID --token CLAIM_TOKEN --lease-seconds 3600
-decision-inbox report --id DECISION_ID --token CLAIM_TOKEN --status blocked --reason '承認待ち' --next-step '承認後に再処理'
+decision-inbox renew --id DECISION_ID --token=CLAIM_TOKEN --lease-seconds 3600
+decision-inbox report --id DECISION_ID --token=CLAIM_TOKEN --status blocked --reason '承認待ち' --next-step '承認後に再処理'
 ```
 
 ## データを保存する
