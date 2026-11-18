@@ -6,9 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import Store
+import app
+from app import AppError, Store
 from test_app import isolated_env, request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +92,18 @@ class CliPreAddTests(unittest.TestCase):
         changes.write_text(json.dumps({'title': '更新後'}), encoding='utf-8')
         self.ok('update', '--id', item['id'], '--note', '理由', '--file', str(changes))
         self.assertFalse(called.exists())
+
+
+class PreAddTimeoutTests(unittest.TestCase):
+    def test_終わらない_pre_add_は打ち切って断る(self):
+        with tempfile.TemporaryDirectory() as temp:
+            hook = Path(temp) / 'pre-add'
+            hook.write_text('#!/bin/sh\nexec sleep 5\n', encoding='utf-8')
+            hook.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {'DECISION_INBOX_HOOKS_DIR': temp}), unittest.mock.patch.object(app, 'PRE_ADD_TIMEOUT', 0.2):
+                with self.assertRaises(AppError) as caught:
+                    app.run_pre_add(request_payload())
+            self.assertIn('0.2 秒で終わりませんでした', str(caught.exception))
 
 
 if __name__ == '__main__':

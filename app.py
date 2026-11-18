@@ -997,13 +997,19 @@ def pre_add_hook():
     return path if path.is_file() and os.access(path, os.X_OK) else None
 
 
+PRE_ADD_TIMEOUT = 10
+
+
 def run_pre_add(item):
     # 登録の可否は呼び出し元 (agent の pane) の env で決まるので、CLI だけが呼ぶ。HTTP は server の env しか持たない
     hook = pre_add_hook()
     if hook is None:
         return
     try:
-        finished = subprocess.run([str(hook)], input=json.dumps(item, ensure_ascii=False).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        finished = subprocess.run([str(hook)], input=json.dumps(item, ensure_ascii=False).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=PRE_ADD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # 止まった hook で全 pane の add が詰まらないよう打ち切る。検査が終わっていないので登録はしない
+        raise AppError(400, f'pre-add が登録を断りました: {PRE_ADD_TIMEOUT} 秒で終わりませんでした') from None
     except OSError as error:
         # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
         raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
