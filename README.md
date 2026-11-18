@@ -102,6 +102,8 @@ python3 app.py run close --run-id RUN --role worker
 
 同じ `run_id` と `role` の開いた行があると `open` は断ります。`show` は開いた行だけを出し、`--all` で閉じた行も出します。
 
+CLI の `add` は、呼び出し元の pane (env `HERDR_PANE_ID` と `HERDR_SOCKET_PATH`) が開いた run の行に当たるとき、request_key が `frontdesk-<run_id>/<名前>` で始まらない登録を断ります。行の無い pane と HTTP の登録は通します。
+
 ## 配置と更新
 
 開発用 worktree と分離する配置例として、`~/.local/share/cue/releases/<commit SHA>/` に検証済みの版を保存し、`~/.local/share/cue/current` から参照できます。`~/.local/bin/decision-inbox` を `current/app.py` へのリンクにすると、開発用 worktree の移動や片づけに依存せず起動できます。DB は repo 外の user data directory に保持します。
