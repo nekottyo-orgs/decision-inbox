@@ -140,7 +140,7 @@ herdr plugin link ~/.local/share/cue/current/herdr-plugin
 python3 app.py add --file request.json
 python3 app.py list
 python3 app.py claim --worker front-desk --lease-seconds 3600
-python3 app.py complete --id DECISION_ID --token CLAIM_TOKEN
+python3 app.py complete --id DECISION_ID --token=CLAIM_TOKEN
 ```
 
 `add --help` に必須・任意の項目と型、最小の JSON 例が、`list --help` に出力の形があります。`list` は配列ではなく `{"decisions": [...]}` の object を返すので、jq では `.decisions[]` を使ってください。JSON が不正なときは、型・必須・許す値の問題について項目名・期待する型・受け取った型が `error` に全件出ます (文字数・件数・URL の形の問題は 1 件ずつです)。
@@ -182,13 +182,13 @@ Claude の Monitor や Codex 側の通知機構は、この出力を受けて窓
 - decision ID による冪等処理と、外部副作用を起こす前の適用済み確認
 - 成功時だけの complete、失敗・承認待ちは理由と再開条件を report して自動再配送を止める運用
 
-claim は回答日時順の FIFO で、有効期限付き token を返します。長い処理は期限より前に renew し、返された新しい期限を確認してください。古い token や期限切れ token は renew / report / complete に使えません。更新に失敗した場合は副作用を止め、状態を再確認します。lease は所有権の永続保証ではないため、必ず decision ID で適用済みか確認してください。claim token は秘密として扱います。
+claim は回答日時順の FIFO で、有効期限付き token を返します。長い処理は期限より前に renew し、返された新しい期限を確認してください。古い token や期限切れ token は renew / report / complete に使えません。更新に失敗した場合は副作用を止め、状態を再確認します。lease は所有権の永続保証ではないため、必ず decision ID で適用済みか確認してください。claim token は秘密として扱います。token は `-` で始まることがあり、`--token TOKEN` と分けて渡すと option として読まれるので、`--token=TOKEN` の形で渡してください。
 
 処理を続けられない場合は、有効な token で status を `blocked` (承認・条件待ち) または `failed` (失敗) として report し、reason と next_step を記録します。これらの状態は claim と watch の対象から外れ、人が明示的に再処理を依頼するまで待ちます。再処理では元の回答内容を維持し、古い報告に対する操作は拒否します。
 
 ```sh
-decision-inbox renew --id DECISION_ID --token CLAIM_TOKEN --lease-seconds 3600
-decision-inbox report --id DECISION_ID --token CLAIM_TOKEN --status blocked --reason '承認待ち' --next-step '承認後に再処理'
+decision-inbox renew --id DECISION_ID --token=CLAIM_TOKEN --lease-seconds 3600
+decision-inbox report --id DECISION_ID --token=CLAIM_TOKEN --status blocked --reason '承認待ち' --next-step '承認後に再処理'
 ```
 
 ## データを保存する

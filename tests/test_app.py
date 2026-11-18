@@ -381,7 +381,7 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn('Traceback', invalid_token.stderr)
         self.assertEqual(set(json.loads(invalid_token.stderr)), {'error'})
         self.assertEqual(Store(self.db).get(item['id']), before)
-        completed = cli('complete', '--id', item['id'], '--token', token)
+        completed = cli('complete', '--id', item['id'], f'--token={token}')
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout)['answer']['status'], 'completed')
         self.assertNotEqual(cli('complete', '--id', item['id'], '--token', 'wrong').returncode, 0)
