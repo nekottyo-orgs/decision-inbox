@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import contextlib
 import sqlite3
 import subprocess
 import sys
@@ -130,14 +131,14 @@ class ChangeTests(unittest.TestCase):
 
     def test_decisions_表だけの旧_DB_を開いても動き_user_version_は_2_のまま(self):
         path = Path(self.temp.name) / 'old.sqlite3'
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(SCHEMA)
             connection.execute("INSERT INTO decisions(id,created_at,payload) VALUES(?,?,?)", ('b' * 32, '2026-01-01T00:00:00+00:00', json.dumps({**request_payload(), 'deadline': None, 'image': None})))
             connection.execute('PRAGMA user_version=2')
         store = Store(path)
         self.assertEqual(store.list()[0]['revision'], 0)
         self.assertEqual(store.withdraw('b' * 32, {'note': '旧 DB でも取り下げ'})['withdrawn']['note'], '旧 DB でも取り下げ')
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
             self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 2)
             columns = [row[1] for row in connection.execute('PRAGMA table_info(decisions)')]
         self.assertEqual(columns, ['id', 'created_at', 'payload', 'choice', 'memo', 'decided_at', 'status', 'worker', 'token', 'lease_until', 'request_key', 'reason', 'next_step', 'reported_at'])

@@ -221,7 +221,7 @@ class RecoveryTests(unittest.TestCase):
     def legacy_database(self):
         path = Path(self.temp.name) / 'legacy.sqlite3'
         rows = []
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
             connection.execute('''CREATE TABLE decisions (
                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL,
                 choice TEXT,memo TEXT,decided_at TEXT,
@@ -243,7 +243,7 @@ class RecoveryTests(unittest.TestCase):
         backups = list(path.parent.glob('legacy.sqlite3.pre-v2-*.sqlite3'))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
-        with sqlite3.connect(backups[0]) as backup:
+        with contextlib.closing(sqlite3.connect(backups[0])) as backup, backup:
             self.assertEqual(backup.execute(f'SELECT {LEGACY_COLUMNS} FROM decisions ORDER BY id').fetchall(), original)
             self.assertEqual(backup.execute('PRAGMA user_version').fetchone()[0], 0)
         with migrated.db() as connection:
@@ -267,7 +267,7 @@ class RecoveryTests(unittest.TestCase):
 
         with patch.object(Store, 'db', denied_db), self.assertRaises(sqlite3.DatabaseError):
             Store(path)
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
             self.assertEqual(connection.execute(f'SELECT {LEGACY_COLUMNS} FROM decisions ORDER BY id').fetchall(), original)
             self.assertNotIn('request_key', {row[1] for row in connection.execute('PRAGMA table_info(decisions)')})
             self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name='decisions_legacy'").fetchone())
