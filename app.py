@@ -12,6 +12,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -984,6 +985,32 @@ def task_lanes(store, lane=None):
     return {'lanes': [{'id': key, 'label': label, 'tasks': [task for task in tasks if task['lane'] == key]} for key, label in LANES.items() if lane in (None, key)]}
 
 
+def hooks_dir():
+    override = os.environ.get('DECISION_INBOX_HOOKS_DIR')
+    if override:
+        return Path(override).expanduser().absolute()
+    return Path(os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')).expanduser().absolute() / 'decision-inbox' / 'hooks'
+
+
+def pre_add_hook():
+    path = hooks_dir() / 'pre-add'
+    return path if path.is_file() and os.access(path, os.X_OK) else None
+
+
+def run_pre_add(item):
+    # 登録の可否は呼び出し元 (agent の pane) の env で決まるので、CLI だけが呼ぶ。HTTP は server の env しか持たない
+    hook = pre_add_hook()
+    if hook is None:
+        return
+    try:
+        finished = subprocess.run([str(hook)], input=json.dumps(item, ensure_ascii=False).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as error:
+        # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
+        raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
+    if finished.returncode != 0:
+        raise AppError(400, 'pre-add が登録を断りました: ' + finished.stderr.decode(errors='replace')[:500])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -1015,6 +1042,7 @@ def main(argv=None):
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)
     claim.add_argument('--key-prefix')
+    commands.add_parser('hooks', help='pre-add の実行パスを JSON で出す')
     complete = commands.add_parser('complete')
     complete.add_argument('--id', required=True)
     complete.add_argument('--token', required=True)
@@ -1061,6 +1089,11 @@ def main(argv=None):
             sub.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'hooks':
+            # Store を開かない。対応版かを確かめるだけの呼び出しで DB を作ったり移行したりしないため
+            hook = pre_add_hook()
+            print(json.dumps({'pre_add': hook and str(hook)}, ensure_ascii=False))
+            return 0
         if args.command == 'tui':
             web_url = tui_web_url(args.web_url)
             if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1095,7 +1128,12 @@ def main(argv=None):
                 raw = handle.read(MAX_BODY + 1)
             if len(raw) > MAX_BODY:
                 raise AppError(413, '送信サイズが上限を超えています')
-            result = store.add(parse_json(raw)) if args.command == 'add' else store.update(args.id, {'note': args.note, 'changes': parse_json(raw)})
+            if args.command == 'add':
+                payload = parse_json(raw)
+                run_pre_add(validate_request(payload))
+                result = store.add(payload)
+            else:
+                result = store.update(args.id, {'note': args.note, 'changes': parse_json(raw)})
         elif args.command == 'withdraw':
             result = store.withdraw(args.id, {'note': args.note})
         elif args.command == 'list':

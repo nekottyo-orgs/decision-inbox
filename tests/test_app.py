@@ -1,6 +1,7 @@
 import copy
 import http.client
 import json
+import os
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -15,6 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import AppError, Store, make_server
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def isolated_env(temp):
+    # 端末に配線した pre-add を CLI のテストが踏まないようにする
+    return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks')}
 
 
 def request_payload(**changes):
@@ -355,7 +361,7 @@ class HTTPTests(unittest.TestCase):
         fixture.write_text(json.dumps(request_payload()), encoding='utf-8')
 
         def cli(*arguments):
-            return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), *arguments], capture_output=True, text=True, timeout=10)
+            return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), *arguments], capture_output=True, text=True, timeout=10, env=isolated_env(self.temp.name))
 
         added = cli('add', '--file', str(fixture))
         self.assertEqual(added.returncode, 0, added.stderr)
