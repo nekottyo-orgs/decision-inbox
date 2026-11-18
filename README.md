@@ -89,6 +89,19 @@ python3 app.py task delete --id fix-login
 
 TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。完了の lane は既定で畳まれ、「完了 (件数)」だけが出ます。`d` で開閉します (Web でも完了は件数付きで畳まれています。開閉の状態は保存しません)。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済み / 取り下げを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
 
+## run と pane の対応を記録する
+
+agent の実行 (run) がどの pane・socket で動いているかを CLI で記録します。HTTP API はありません。`PRAGMA user_version` は 2 のままで、旧 release に戻してもそのまま動きます (runs 表は無視されます)。
+
+```sh
+python3 app.py run open --run-id RUN --role worker --pane 1-2 --socket /tmp/herdr.sock
+python3 app.py run show --run-id RUN
+python3 app.py run show --pane 1-2 --socket /tmp/herdr.sock [--all]
+python3 app.py run close --run-id RUN --role worker
+```
+
+同じ `run_id` と `role` の開いた行があると `open` は断ります。`show` は開いた行だけを出し、`--all` で閉じた行も出します。
+
 ## 配置と更新
 
 開発用 worktree と分離する配置例として、`~/.local/share/cue/releases/<commit SHA>/` に検証済みの版を保存し、`~/.local/share/cue/current` から参照できます。`~/.local/bin/decision-inbox` を `current/app.py` へのリンクにすると、開発用 worktree の移動や片づけに依存せず起動できます。DB は repo 外の user data directory に保持します。

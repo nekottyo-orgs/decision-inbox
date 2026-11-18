@@ -385,6 +385,12 @@ class Store:
             connection.execute('''CREATE TABLE IF NOT EXISTS decision_changes (
                 id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
                 recorded_at TEXT NOT NULL, note TEXT NOT NULL, before TEXT)''')
+            # runs も同じく IF NOT EXISTS で足すだけで、user_version は上げない (理由は tasks と同じ)。
+            # 開いた行 = closed_at が NULL。同じ run_id と role の開いた行は 1 つだけにする
+            connection.execute('''CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, role TEXT NOT NULL, pane TEXT NOT NULL, socket TEXT NOT NULL,
+                opened_at TEXT NOT NULL, closed_at TEXT)''')
+            connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS runs_open ON runs(run_id, role) WHERE closed_at IS NULL')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -644,6 +650,38 @@ class Store:
             if not connection.execute('DELETE FROM tasks WHERE id=?', (identifier,)).rowcount:
                 raise AppError(404, 'task が見つかりません')
         return {'deleted': identifier}
+
+    def open_run(self, payload):
+        object_fields(payload, ('run_id', 'role', 'pane', 'socket'), ())
+        for key, value in payload.items():
+            if not isinstance(value, str) or not value.strip() or len(value) > 200:
+                raise AppError(400, f'{key} は 1 から 200 文字の文字列を指定してください')
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if connection.execute('SELECT 1 FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (payload['run_id'], payload['role'])).fetchone():
+                raise AppError(409, '同じ run_id と role の開いた run があります')
+            cursor = connection.execute('INSERT INTO runs(run_id,role,pane,socket,opened_at) VALUES(?,?,?,?,?)',
+                                        (payload['run_id'], payload['role'], payload['pane'], payload['socket'], utc_now()))
+            return dict(connection.execute('SELECT * FROM runs WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+    def close_run(self, run_id, role):
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT id FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (run_id, role)).fetchone()
+            if not row:
+                raise AppError(404, '開いた run が見つかりません')
+            connection.execute('UPDATE runs SET closed_at=? WHERE id=?', (utc_now(), row['id']))
+            return dict(connection.execute('SELECT * FROM runs WHERE id=?', (row['id'],)).fetchone())
+
+    def runs(self, run_id=None, pane=None, socket=None, include_closed=False):
+        if run_id is None and (pane is None or socket is None):
+            raise AppError(400, '--run-id か、--pane と --socket の組を指定してください')
+        if run_id is not None and (pane is not None or socket is not None):
+            raise AppError(400, '--run-id と --pane / --socket は同時に指定できません')
+        where, values = ('run_id=?', (run_id,)) if run_id is not None else ('pane=? AND socket=?', (pane, socket))
+        with self.db() as connection:
+            rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
+            return {'runs': [dict(row) for row in rows]}
 
     def tasks(self, lane=None):
         if lane is not None and lane not in LANES:
@@ -1232,6 +1270,21 @@ def main(argv=None):
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')
+    run = commands.add_parser('run', help='agent の実行 (run) と pane の対応を記録する')
+    run_commands = run.add_subparsers(dest='run_command', required=True)
+    for name in ('open', 'close', 'show'):
+        sub = run_commands.add_parser(name, help={'open': 'run を開く。同じ run_id と role の開いた行があれば 409', 'close': 'run を閉じて closed_at を入れる', 'show': 'run_id か pane と socket の組で引く。既定は開いた行だけ'}[name])
+        if name == 'show':
+            sub.add_argument('--run-id')
+            sub.add_argument('--pane')
+            sub.add_argument('--socket')
+            sub.add_argument('--all', action='store_true', help='閉じた行も出す')
+        else:
+            sub.add_argument('--run-id', required=True)
+            sub.add_argument('--role', required=True)
+        if name == 'open':
+            sub.add_argument('--pane', required=True)
+            sub.add_argument('--socket', required=True)
     for sub in (complete, report, renew):
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument('--token')
@@ -1263,6 +1316,15 @@ def main(argv=None):
                     pass
             return 0
         store = Store(args.db, readonly=args.command in ('watch', 'backup'))
+        if args.command == 'run':
+            if args.run_command == 'open':
+                result = store.open_run({'run_id': args.run_id, 'role': args.role, 'pane': args.pane, 'socket': args.socket})
+            elif args.run_command == 'close':
+                result = store.close_run(args.run_id, args.role)
+            else:
+                result = store.runs(args.run_id, args.pane, args.socket, args.all)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.command == 'task':
             result = run_task(store, args)
             if result is None:

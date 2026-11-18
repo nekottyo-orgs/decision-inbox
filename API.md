@@ -101,6 +101,9 @@ python3 app.py --db /tmp/decision-test.sqlite3 report --id ID (--token TOKEN | -
 python3 app.py --db /tmp/decision-test.sqlite3 retry --id ID --decided-at ANSWER_TIMESTAMP --reported-at REPORT_TIMESTAMP
 python3 app.py --db /tmp/decision-test.sqlite3 close --id ID --decided-at ANSWER_TIMESTAMP --reported-at REPORT_TIMESTAMP
 python3 app.py --db /tmp/decision-test.sqlite3 backup --output /tmp/decision-backup.sqlite3
+python3 app.py --db /tmp/decision-test.sqlite3 run open --run-id RUN --role worker --pane P --socket SOCKET
+python3 app.py --db /tmp/decision-test.sqlite3 run close --run-id RUN --role worker
+python3 app.py --db /tmp/decision-test.sqlite3 run show (--run-id RUN | --pane P --socket SOCKET) [--all]
 python3 app.py --db /tmp/decision-test.sqlite3 task add --id ID --title 題名 [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--lane L] [--decision DECISION_ID]
 python3 app.py --db /tmp/decision-test.sqlite3 task move --id ID --lane worker
 python3 app.py --db /tmp/decision-test.sqlite3 task update --id ID [--title T] [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--decision DECISION_ID]
@@ -109,6 +112,8 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 ```
 
 `task` は依頼の進み具合を管理する機能で、書き込みは CLI が行い、判断への回答 (Web の `POST /api/decisions/{id}/answer` と TUI) だけは、その判断に紐付く human_decision の task を同じ transaction で todo へ移し、remaining の先頭に「Cue 回答済み: <choice>。」を足す。undo では task を戻さない。HTTP は一覧の `GET /api/tasks` (`list --json` と同じ形) だけを出し、Web の task 画面はこれを読み取り専用で表示する。lane は `todo` / `human_decision` / `worker` / `human_action` / `done`。`add` は同じ id で登録内容 (title / request / pane / run) が同じなら既存を返し、違えば 409。lane / result / remaining / decision_id は move / update で進むため比べず、再送しても既存の値は変わらない。`--decision` は 32 桁 hex 以外を 400、存在しない判断を 404 にする。不正な `--lane` は `list` / `list --json` / `add` / `move` とも 400。`update` は指定した項目だけを変え、空文字で消去する (`--decision` の空文字は関連付けの解除)。`list --json` は `{"lanes":[{"id","label","tasks":[...]}]}` を返し、各 task の `decision` は判断が無ければ null、あれば `{"title":"判断の題名","answered":false,"withdrawn":false}` (判断 ID が残っていて判断が見つからないときも null)。`--json` なしは lane ごとの文字の一覧を出す。task 系は DB を書き込み可で開くため、tasks 表が無い DB には表を足す (`PRAGMA user_version` は 2 のまま)。
+
+`run` は agent の実行と pane の対応を runs 表に記録する CLI 専用の機能で、HTTP API は無い。行は `{"id","run_id","role","pane","socket","opened_at","closed_at"}` で、開いた行は `closed_at` が null。`open` は 4 項目すべて必須 (1 から 200 文字) で、同じ `run_id` と `role` の開いた行があれば 409 (閉じれば開き直せる)。`close` は `run_id` と `role` の開いた行に `closed_at` を入れ、無ければ 404。`show` は `--run-id` か `--pane` と `--socket` の組のどちらか一方で引き、`{"runs":[...]}` を返す。既定は開いた行だけで、`--all` で閉じた行も出す。runs 表は tasks 表と同じく足すだけで既存の表を変えず、`PRAGMA user_version` は 2 のまま。
 
 `add --help` で必須・任意の項目と型の一覧・最小 JSON 例、`list --help` と `task list --help` で出力の形 (`list` は `{"decisions":[...],"demo":false}` の object、`task list --json` は `{"lanes":[...]}`) を確認できる。
 
