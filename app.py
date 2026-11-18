@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -1005,16 +1006,27 @@ def run_pre_add(item):
     hook = pre_add_hook()
     if hook is None:
         return
-    try:
-        finished = subprocess.run([str(hook)], input=json.dumps(item, ensure_ascii=False).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=PRE_ADD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        # 止まった hook で全 pane の add が詰まらないよう打ち切る。検査が終わっていないので登録はしない
-        raise AppError(400, f'pre-add が登録を断りました: {PRE_ADD_TIMEOUT} 秒で終わりませんでした') from None
-    except OSError as error:
-        # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
-        raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
-    if finished.returncode != 0:
-        raise AppError(400, 'pre-add が登録を断りました: ' + finished.stderr.decode(errors='replace')[:500])
+    # stderr は一時ファイルに逃がし、先頭だけ読む。PIPE だと饒舌な hook の出力を全量メモリに溜める
+    with tempfile.TemporaryFile() as errors:
+        try:
+            # 別の process group で起動し、打ち切るときに hook が起こした子もまとめて止める
+            process = subprocess.Popen([str(hook)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True)
+        except OSError as error:
+            # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
+            raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
+        try:
+            process.communicate(json.dumps(item, ensure_ascii=False).encode(), timeout=PRE_ADD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # 止まった hook で全 pane の add が詰まらないよう打ち切る。検査が終わっていないので登録はしない
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise AppError(400, f'pre-add が登録を断りました: {PRE_ADD_TIMEOUT} 秒で終わりませんでした') from None
+        if process.returncode != 0:
+            errors.seek(0)
+            raise AppError(400, 'pre-add が登録を断りました: ' + errors.read(2000).decode(errors='replace')[:500])
 
 
 def main(argv=None):

@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -104,6 +105,25 @@ class PreAddTimeoutTests(unittest.TestCase):
                 with self.assertRaises(AppError) as caught:
                     app.run_pre_add(request_payload())
             self.assertIn('0.2 秒で終わりませんでした', str(caught.exception))
+
+    def test_打ち切りでは_hook_が起こした子も止める(self):
+        with tempfile.TemporaryDirectory() as temp:
+            hook = Path(temp) / 'pre-add'
+            pid_file = Path(temp) / 'child.pid'
+            hook.write_text(f'#!/bin/sh\nsleep 5 &\necho $! > {pid_file}\nwait\n', encoding='utf-8')
+            hook.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {'DECISION_INBOX_HOOKS_DIR': temp}), unittest.mock.patch.object(app, 'PRE_ADD_TIMEOUT', 0.5):
+                with self.assertRaises(AppError):
+                    app.run_pre_add(request_payload())
+            child = int(pid_file.read_text())
+            for _ in range(50):
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail('打ち切り後も hook の子が残っている')
 
 
 if __name__ == '__main__':

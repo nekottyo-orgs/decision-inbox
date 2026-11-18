@@ -121,7 +121,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 
 HTTP API は変わらない。
 
-- **pre-add**: `add` は JSON を読んで検証した後・登録の前に pre-add を起動する。場所は `DECISION_INBOX_HOOKS_DIR`、無ければ `${XDG_CONFIG_HOME:-~/.config}/decision-inbox/hooks` の下の `pre-add`。stdin は検証済みの payload の JSON、env は呼び出し元を継承、hook の stdout は捨てる。exit 0 なら登録、非 0 なら登録せず exit 1 で stderr に `{"error":"pre-add が登録を断りました: <hook の stderr 先頭 500 字>"}`。起動に失敗したとき (interpreter が無い等) も登録せず同じ接頭辞で exit 1。10 秒で終わらないときも打ち切って登録しない。ファイルが無い・実行可能でないなら何もしない。検証で弾かれた payload では hook を呼ばない
+- **pre-add**: `add` は JSON を読んで検証した後・登録の前に pre-add を起動する。場所は `DECISION_INBOX_HOOKS_DIR`、無ければ `${XDG_CONFIG_HOME:-~/.config}/decision-inbox/hooks` の下の `pre-add`。stdin は検証済みの payload の JSON、env は呼び出し元を継承、hook の stdout は捨てる。exit 0 なら登録、非 0 なら登録せず exit 1 で stderr に `{"error":"pre-add が登録を断りました: <hook の stderr 先頭 500 字>"}`。起動に失敗したとき (interpreter が無い等) も登録せず同じ接頭辞で exit 1。10 秒で終わらないときは hook が起こした子を含めて止め、登録しない。hook は登録済みかを調べる前に走るので、登録済みの request_key で再送した add も hook が断れば exit 1 になる (API なら既存の判断が返る)。この拒否は前回の add が失敗した印にならない。ファイルが無い・実行可能でないなら何もしない。検証で弾かれた payload では hook を呼ばない
 - 対象外: `POST /api/decisions` は server の env が呼び出し元の pane を表さないので呼ばない。`update` は `request_key` を変えられない (変えると 400) ので、key で判定する hook は add の時点で済む。title や reason を見る hook は update の後には掛からない
 - **hooks**: `{"pre_add":"<実行するパス>" | null}` を返す。DB を開かない。旧版はこのサブコマンドを知らず argparse の exit 2 になるので、呼び手は pre-add に対応した CLI かをこれで判定する
 
