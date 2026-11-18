@@ -91,11 +91,13 @@ python3 app.py --db /tmp/decision-test.sqlite3 update --id ID --note "更新の�
 python3 app.py --db /tmp/decision-test.sqlite3 withdraw --id ID --note "取り下げの理由"
 python3 app.py --db /tmp/decision-test.sqlite3 watch --interval 2 --timeout 1740
 python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/ [--files-root DIR]
-python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300
-python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID --token TOKEN
+python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300 [--token-file auto|PATH]
+python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID (--token TOKEN | --token-file PATH)
+python3 app.py --db /tmp/decision-test.sqlite3 claims [--id ID]
+python3 app.py --db /tmp/decision-test.sqlite3 hooks
 python3 app.py --db /tmp/decision-test.sqlite3 undo --id ID --decided-at ANSWER_TIMESTAMP
-python3 app.py --db /tmp/decision-test.sqlite3 renew --id ID --token TOKEN --lease-seconds 3600
-python3 app.py --db /tmp/decision-test.sqlite3 report --id ID --token TOKEN --status blocked --reason "承認が必要" --next-step "承認後に再試行"
+python3 app.py --db /tmp/decision-test.sqlite3 renew --id ID (--token TOKEN | --token-file PATH) --lease-seconds 3600
+python3 app.py --db /tmp/decision-test.sqlite3 report --id ID (--token TOKEN | --token-file PATH) --status blocked --reason "承認が必要" --next-step "承認後に再試行"
 python3 app.py --db /tmp/decision-test.sqlite3 retry --id ID --decided-at ANSWER_TIMESTAMP --reported-at REPORT_TIMESTAMP
 python3 app.py --db /tmp/decision-test.sqlite3 close --id ID --decided-at ANSWER_TIMESTAMP --reported-at REPORT_TIMESTAMP
 python3 app.py --db /tmp/decision-test.sqlite3 backup --output /tmp/decision-backup.sqlite3
@@ -115,6 +117,20 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
 
 入力不正のうち型・必須・未知の項目・許す値の問題は、項目名・期待する型 (または許す値)・受け取った型を全件 `; ` 区切りで 1 本の `error` に並べる。先頭は `JSON の項目を確認してください: ` で、項目名は `links[0].kind` のように添字・入れ子つき。例は `{"error":"JSON の項目を確認してください: links[0] は {url: string, label: string, kind: pr / issue / other} を指定してください (受け取った型: string)"}`。文字数・件数・URL の形・deadline・recommended の不正は従来どおり 1 件ずつ返す。`add` / `POST /api/decisions` / `update` のほか、claim / report などの入力も欠けた項目と未知の項目の名前を返す。
+
+### pre-add と token ファイル (CLI のみ)
+
+HTTP API は変わらない。以下は CLI だけの契約。
+
+- **pre-add**: `add` は JSON を読んで検証した後・登録の前に `${DECISION_INBOX_HOOKS_DIR:-${XDG_CONFIG_HOME:-~/.config}/decision-inbox/hooks}/pre-add` を起動する。stdin は検証済みの payload の JSON、env は呼び出し元を継承、hook の stdout は捨てる。exit 0 なら登録、非 0 なら登録せず exit 1 で stderr に `{"error":"pre-add が登録を断りました: <hook の stderr 先頭 500 字>"}`。起動に失敗したとき (interpreter が無い等) も登録せず同じ接頭辞で exit 1。ファイルが無い・実行可能でないなら何もしない。検証で弾かれた payload では hook を呼ばない。`update` と `POST /api/decisions` は対象外 (server の env は呼び出し元の pane を表さない)
+- **hooks**: `{"pre_add":"<実行するパス>" | null,"claims_dir":"<パス>"}` を返す。DB を開かない。旧版はこのサブコマンドを知らず argparse の exit 2 になるので、呼び手は pre-add と token ファイルに対応した CLI かをこれで判定する
+- **claims_dir**: `DECISION_INBOX_CLAIMS_DIR`、無ければ DB と同じディレクトリの `claims/`。`claim --token-file auto` が mode 0700 で作る
+- **claim --token-file auto|PATH**: token をファイルに保存し、stdout の JSON から `token` を外して `token_file` (絶対パス) を入れる。`auto` は claims_dir に `<decision id>-<16 桁 hex>.json`、PATH は指定したパスに作る。中身は `{"id","token","worker","expires_at"}`、mode 0600。claim ごとに別のファイル名にするのは、同じ worker 名で再 claim されたときに旧プロセスが新しい token を読んで照合を通らないようにするため
+  - 順序は、一時ファイル (宛先と同じディレクトリ、O_EXCL) を開く → claim の transaction の中で token を書いて fsync → 宛先へ公開 → commit。一時ファイルを開けなければ claim せず exit 1。書き込みか公開に失敗したら rollback して claim しない。PATH が既にあれば上書きせず失敗する (exit 1、claim しない)。対象が無ければ一時ファイルを消して `{"decision":null}`
+  - `auto` の claim のたびに、claims_dir の中で `expires_at` から 24 時間過ぎたファイルを消す
+- **complete / report / renew --token-file PATH**: `--token` と排他でどちらか必須 (両方・どちらも無しは argparse の exit 2)。ファイルの `id` が `--id` と違えば 400 (exit 1)。complete / report が成功したらファイルを消す。renew は成功後にファイルの `expires_at` を書き換える (一時ファイルから置き換え、0600)。token が無効なら従来どおり 409 (exit 1) でファイルは残る
+- **claims [--id ID]**: `{"claims":[{"id","token_file","worker","expires_at","active"}]}`。active は DB の現在の token と一致し lease 内か (ファイルの expires_at ではなく DB で判定)。token の値は出さない。読めないファイルは飛ばす
+- `--token-file` を付けない claim / complete / report / renew は従来どおり token を stdout に出し、`--token` で受ける
 
 `tui` は対話端末で同じ Store を利用し、選択した回答を既存の回答保存処理に渡す。非 TTY では DB を作らずエラー終了。`--web-url` / `CUE_WEB_URL` は任意で loopback の http(s) URL のみ。Web の `?decision=<id>` は対象の未判断または判断済みを初期表示し、不明な ID では通常の優先度順表示になる。
 

@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import ADD_EXAMPLE, REQUEST_FIELDS, AppError, Store, make_server, object_fields
-from test_app import request_payload
+from test_app import isolated_env, request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,7 +21,7 @@ class SelfDescribeCliTests(unittest.TestCase):
         self.db = Path(self.temp.name) / 'cli.sqlite3'
 
     def cli(self, *arguments):
-        return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), *arguments], capture_output=True, text=True, timeout=10)
+        return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), *arguments], capture_output=True, text=True, timeout=10, env=isolated_env(self.temp.name))
 
     def write(self, value, name='payload.json'):
         path = Path(self.temp.name) / name
