@@ -271,8 +271,9 @@ class InProcessTokenFileTests(unittest.TestCase):
         try:
             connection.execute('BEGIN IMMEDIATE')
         except sqlite3.OperationalError as error:
-            # ロック待ち以外の失敗 (I/O エラー等) を「ロックを握っている」と読まない
-            if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+            # ロック待ち (SQLITE_BUSY) 以外の失敗 (I/O エラー等) を「ロックを握っている」と読まない。
+            # sqlite_errorcode は Python 3.11 からなので、どの Python の version でも同じ SQLite の文言で見分ける
+            if str(error) != 'database is locked':
                 raise
             return True
         finally:
@@ -399,19 +400,45 @@ class InProcessTokenFileTests(unittest.TestCase):
         self.assertEqual((caught.exception.status, str(caught.exception)), (409, 'token ファイルの書き込み中に lease が切れました'))
         self.assertEqual(self.store.get(self.item['id'])['answer']['status'], 'pending')
 
-    def test_更新中に_lease_が切れた_renew_は_commit_しない(self):
-        claimed = self.store.claim('w', 300)
+    def lease_until(self):
         with self.store.db() as connection:
-            before = connection.execute('SELECT lease_until FROM decisions WHERE id=?', (self.item['id'],)).fetchone()[0]
+            return connection.execute('SELECT lease_until FROM decisions WHERE id=?', (self.item['id'],)).fetchone()[0]
+
+    def test_更新中に_lease_が切れた_renew_は_commit_しない(self):
         now = time.time()
         with mock.patch.object(app.time, 'time', return_value=now) as clock:
+            claimed = self.store.claim('w', 300)
+
             def expire(result):
-                clock.return_value = before
+                # 300 秒から 600 秒への本当の延長を試み、callback の中で新しい期限まで時計を進める
+                clock.return_value = now + 600
             with self.assertRaises(AppError) as caught:
-                self.store.renew(self.item['id'], {'token': claimed['token'], 'lease_seconds': 1}, on_renew=expire)
+                self.store.renew(self.item['id'], {'token': claimed['token'], 'lease_seconds': 600}, on_renew=expire)
         self.assertEqual((caught.exception.status, str(caught.exception)), (409, 'token ファイルの更新中に lease が切れました'))
-        with self.store.db() as connection:
-            self.assertEqual(connection.execute('SELECT lease_until FROM decisions WHERE id=?', (self.item['id'],)).fetchone()[0], before)
+        self.assertEqual(self.lease_until(), now + 300)
+
+    def test_commit_の後に_lease_が切れた_renew_は保存したまま_409_を返す(self):
+        now = time.time()
+        with mock.patch.object(app.time, 'time', return_value=now) as clock:
+            claimed = self.store.claim('w', 300)
+            # active の確認では now、commit の後の確認では新しい期限を過ぎた時刻を返す (commit の待ちで切れた状態)
+            clock.side_effect = [now, now + 700]
+            with self.assertRaises(AppError) as caught:
+                self.store.renew(self.item['id'], {'token': claimed['token'], 'lease_seconds': 600})
+        self.assertEqual((caught.exception.status, str(caught.exception)), (409, '延長は保存しましたが lease は既に切れています。この token は使えません'))
+        self.assertEqual(self.lease_until(), now + 600)
+
+    def test_一時ファイルの警告は_stderr_が無くても_stdout_を汚さない(self):
+        temp = mock.Mock()
+        temp.unlink.side_effect = PermissionError(13, 'Permission denied')
+        out = io.StringIO()
+        with mock.patch.object(app.sys, 'stderr', None), contextlib.redirect_stdout(out):
+            app.unlink_temp(temp)
+        self.assertEqual(out.getvalue(), '')
+        broken = mock.Mock()
+        broken.write.side_effect = OSError(5, 'Input/output error')
+        with mock.patch.object(app.sys, 'stderr', broken):
+            app.unlink_temp(temp)
 
 
 if __name__ == '__main__':

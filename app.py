@@ -786,6 +786,9 @@ class Store:
                 # claim と同じく、ファイル更新に lease 以上かかったら延長を成功扱いにしない
                 if time.time() >= expires:
                     raise AppError(409, 'token ファイルの更新中に lease が切れました')
+        # commit は読み手のロック解放を busy timeout まで待つことがあり、その間に短い lease は切れうる
+        if time.time() >= expires:
+            raise AppError(409, '延長は保存しましたが lease は既に切れています。この token は使えません')
         return result
 
     def lease_of(self, identifier, token):
@@ -1147,7 +1150,11 @@ def unlink_temp(path):
     try:
         path.unlink(missing_ok=True)
     except OSError as error:
-        print(json.dumps({'warning': f'token を含む一時ファイルを消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
+        # 警告は出せたら出す。2>&- で stderr が None だと print は stdout に書いて結果の JSON を壊し、
+        # 書き込みの失敗を投げると finally から claim の結果や元の例外を潰す
+        if sys.stderr is not None:
+            with suppress(OSError, ValueError):
+                print(json.dumps({'warning': f'token を含む一時ファイルを消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
 
 
 TOKEN_FILE_LIMIT = 65536
