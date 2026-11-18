@@ -95,6 +95,18 @@ class CliPreAddTests(unittest.TestCase):
         self.assertFalse(called.exists())
 
 
+class HooksDirTests(unittest.TestCase):
+    def test_default_hooks_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # clear=True は他テストの環境変数の扱いを壊すため、値を入れて override だけ外す
+            with unittest.mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': tmp}):
+                os.environ.pop('DECISION_INBOX_HOOKS_DIR', None)
+                self.assertEqual(app.hooks_dir(), Path(tmp).absolute() / 'decision-inbox' / 'hooks')
+            with unittest.mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': '', 'HOME': tmp}):
+                os.environ.pop('DECISION_INBOX_HOOKS_DIR', None)
+                self.assertEqual(app.hooks_dir(), Path(tmp).absolute() / '.config' / 'decision-inbox' / 'hooks')
+
+
 class PreAddTimeoutTests(unittest.TestCase):
     def test_終わらない_pre_add_は打ち切って断る(self):
         with tempfile.TemporaryDirectory() as temp:
