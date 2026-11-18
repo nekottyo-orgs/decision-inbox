@@ -1130,7 +1130,7 @@ def run_pre_add(item):
 
 
 def require_run_prefix(store, item):
-    # pre-add の有無・場所・--db に依らず効く層。呼び出し pane が開いた run の行を持つのに、request_key が
+    # pre-add の有無・場所に依らず効く層 (runs 表は --db が指す DB のものを引くので、別 DB を指すと素通りするが登録先も同じ別 DB)。呼び出し pane が開いた run の行を持つのに、request_key が
     # その run の frontdesk-<run>/ で始まらない add を断る。行の無い pane (他用途) は通す。HTTP は pane を知らないので対象外
     pane = os.environ.get('HERDR_PANE_ID')
     if not pane:
