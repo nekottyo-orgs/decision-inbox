@@ -28,8 +28,8 @@ class RunTests(unittest.TestCase):
             call(*args)
         return caught.exception.status
 
-    def cli(self, *arguments, script=None):
-        return subprocess.run([sys.executable, str(script or ROOT / 'app.py'), '--db', str(self.db), *arguments], capture_output=True, text=True, timeout=10, env=isolated_env(self.temp.name))
+    def cli(self, *arguments, script=None, db=None):
+        return subprocess.run([sys.executable, str(script or ROOT / 'app.py'), '--db', str(db or self.db), *arguments], capture_output=True, text=True, timeout=10, env=isolated_env(self.temp.name))
 
     def run_open(self, **changes):
         return self.store.open_run({'run_id': 'r1', 'role': 'worker', 'pane': 'p1', 'socket': '/tmp/s', **changes})
@@ -109,14 +109,22 @@ class RunTests(unittest.TestCase):
             self.skipTest('旧 release の app.py を git から取り出せない')
         old = Path(self.temp.name) / 'old_app.py'
         old.write_bytes(shown.stdout)
-        decision = self.store.add(request_payload())
-        self.run_open()
-        listed = self.cli('list', script=old)
+        # setUp の DB は新しい Store が作るので runs 表が最初からある。旧 release に別の DB を作らせ、既存の DB に表を足す経路を通す
+        legacy = Path(self.temp.name) / 'legacy.sqlite3'
+        fixture = Path(self.temp.name) / 'request.json'
+        fixture.write_text(json.dumps(request_payload()), encoding='utf-8')
+        added = self.cli('add', '--file', str(fixture), script=old, db=legacy)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        opened = self.cli('run', 'open', '--run-id', 'r1', '--role', 'worker', '--pane', 'p1', '--socket', '/tmp/s', db=legacy)
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        listed = self.cli('list', script=old, db=legacy)
         self.assertEqual(listed.returncode, 0, listed.stderr)
-        self.assertEqual(json.loads(listed.stdout)['decisions'][0]['id'], decision['id'])
-        answered = self.cli('task', 'add', '--id', 't1', '--title', '題', script=old)
+        self.assertEqual(json.loads(listed.stdout)['decisions'][0]['id'], json.loads(added.stdout)['id'])
+        answered = self.cli('task', 'add', '--id', 't1', '--title', '題', script=old, db=legacy)
         self.assertEqual(answered.returncode, 0, answered.stderr)
-        self.assertEqual(self.cli('run', 'show', '--run-id', 'r1').returncode, 0)
+        shown = self.cli('run', 'show', '--run-id', 'r1', db=legacy)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(json.loads(shown.stdout), {'runs': [json.loads(opened.stdout)]})
 
 
 if __name__ == '__main__':
