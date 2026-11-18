@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local decision inbox, using only the Python standard library."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -715,6 +715,9 @@ class Store:
             # commit の前に呼ぶ。on_claim が失敗すれば claim ごと rollback され、token を失った claim が残らない
             if on_claim:
                 on_claim(result)
+                # 書き込みに lease 以上かかると、成功を返しても complete / renew が token を断る claim になる
+                if time.time() >= expires:
+                    raise AppError(409, 'token ファイルの書き込み中に lease が切れました')
         return result
 
     def report(self, identifier, payload):
@@ -762,7 +765,7 @@ class Store:
             connection.execute("UPDATE decisions SET status='completed' WHERE id=?", (identifier,))
         return self.get(identifier)
 
-    def renew(self, identifier, payload):
+    def renew(self, identifier, payload, on_renew=None):
         object_fields(payload, ('token',), ('lease_seconds',))
         seconds = validate_lease(payload.get('lease_seconds', 300))
         with self.db() as connection:
@@ -771,8 +774,20 @@ class Store:
             now = self.active(row, payload['token'])
             expires = max(row['lease_until'], now + seconds)
             connection.execute('UPDATE decisions SET lease_until=? WHERE id=?', (expires, identifier))
-            decision = self.fetch(connection, identifier)
-        return {'decision': decision, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            result = {'decision': self.fetch(connection, identifier), 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+            # commit の前に呼ぶ。書き込みロックの中なので complete / report / 他の renew とファイル操作の順序が DB と揃う
+            if on_renew:
+                on_renew(result)
+        return result
+
+    def lease_of(self, identifier, token):
+        """claims_dir の掃除用。この DB に無い判断は None、あれば token が一致する claim の lease_until (無ければ 0)"""
+        with self.db() as connection:
+            row = connection.execute('SELECT token, lease_until FROM decisions WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            return None
+        matches = row['token'] and token.isascii() and secrets.compare_digest(row['token'], token)
+        return (row['lease_until'] or 0) if matches else 0
 
     def holder(self, identifier, token):
         # claims の active 判定。ファイルの expires_at でなく DB の現在の token と lease で決める
@@ -1111,10 +1126,30 @@ def write_synced(descriptor, data):
         os.fsync(handle.fileno())
 
 
+def fsync_dir(path):
+    # 一時ファイルの fsync だけでは link / replace で増えた名前が電源断で消えうる
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+TOKEN_FILE_LIMIT = 65536
+
+
 def read_token_file(path, identifier):
     try:
-        with open(path, 'rb') as handle:
-            data = json.loads(handle.read(65536))
+        # O_NONBLOCK で開く。書き手の無い FIFO だと通常の open が戻らない
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError
+            raw = handle.read(TOKEN_FILE_LIMIT + 1)
+        # 上限で切ってから decode すると、切れ目の後ろが壊れていても通ってしまう
+        if len(raw) > TOKEN_FILE_LIMIT:
+            raise ValueError
+        data = json.loads(raw)
     except (OSError, ValueError, UnicodeError):
         raise AppError(400, 'token ファイルを読めません') from None
     if not isinstance(data, dict) or not isinstance(data.get('token'), str):
@@ -1124,14 +1159,25 @@ def read_token_file(path, identifier):
     return data
 
 
-def sweep_claims(directory, now):
+CLAIM_FILE = re.compile(r'([0-9a-f]{32})-[0-9a-f]{16}\.json')
+
+
+def sweep_claims(store, directory, now):
     # lease 期限から 24 時間は残す。session が消えた後に claims --id で探す余地を残すため
     for path in Path(directory).glob('*.json'):
+        # claims_dir は env で他のファイルがある場所を指せるので、auto が作った名前と中身のものだけを消す
+        name = CLAIM_FILE.fullmatch(path.name)
         try:
-            expires = datetime.fromisoformat(json.loads(path.read_text(encoding='utf-8'))['expires_at']).timestamp()
-        except (OSError, ValueError, KeyError, TypeError):
+            data = read_token_file(path, name and name[1])
+            expires = datetime.fromisoformat(data['expires_at']).timestamp()
+        except (AppError, KeyError, TypeError, ValueError):
             continue
-        if expires + 86400 < now:
+        if not name or not isinstance(data.get('worker'), str):
+            continue
+        # --token や HTTP の renew はファイルの expires_at を書き換えないので DB の lease も見る。
+        # この DB に無い判断 (claims_dir を共有する別 DB の claim) は失効を確かめられないので残す
+        lease = store.lease_of(data['id'], data['token'])
+        if lease is not None and max(expires, lease) + 86400 < now:
             path.unlink(missing_ok=True)
 
 
@@ -1140,9 +1186,11 @@ def claim_to_file(store, args):
     if not args.token_file:
         raise AppError(400, '--token-file には auto かパスを指定してください')
     directory = claims_dir(args.db)
+    created = False
     if args.token_file == 'auto':
+        created = not directory.exists()
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-        sweep_claims(directory, time.time())
+        sweep_claims(store, directory, time.time())
         target = None
     else:
         target = Path(args.token_file).expanduser().absolute()
@@ -1160,20 +1208,48 @@ def claim_to_file(store, args):
         # rename でなく link にする。宛先が既にあれば上書きせず失敗させ、他の claim のファイルを壊さない
         os.link(temp, final)
         published.append(final)
+        fsync_dir(final.parent)
+        if created:
+            fsync_dir(directory.parent)
         result['token_file'] = str(final)
 
     try:
         result = store.claim(args.worker, args.lease_seconds, args.key_prefix, on_claim=save)
     except BaseException:
         for path in published:
-            path.unlink(missing_ok=True)
+            # 後始末の失敗で元の例外を隠さない
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
         raise
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        temp.unlink(missing_ok=True)
+        # commit 後に一時名を消せなくても claim は成立している。結果を失うほうが困るので握る
+        # (残った .claim-*.tmp は列挙にも掃除にも掛からない)
+        with suppress(OSError):
+            temp.unlink(missing_ok=True)
     result.pop('token', None)
     return result
+
+
+def renew_with_file(store, args):
+    path = args.token_file
+    data = read_token_file(path, args.id)
+
+    def save(result):
+        # 書き込みロックの中で読み直す。ファイルが別経路で消え、同じ PATH に別の claim が入っていたら上書きしない
+        if read_token_file(path, args.id)['token'] != data['token']:
+            raise AppError(409, 'token ファイルが別の claim のものに置き換わっています')
+        descriptor, temp = open_temp(path.parent)
+        try:
+            write_synced(descriptor, {**data, 'expires_at': result['expires_at']})
+            os.replace(temp, path)
+            fsync_dir(path.parent)
+        finally:
+            with suppress(OSError):
+                temp.unlink(missing_ok=True)
+
+    return store.renew(args.id, {'token': data['token'], 'lease_seconds': args.lease_seconds}, on_renew=save)
 
 
 def token_from(args):
@@ -1364,16 +1440,10 @@ def main(argv=None):
         elif args.command == 'close':
             result = store.close(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
         elif args.command == 'renew':
-            data = read_token_file(args.token_file, args.id) if args.token_file else None
-            result = store.renew(args.id, {'token': data['token'] if data else args.token, 'lease_seconds': args.lease_seconds})
-            if data:
-                data['expires_at'] = result['expires_at']
-                descriptor, temp = open_temp(args.token_file.parent)
-                try:
-                    write_synced(descriptor, data)
-                    os.replace(temp, args.token_file)
-                finally:
-                    temp.unlink(missing_ok=True)
+            if args.token_file:
+                result = renew_with_file(store, args)
+            else:
+                result = store.renew(args.id, {'token': args.token, 'lease_seconds': args.lease_seconds})
         elif args.command == 'backup':
             result = store.backup(args.output)
         else:

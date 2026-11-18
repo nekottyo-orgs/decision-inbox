@@ -1,15 +1,21 @@
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import stat
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import Store
+import app
+from app import AppError, Store
 from test_app import isolated_env, request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,8 +68,8 @@ class CliHookAndTokenFileTests(unittest.TestCase):
 
     def test_pre_add_は_exit_0_で登録し非0_で断る(self):
         seen = self.root / 'seen.json'
-        self.hook(f'#!/bin/sh\ncat > {seen}\n[ "$HOOK_DECIDES" = ok ] && exit 0\nprintf "%0600d" 0 >&2\nexit 10\n')
-        refused = self.cli('add', '--file', str(self.payload_file(request_key='run-a/1')))
+        self.hook(f'#!/bin/sh\ncat > {shlex.quote(str(seen))}\n[ "$HOOK_DECIDES" = ok ] && exit 0\nprintf "%0600d" 0 >&2\nexit 10\n')
+        refused = self.cli('add', '--file', str(self.payload_file(request_key='run-a/1')), env={'HOOK_DECIDES': 'reject'})
         self.assertEqual(refused.returncode, 1)
         error = json.loads(refused.stderr)['error']
         self.assertEqual(error, 'pre-add が登録を断りました: ' + '0' * 500)
@@ -84,7 +90,7 @@ class CliHookAndTokenFileTests(unittest.TestCase):
 
     def test_不正な_payload_では_pre_add_を呼ばない(self):
         called = self.root / 'called'
-        self.hook(f'#!/bin/sh\ntouch {called}\n')
+        self.hook(f'#!/bin/sh\ntouch {shlex.quote(str(called))}\n')
         result = self.cli('add', '--file', str(self.payload_file(title='')))
         self.assertEqual(result.returncode, 1)
         self.assertFalse(called.exists())
@@ -162,15 +168,146 @@ class CliHookAndTokenFileTests(unittest.TestCase):
         self.assertEqual(legacy['decision']['id'], item['id'])
         self.assertIn('token', legacy)
 
+    def claim_file(self, item, expires_at, token='t', name=None):
+        path = self.claims / (name or f"{item['id']}-{'0' * 16}.json")
+        path.write_text(json.dumps({'id': item['id'], 'token': token, 'worker': 'w', 'expires_at': expires_at}))
+        return path
+
     def test_lease_期限から_24_時間過ぎたファイルを_claim_で消す(self):
         self.claims.mkdir(mode=0o700)
-        old = self.claims / 'old.json'
-        fresh = self.claims / 'fresh.json'
-        old.write_text(json.dumps({'id': 'a', 'token': 't', 'worker': 'w', 'expires_at': '2000-01-01T00:00:00+00:00'}))
-        fresh.write_text(json.dumps({'id': 'b', 'token': 't', 'worker': 'w', 'expires_at': '2999-01-01T00:00:00+00:00'}))
+        old = self.claim_file(self.answered(title='古い'), '2000-01-01T00:00:00+00:00')
+        fresh = self.claim_file(self.answered(title='新しい'), '2999-01-01T00:00:00+00:00')
         self.ok('claim', '--worker', 'w', '--token-file', 'auto')
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
+
+    def test_掃除は管理外のファイルと別_DB_の判断のファイルを消さない(self):
+        self.claims.mkdir(mode=0o700)
+        stale = '2000-01-01T00:00:00+00:00'
+        item = self.answered(title='管理外')
+        foreign = self.claims / f"{'f' * 32}-{'0' * 16}.json"
+        foreign.write_text(json.dumps({'id': 'f' * 32, 'token': 't', 'worker': 'w', 'expires_at': stale}))
+        unmanaged = self.claim_file(item, stale, name='job-state.json')
+        partial = self.claims / f"{item['id']}-{'1' * 16}.json"
+        partial.write_text(json.dumps({'id': item['id'], 'expires_at': stale}))
+        self.ok('claim', '--worker', 'w', '--token-file', 'auto')
+        self.assertTrue(foreign.exists())
+        self.assertTrue(unmanaged.exists())
+        self.assertTrue(partial.exists())
+
+    def test_token_で延長した有効な_claim_のファイルは期限が古くても消さない(self):
+        item = self.answered()
+        claimed = self.ok('claim', '--worker', 'w', '--lease-seconds', '3600', '--token-file', 'auto')
+        path = Path(claimed['token_file'])
+        data = json.loads(path.read_text())
+        # --token や HTTP の renew はファイルを書き換えないので、ファイルの expires_at だけが古くなる
+        path.write_text(json.dumps({**data, 'expires_at': '2000-01-01T00:00:00+00:00'}))
+        self.answered(title='次')
+        self.ok('claim', '--worker', 'w2', '--token-file', 'auto')
+        self.assertTrue(path.exists())
+        self.assertTrue(self.store.holder(item['id'], data['token']))
+
+    def test_claims_dir_の_FIFO_で止まらない(self):
+        self.claims.mkdir(mode=0o700)
+        os.mkfifo(self.claims / f"{'a' * 32}-{'0' * 16}.json")
+        self.assertEqual(self.ok('claims'), {'claims': []})
+        self.answered()
+        self.assertIsNotNone(self.ok('claim', '--worker', 'w', '--token-file', 'auto')['decision'])
+
+    def test_上限を超える_token_ファイルは中身が正しくても断る(self):
+        item = self.answered()
+        target = self.root / 'mine.json'
+        self.ok('claim', '--worker', 'w', '--token-file', str(target))
+        target.write_text(target.read_text() + ' ' * 65536)
+        result = self.cli('complete', '--id', item['id'], '--token-file', str(target))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.store.get(item['id'])['answer']['status'], 'processing')
+
+
+class InProcessTokenFileTests(unittest.TestCase):
+    """mock が要る検査。main を同じ process で呼ぶので env と --db を一時ディレクトリに閉じる"""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.db = self.root / 'data' / 'cli.sqlite3'
+        self.claims = self.root / 'claims'
+        patcher = mock.patch.dict(os.environ, isolated_env(self.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = Store(self.db)
+        item = self.store.add(request_payload())
+        self.item = self.store.answer(item['id'], {'choice': 'minimal'})
+
+    def main(self, *arguments):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = app.main(['--db', str(self.db), *arguments])
+        self.assertEqual(code, 0, err.getvalue())
+        return json.loads(out.getvalue())
+
+    def locked(self):
+        # 他の process が書き込みロックを握っているかを、待たずに BEGIN IMMEDIATE を試して見る
+        connection = sqlite3.connect(self.db, timeout=0, isolation_level=None)
+        try:
+            connection.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError:
+            return True
+        finally:
+            connection.close()
+        return False
+
+    def test_renew_のファイル置換は_DB_の書き込みロックの中で行う(self):
+        target = self.root / 'mine.json'
+        self.main('claim', '--worker', 'w', '--token-file', str(target))
+        seen = []
+        replace = os.replace
+
+        def spy(source, destination):
+            seen.append(self.locked())
+            return replace(source, destination)
+        with mock.patch.object(app.os, 'replace', spy):
+            self.main('renew', '--id', self.item['id'], '--token-file', str(target), '--lease-seconds', '3600')
+        # ロックの外で置き換えると、complete と別 claim が同じ PATH を使った後に古い token で上書きできる
+        self.assertEqual(seen, [True])
+
+    def test_renew_は別の_claim_に置き換わったファイルを上書きしない(self):
+        target = self.root / 'mine.json'
+        self.main('claim', '--worker', 'w', '--token-file', str(target))
+        original = json.loads(target.read_text())
+        read = app.read_token_file
+        calls = []
+
+        def swap(path, identifier):
+            data = read(path, identifier)
+            calls.append(path)
+            if len(calls) == 1:
+                # 最初の読み取りの後、別の claim が同じ PATH に入った状態を作る
+                target.write_text(json.dumps({**original, 'token': 'other'}))
+            return data
+        with mock.patch.object(app, 'read_token_file', swap), contextlib.redirect_stderr(io.StringIO()):
+            code = app.main(['--db', str(self.db), 'renew', '--id', self.item['id'], '--token-file', str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(target.read_text())['token'], 'other')
+
+    def test_claim_は_commit_前に公開先ディレクトリを_fsync_する(self):
+        directories = []
+        fsync = os.fsync
+
+        def spy(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                directories.append((os.fstat(descriptor).st_ino, self.locked()))
+            return fsync(descriptor)
+        with mock.patch.object(app.os, 'fsync', spy):
+            self.main('claim', '--worker', 'w', '--token-file', 'auto')
+        # auto が作った claims_dir と、その名前を持つ親の両方
+        self.assertEqual(sorted(directories), sorted([(self.claims.stat().st_ino, True), (self.root.stat().st_ino, True)]))
+
+    def test_書き込み中に_lease_が切れた_claim_は_commit_しない(self):
+        with self.assertRaises(AppError):
+            self.store.claim('w', 1, on_claim=lambda result: time.sleep(1.1))
+        self.assertEqual(self.store.get(self.item['id'])['answer']['status'], 'pending')
 
 
 if __name__ == '__main__':
