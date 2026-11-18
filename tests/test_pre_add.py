@@ -122,7 +122,7 @@ class PreAddTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             hook = Path(temp) / 'pre-add'
             pid_file = Path(temp) / 'child.pid'
-            hook.write_text(f'#!/bin/sh\nsleep 5 &\necho $! > {pid_file}\nwait\n', encoding='utf-8')
+            hook.write_text(f'#!/bin/sh\nsleep 5 &\necho $! > {shlex.quote(str(pid_file))}\nwait\n', encoding='utf-8')
             hook.chmod(0o755)
             with unittest.mock.patch.dict(os.environ, {'DECISION_INBOX_HOOKS_DIR': temp}), unittest.mock.patch.object(app, 'PRE_ADD_TIMEOUT', 0.5):
                 with self.assertRaises(AppError):
@@ -136,6 +136,33 @@ class PreAddTimeoutTests(unittest.TestCase):
                 time.sleep(0.02)
             else:
                 self.fail('打ち切り後も hook の子が残っている')
+
+    def test_KeyboardInterrupt_でも_hook_の_process_group_を止めて再送出する(self):
+        with tempfile.TemporaryDirectory() as temp:
+            hook = Path(temp) / 'pre-add'
+            hook.write_text('#!/bin/sh\nexec sleep 5\n', encoding='utf-8')
+            hook.chmod(0o755)
+            def interrupted(process, *args, **kwargs):
+                process.stdin.close()
+                raise KeyboardInterrupt
+
+            with unittest.mock.patch.dict(os.environ, {'DECISION_INBOX_HOOKS_DIR': temp}), \
+                    unittest.mock.patch.object(subprocess.Popen, 'communicate', autospec=True, side_effect=interrupted), \
+                    unittest.mock.patch.object(app.os, 'killpg', wraps=os.killpg) as killpg:
+                with self.assertRaises(KeyboardInterrupt):
+                    app.run_pre_add(request_payload())
+            killpg.assert_called_once()
+            self.assertEqual(killpg.call_args.args[1], app.signal.SIGKILL)
+
+    def test_一時ファイルを作れないときは接頭辞つきで断る(self):
+        with tempfile.TemporaryDirectory() as temp:
+            hook = Path(temp) / 'pre-add'
+            hook.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+            hook.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {'DECISION_INBOX_HOOKS_DIR': temp}), unittest.mock.patch.object(app.tempfile, 'TemporaryFile', side_effect=OSError(28, 'No space left on device')):
+                with self.assertRaises(AppError) as caught:
+                    app.run_pre_add(request_payload())
+            self.assertTrue(str(caught.exception).startswith('pre-add が登録を断りました: '))
 
 
 if __name__ == '__main__':

@@ -1001,13 +1001,26 @@ def pre_add_hook():
 PRE_ADD_TIMEOUT = 10
 
 
+def kill_pre_add(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def run_pre_add(item):
     # 登録の可否は呼び出し元 (agent の pane) の env で決まるので、CLI だけが呼ぶ。HTTP は server の env しか持たない
     hook = pre_add_hook()
     if hook is None:
         return
     # stderr は一時ファイルに逃がし、先頭だけ読む。PIPE だと饒舌な hook の出力を全量メモリに溜める
-    with tempfile.TemporaryFile() as errors:
+    try:
+        errors = tempfile.TemporaryFile()
+    except OSError as error:
+        # 検査できない状態は起動失敗と同じく素通りさせない
+        raise AppError(400, f'pre-add が登録を断りました: 一時ファイルを作れませんでした ({error.strerror or error})') from None
+    with errors:
         try:
             # 別の process group で起動し、打ち切るときに hook が起こした子もまとめて止める
             process = subprocess.Popen([str(hook)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True)
@@ -1018,12 +1031,12 @@ def run_pre_add(item):
             process.communicate(json.dumps(item, ensure_ascii=False).encode(), timeout=PRE_ADD_TIMEOUT)
         except subprocess.TimeoutExpired:
             # 止まった hook で全 pane の add が詰まらないよう打ち切る。検査が終わっていないので登録はしない
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+            kill_pre_add(process)
             raise AppError(400, f'pre-add が登録を断りました: {PRE_ADD_TIMEOUT} 秒で終わりませんでした') from None
+        except KeyboardInterrupt:
+            # Ctrl-C でも hook と子を残さない
+            kill_pre_add(process)
+            raise
         if process.returncode != 0:
             errors.seek(0)
             raise AppError(400, 'pre-add が登録を断りました: ' + errors.read(2000).decode(errors='replace')[:500])
