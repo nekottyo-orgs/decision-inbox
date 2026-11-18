@@ -653,9 +653,9 @@ class Store:
 
     def open_run(self, payload):
         object_fields(payload, ('run_id', 'role', 'pane', 'socket'), ())
+        # text() でサロゲートも断る。socket のパスに decode できないバイトがあると SQLite が bind できない
         for key, value in payload.items():
-            if not isinstance(value, str) or not value.strip() or len(value) > 200:
-                raise AppError(400, f'{key} は 1 から 200 文字の文字列を指定してください')
+            text(value, key, 200)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             if connection.execute('SELECT 1 FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (payload['run_id'], payload['role'])).fetchone():
@@ -665,6 +665,8 @@ class Store:
             return dict(connection.execute('SELECT * FROM runs WHERE id=?', (cursor.lastrowid,)).fetchone())
 
     def close_run(self, run_id, role):
+        text(run_id, 'run_id', 200)
+        text(role, 'role', 200)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT id FROM runs WHERE run_id=? AND role=? AND closed_at IS NULL', (run_id, role)).fetchone()
@@ -678,6 +680,9 @@ class Store:
             raise AppError(400, '--run-id か、--pane と --socket の組を指定してください')
         if run_id is not None and (pane is not None or socket is not None):
             raise AppError(400, '--run-id と --pane / --socket は同時に指定できません')
+        for name, value in (('run_id', run_id), ('pane', pane), ('socket', socket)):
+            if value is not None:
+                text(value, name, 200)
         where, values = ('run_id=?', (run_id,)) if run_id is not None else ('pane=? AND socket=?', (pane, socket))
         with self.db() as connection:
             rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
@@ -1349,7 +1354,7 @@ def main(argv=None):
     run = commands.add_parser('run', help='agent の実行 (run) と pane の対応を記録する')
     run_commands = run.add_subparsers(dest='run_command', required=True)
     for name in ('open', 'close', 'show'):
-        sub = run_commands.add_parser(name, help={'open': 'run を開く。同じ run_id と role の開いた行があれば 409', 'close': 'run を閉じて closed_at を入れる', 'show': 'run_id か pane と socket の組で引く。既定は開いた行だけ'}[name])
+        sub = run_commands.add_parser(name, help={'open': 'run を開く。同じ run_id と role の開いた行があれば断る', 'close': 'run を閉じて closed_at を入れる', 'show': 'run_id か pane と socket の組で引く。既定は開いた行だけ'}[name])
         if name == 'show':
             sub.add_argument('--run-id')
             sub.add_argument('--pane')

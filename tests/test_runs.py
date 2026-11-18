@@ -50,6 +50,14 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.run_open(pane='p3')['pane'], 'p3')
         self.assertEqual(self.status(self.store.close_run, 'r1', 'nobody'), 404)
 
+    def test_サロゲートを含む引数は_SQLite_に渡す前に_400_で断る(self):
+        # Unix で decode できないバイトを含むパスは surrogateescape で文字列に入る
+        broken = b'/tmp/\xff'.decode(errors='surrogateescape')
+        self.assertEqual(self.status(lambda: self.run_open(socket=broken)), 400)
+        self.assertEqual(self.status(self.store.close_run, broken, 'worker'), 400)
+        self.assertEqual(self.status(self.store.runs, None, 'p1', broken), 400)
+        self.assertEqual(self.run_open(pane='作業')['pane'], '作業')
+
     def test_show_は開いた行だけが既定で_all_で閉じた行も出す(self):
         self.run_open()
         self.store.close_run('r1', 'worker')

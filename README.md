@@ -96,7 +96,7 @@ agent の実行 (run) がどの pane・socket で動いているかを CLI で�
 ```sh
 python3 app.py run open --run-id RUN --role worker --pane 1-2 --socket /tmp/herdr.sock
 python3 app.py run show --run-id RUN
-python3 app.py run show --pane 1-2 --socket /tmp/herdr.sock [--all]
+python3 app.py run show --pane 1-2 --socket /tmp/herdr.sock
 python3 app.py run close --run-id RUN --role worker
 ```
 
