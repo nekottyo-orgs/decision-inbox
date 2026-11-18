@@ -1067,6 +1067,9 @@ def sweep_claims(directory, now):
 
 
 def claim_to_file(store, args):
+    # 空文字を従来の経路へ落とすと、空の変数からパスを組んだ呼び手の token が stdout に出る
+    if not args.token_file:
+        raise AppError(400, '--token-file には auto かパスを指定してください')
     directory = claims_dir(args.db)
     if args.token_file == 'auto':
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -1254,7 +1257,7 @@ def main(argv=None):
         elif args.command == 'list':
             result = {'decisions': store.list(args.include_withdrawn), 'demo': False}
         elif args.command == 'claim':
-            result = claim_to_file(store, args) if args.token_file else store.claim(args.worker, args.lease_seconds, args.key_prefix)
+            result = claim_to_file(store, args) if args.token_file is not None else store.claim(args.worker, args.lease_seconds, args.key_prefix)
         elif args.command == 'claims':
             result = list_claims(store, claims_dir(args.db), args.id)
         elif args.command == 'undo':
