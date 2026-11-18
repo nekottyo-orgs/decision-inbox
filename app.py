@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -1015,18 +1016,48 @@ def claims_dir(db):
     return Path(override).expanduser().absolute() if override else Path(db).expanduser().absolute().parent / 'claims'
 
 
+PRE_ADD_TIMEOUT = 10
+
+
+def kill_pre_add(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def run_pre_add(item):
     # 登録の可否は呼び出し元 (agent の pane) の env で決まるので、CLI だけが呼ぶ。HTTP は server の env しか持たない
     hook = pre_add_hook()
     if hook is None:
         return
+    # stderr は一時ファイルに逃がし、先頭だけ読む。PIPE だと饒舌な hook の出力を全量メモリに溜める
     try:
-        finished = subprocess.run([str(hook)], input=json.dumps(item, ensure_ascii=False).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        errors = tempfile.TemporaryFile()
     except OSError as error:
-        # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
-        raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
-    if finished.returncode != 0:
-        raise AppError(400, 'pre-add が登録を断りました: ' + finished.stderr.decode(errors='replace')[:500])
+        # 検査できない状態は起動失敗と同じく素通りさせない
+        raise AppError(400, f'pre-add が登録を断りました: 一時ファイルを作れませんでした ({error.strerror or error})') from None
+    with errors:
+        try:
+            # 別の process group で起動し、打ち切るときに hook が起こした子もまとめて止める
+            process = subprocess.Popen([str(hook)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True)
+        except OSError as error:
+            # 起動できない hook は検査が効いていない状態なので、素通りさせず登録しない
+            raise AppError(400, f'pre-add が登録を断りました: 起動に失敗しました ({error.strerror or error})') from None
+        try:
+            process.communicate(json.dumps(item, ensure_ascii=False).encode(), timeout=PRE_ADD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # 止まった hook で全 pane の add が詰まらないよう打ち切る。検査が終わっていないので登録はしない
+            kill_pre_add(process)
+            raise AppError(400, f'pre-add が登録を断りました: {PRE_ADD_TIMEOUT} 秒で終わりませんでした') from None
+        except KeyboardInterrupt:
+            # Ctrl-C でも hook と子を残さない
+            kill_pre_add(process)
+            raise
+        if process.returncode != 0:
+            # 背景の子が stderr を握ったまま書くと共有 offset が動くので、offset を使わず先頭から読む
+            raise AppError(400, 'pre-add が登録を断りました: ' + os.pread(errors.fileno(), 2000, 0).decode(errors='replace')[:500])
 
 
 def open_temp(directory):
@@ -1159,7 +1190,7 @@ def main(argv=None):
     claim.add_argument('--token-file', help='token を stdout に出さずファイルへ保存する。auto は claims_dir に claim ごとの新しいファイルを作る')
     claims = commands.add_parser('claims', help='claims_dir の token ファイルを列挙する (token の値は出さない)')
     claims.add_argument('--id')
-    commands.add_parser('hooks', help='pre-add の実行パスと claims_dir を JSON で出す')
+    commands.add_parser('hooks', help='pre-add の実行パスを JSON で出す')
     complete = commands.add_parser('complete')
     complete.add_argument('--id', required=True)
     undo = commands.add_parser('undo')
@@ -1210,7 +1241,7 @@ def main(argv=None):
         if args.command == 'hooks':
             # Store を開かない。対応版かを確かめるだけの呼び出しで DB を作ったり移行したりしないため
             hook = pre_add_hook()
-            print(json.dumps({'pre_add': hook and str(hook), 'claims_dir': str(claims_dir(args.db))}, ensure_ascii=False))
+            print(json.dumps({'pre_add': hook and str(hook)}, ensure_ascii=False))
             return 0
         if args.command == 'tui':
             web_url = tui_web_url(args.web_url)

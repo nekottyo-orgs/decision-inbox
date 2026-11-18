@@ -1,5 +1,6 @@
 import curses
 import json
+import contextlib
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -119,14 +120,14 @@ class TaskTests(unittest.TestCase):
         self.store.add_task({'id': 't1', 'title': '題'})
         reopened = Store(self.db)
         self.assertEqual(reopened.get(decision['id'])['answer']['choice'], 'minimal')
-        with sqlite3.connect(self.db) as connection:
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
             self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 2)
             columns = [row[1] for row in connection.execute('PRAGMA table_info(decisions)')]
         self.assertEqual(columns, ['id', 'created_at', 'payload', 'choice', 'memo', 'decided_at', 'status', 'worker', 'token', 'lease_until', 'request_key', 'reason', 'next_step', 'reported_at'])
 
     def test_tasks_表が無い_version_2_の_DB_を開き直すと表ができる(self):
         decision = self.store.add(request_payload())
-        with sqlite3.connect(self.db) as connection:
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute('DROP TABLE tasks')
         reopened = Store(self.db)
         self.assertEqual(reopened.tasks(), [])
@@ -136,7 +137,7 @@ class TaskTests(unittest.TestCase):
         self.store.add_task({'id': 't1', 'title': '題'})
         output = Path(self.temp.name) / 'backup.sqlite3'
         self.store.backup(output)
-        with sqlite3.connect(output) as connection:
+        with contextlib.closing(sqlite3.connect(output)) as connection, connection:
             self.assertEqual(connection.execute('SELECT id FROM tasks').fetchall(), [('t1',)])
 
 

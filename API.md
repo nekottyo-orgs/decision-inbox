@@ -112,7 +112,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 
 `add --help` で必須・任意の項目と型の一覧・最小 JSON 例、`list --help` と `task list --help` で出力の形 (`list` は `{"decisions":[...],"demo":false}` の object、`task list --json` は `{"lanes":[...]}`) を確認できる。
 
-`tui`、`watch`、`backup`、`task` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
+`tui`、`watch`、`backup`、`task`、`hooks` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
 
@@ -120,10 +120,11 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 
 ### pre-add と token ファイル (CLI のみ)
 
-HTTP API は変わらない。以下は CLI だけの契約。
+HTTP API は変わらない。
 
-- **pre-add**: `add` は JSON を読んで検証した後・登録の前に `${DECISION_INBOX_HOOKS_DIR:-${XDG_CONFIG_HOME:-~/.config}/decision-inbox/hooks}/pre-add` を起動する。stdin は検証済みの payload の JSON、env は呼び出し元を継承、hook の stdout は捨てる。exit 0 なら登録、非 0 なら登録せず exit 1 で stderr に `{"error":"pre-add が登録を断りました: <hook の stderr 先頭 500 字>"}`。起動に失敗したとき (interpreter が無い等) も登録せず同じ接頭辞で exit 1。ファイルが無い・実行可能でないなら何もしない。検証で弾かれた payload では hook を呼ばない。`update` と `POST /api/decisions` は対象外 (server の env は呼び出し元の pane を表さない)
-- **hooks**: `{"pre_add":"<実行するパス>" | null,"claims_dir":"<パス>"}` を返す。DB を開かない。旧版はこのサブコマンドを知らず argparse の exit 2 になるので、呼び手は pre-add と token ファイルに対応した CLI かをこれで判定する
+- **pre-add**: `add` は JSON を読んで検証した後・登録の前に pre-add を起動する。場所は `DECISION_INBOX_HOOKS_DIR`、無ければ `${XDG_CONFIG_HOME:-~/.config}/decision-inbox/hooks` の下の `pre-add`。stdin は検証済みの payload の JSON、env は呼び出し元を継承、hook の stdout は捨てる。exit 0 なら登録、非 0 なら登録せず exit 1 で stderr に `{"error":"pre-add が登録を断りました: <hook の stderr 先頭 500 字>"}`。起動に失敗したとき (interpreter が無い等) も登録せず同じ接頭辞で exit 1。10 秒で終わらないときは hook が起こした子を含めて止め、登録しない (hook が setsid などで別の process group に移した子は止められない)。hook は登録済みかを調べる前に走るので、登録済みの request_key で再送した add も hook が断れば exit 1 になる (API なら既存の判断が返る)。この拒否は前回の add が失敗した印にならない。ファイルが無い・実行可能でないなら何もしない。検証で弾かれた payload では hook を呼ばない。場所を呼び出し元の env で決めるので、付け忘れを防ぐ検査であって強制ではない (env の差し替えと HTTP で外せる)
+- 対象外: `POST /api/decisions` は server の env が呼び出し元の pane を表さないので呼ばない。`update` は `request_key` を変えられない (変えると 400) ので、key で判定する hook は add の時点で済む。title や reason を見る hook は update の後には掛からない
+- **hooks**: `{"pre_add":"<実行するパス>" | null}` を返す。DB を開かない。旧版はこのサブコマンドを知らず argparse の exit 2 になるので、呼び手は pre-add に対応した CLI かをこれで判定する
 - **claims_dir**: `DECISION_INBOX_CLAIMS_DIR`、無ければ DB と同じディレクトリの `claims/`。`claim --token-file auto` が mode 0700 で作る
 - **claim --token-file auto|PATH**: token をファイルに保存し、stdout の JSON から `token` を外して `token_file` (絶対パス) を入れる。`auto` は claims_dir に `<decision id>-<16 桁 hex>.json`、PATH は指定したパスに作る。中身は `{"id","token","worker","expires_at"}`、mode 0600。claim ごとに別のファイル名にするのは、同じ worker 名で再 claim されたときに旧プロセスが新しい token を読んで照合を通らないようにするため
   - 順序は、一時ファイル (宛先と同じディレクトリ、O_EXCL) を開く → claim の transaction の中で token を書いて fsync → 宛先へ公開 → commit。一時ファイルを開けなければ claim せず exit 1。書き込みか公開に失敗したら rollback して claim しない。PATH が既にあれば上書きせず失敗する (exit 1、claim しない)。対象が無ければ一時ファイルを消して `{"decision":null}`

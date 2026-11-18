@@ -49,16 +49,16 @@ class CliHookAndTokenFileTests(unittest.TestCase):
         item = self.store.add(request_payload(**changes))
         return self.store.answer(item['id'], {'choice': 'minimal'})
 
-    def test_hooks_は_pre_add_と_claims_dir_を出し_DB_を作らない(self):
+    def test_hooks_は_pre_add_を出し_DB_を作らない(self):
         missing = self.root / 'none' / 'x.sqlite3'
         result = subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(missing), 'hooks'], capture_output=True, text=True, timeout=10, env={**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(self.hooks), 'DECISION_INBOX_CLAIMS_DIR': ''})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), {'pre_add': None, 'claims_dir': str(missing.parent / 'claims')})
+        self.assertEqual(json.loads(result.stdout), {'pre_add': None})
         self.assertFalse(missing.parent.exists())
         self.hook('#!/bin/sh\nexit 0\n', mode=0o644)
         self.assertIsNone(self.ok('hooks')['pre_add'])
         path = self.hook('#!/bin/sh\nexit 0\n')
-        self.assertEqual(self.ok('hooks'), {'pre_add': str(path), 'claims_dir': str(self.claims)})
+        self.assertEqual(self.ok('hooks'), {'pre_add': str(path)})
 
     def test_pre_add_は_exit_0_で登録し非0_で断る(self):
         seen = self.root / 'seen.json'
