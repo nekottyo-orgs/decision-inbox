@@ -142,7 +142,10 @@ class PreAddTimeoutTests(unittest.TestCase):
             hook = Path(temp) / 'pre-add'
             hook.write_text('#!/bin/sh\nexec sleep 5\n', encoding='utf-8')
             hook.chmod(0o755)
+            started = []
+
             def interrupted(process, *args, **kwargs):
+                started.append(process)
                 process.stdin.close()
                 raise KeyboardInterrupt
 
@@ -152,6 +155,9 @@ class PreAddTimeoutTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     app.run_pre_add(request_payload())
             killpg.assert_called_once()
+            self.assertEqual(killpg.call_args.args[0], started[0].pid)
+            # returncode が埋まっているのは kill_pre_add の wait が効いた証拠
+            self.assertIsNotNone(started[0].returncode)
             self.assertEqual(killpg.call_args.args[1], app.signal.SIGKILL)
 
     def test_一時ファイルを作れないときは接頭辞つきで断る(self):

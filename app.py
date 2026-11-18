@@ -1038,8 +1038,8 @@ def run_pre_add(item):
             kill_pre_add(process)
             raise
         if process.returncode != 0:
-            errors.seek(0)
-            raise AppError(400, 'pre-add が登録を断りました: ' + errors.read(2000).decode(errors='replace')[:500])
+            # 背景の子が stderr を握ったまま書くと共有 offset が動くので、offset を使わず先頭から読む
+            raise AppError(400, 'pre-add が登録を断りました: ' + os.pread(errors.fileno(), 2000, 0).decode(errors='replace')[:500])
 
 
 def main(argv=None):
