@@ -304,6 +304,20 @@ class InProcessTokenFileTests(unittest.TestCase):
         # auto が作った claims_dir と、その名前を持つ親の両方
         self.assertEqual(sorted(directories), sorted([(self.claims.stat().st_ino, True), (self.root.stat().st_ino, True)]))
 
+    def test_既にある_claims_dir_でも親を_fsync_する(self):
+        # 対象なしの claim でも claims_dir は作られる。その後の claim で親の名前が永続化されないままにしない
+        self.claims.mkdir(mode=0o700)
+        directories = []
+        fsync = os.fsync
+
+        def spy(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                directories.append(os.fstat(descriptor).st_ino)
+            return fsync(descriptor)
+        with mock.patch.object(app.os, 'fsync', spy):
+            self.main('claim', '--worker', 'w', '--token-file', 'auto')
+        self.assertIn(self.root.stat().st_ino, directories)
+
     def test_書き込み中に_lease_が切れた_claim_は_commit_しない(self):
         with self.assertRaises(AppError):
             self.store.claim('w', 1, on_claim=lambda result: time.sleep(1.1))

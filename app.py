@@ -1191,9 +1191,7 @@ def claim_to_file(store, args):
     if not args.token_file:
         raise AppError(400, '--token-file には auto かパスを指定してください')
     directory = claims_dir(args.db)
-    created = False
     if args.token_file == 'auto':
-        created = not directory.exists()
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
         sweep_claims(store, directory, time.time())
         target = None
@@ -1214,7 +1212,8 @@ def claim_to_file(store, args):
         os.link(temp, final)
         published.append(final)
         fsync_dir(final.parent)
-        if created:
+        # claims_dir は対象なしの claim でも作られるので、作った回に限らず親も毎回 fsync する
+        if target is None:
             fsync_dir(directory.parent)
         result['token_file'] = str(final)
 
