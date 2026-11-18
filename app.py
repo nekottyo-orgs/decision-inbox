@@ -675,6 +675,11 @@ class Store:
             connection.execute('UPDATE runs SET closed_at=? WHERE id=?', (utc_now(), row['id']))
             return dict(connection.execute('SELECT * FROM runs WHERE id=?', (row['id'],)).fetchone())
 
+    def open_run_ids(self, pane, socket):
+        # 長さの検査をする runs() と違い、env の値をそのまま引く (長すぎる値は行に当たらないだけ)
+        with self.db() as connection:
+            return sorted({row['run_id'] for row in connection.execute('SELECT run_id FROM runs WHERE pane=? AND socket=? AND closed_at IS NULL', (pane, socket))})
+
     def runs(self, run_id=None, pane=None, socket=None, include_closed=False):
         if run_id is None and (pane is None or socket is None):
             raise AppError(400, '--run-id か、--pane と --socket の組を指定してください')
@@ -1124,6 +1129,20 @@ def run_pre_add(item):
             raise AppError(400, 'pre-add が登録を断りました: ' + os.pread(errors.fileno(), 2000, 0).decode(errors='replace')[:500])
 
 
+def require_run_prefix(store, item):
+    # pre-add の有無・場所・--db に依らず効く層。呼び出し pane が開いた run の行を持つのに、request_key が
+    # その run の frontdesk-<run>/ で始まらない add を断る。行の無い pane (他用途) は通す。HTTP は pane を知らないので対象外
+    pane = os.environ.get('HERDR_PANE_ID')
+    if not pane:
+        return
+    socket = os.environ.get('HERDR_SOCKET_PATH') or os.path.expanduser('~/.config/herdr/herdr.sock')
+    runs = store.open_run_ids(pane, socket)
+    key = item.get('request_key')
+    if runs and not (isinstance(key, str) and any(key.startswith(f'frontdesk-{run}/') and len(key) > len(f'frontdesk-{run}/') for run in runs)):
+        wants = ' か '.join(f'frontdesk-{run}/<名前>' for run in runs)
+        raise AppError(400, f'この pane は run {", ".join(runs)} に開いており、request_key は {wants} の形が要ります')
+
+
 def open_temp(directory):
     # 末尾を .json にしない。claims の列挙と掃除が書きかけを拾わないため
     path = Path(directory) / f'.claim-{secrets.token_hex(8)}.tmp'
@@ -1442,7 +1461,9 @@ def main(argv=None):
                 raise AppError(413, '送信サイズが上限を超えています')
             if args.command == 'add':
                 payload = parse_json(raw)
-                run_pre_add(validate_request(payload))
+                item = validate_request(payload)
+                run_pre_add(item)
+                require_run_prefix(store, item)
                 result = store.add(payload)
             else:
                 result = store.update(args.id, {'note': args.note, 'changes': parse_json(raw)})
