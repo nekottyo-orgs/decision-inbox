@@ -783,6 +783,9 @@ class Store:
             # commit の前に呼ぶ。書き込みロックの中なので complete / report / 他の renew とファイル操作の順序が DB と揃う
             if on_renew:
                 on_renew(result)
+                # claim と同じく、ファイル更新に lease 以上かかったら延長を成功扱いにしない
+                if time.time() >= expires:
+                    raise AppError(409, 'token ファイルの更新中に lease が切れました')
         return result
 
     def lease_of(self, identifier, token):
@@ -1140,6 +1143,13 @@ def fsync_dir(path):
         os.close(descriptor)
 
 
+def unlink_temp(path):
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        print(json.dumps({'warning': f'token を含む一時ファイルを消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
+
+
 TOKEN_FILE_LIMIT = 65536
 
 
@@ -1155,7 +1165,8 @@ def read_token_file(path, identifier):
         if len(raw) > TOKEN_FILE_LIMIT:
             raise ValueError
         data = json.loads(raw)
-    except (OSError, ValueError, UnicodeError):
+    # 64 KiB 以内でも入れ子が深いと json が RecursionError を出す。claims の列挙で飛ばせるよう 400 に揃える
+    except (OSError, ValueError, UnicodeError, RecursionError):
         raise AppError(400, 'token ファイルを読めません') from None
     if not isinstance(data, dict) or not isinstance(data.get('token'), str):
         raise AppError(400, 'token ファイルの形式が不正です')
@@ -1192,7 +1203,12 @@ def claim_to_file(store, args):
         raise AppError(400, '--token-file には auto かパスを指定してください')
     directory = claims_dir(args.db)
     if args.token_file == 'auto':
-        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # 作るのは claims_dir だけにする。中間ディレクトリまで作ると、その名前を持つ祖先すべてを
+        # commit 前に fsync しないと電源断で token ファイルへ辿れなくなる
+        try:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        except FileNotFoundError:
+            raise AppError(400, f'claims_dir の親ディレクトリがありません: {directory.parent}') from None
         sweep_claims(store, directory, time.time())
         target = None
     else:
@@ -1228,10 +1244,9 @@ def claim_to_file(store, args):
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        # commit 後に一時名を消せなくても claim は成立している。結果を失うほうが困るので握る
-        # (残った .claim-*.tmp は列挙にも掃除にも掛からない)
-        with suppress(OSError):
-            temp.unlink(missing_ok=True)
+        # commit 後に一時名を消せなくても claim は成立しているので、結果は失わず警告だけ出す
+        # (残った .claim-*.tmp は列挙にも掃除にも掛からないので、token 入りのまま誰も消さない)
+        unlink_temp(temp)
     result.pop('token', None)
     return result
 
@@ -1250,8 +1265,7 @@ def renew_with_file(store, args):
             os.replace(temp, path)
             fsync_dir(path.parent)
         finally:
-            with suppress(OSError):
-                temp.unlink(missing_ok=True)
+            unlink_temp(temp)
 
     return store.renew(args.id, {'token': data['token'], 'lease_seconds': args.lease_seconds}, on_renew=save)
 
