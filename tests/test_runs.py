@@ -101,7 +101,10 @@ class RunTests(unittest.TestCase):
         self.assertEqual(Store(self.db).get(decision['id'])['id'], decision['id'])
 
     def test_旧_release_の_app_py_が移行後の_DB_でもそのまま動く(self):
-        shown = subprocess.run(['git', 'show', f'{OLD_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
+        try:
+            shown = subprocess.run(['git', 'show', f'{OLD_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
+        except FileNotFoundError:
+            self.skipTest('git が無い')
         if shown.returncode != 0:
             self.skipTest('旧 release の app.py を git から取り出せない')
         old = Path(self.temp.name) / 'old_app.py'
