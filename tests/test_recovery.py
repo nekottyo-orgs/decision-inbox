@@ -88,6 +88,19 @@ class RecoveryTests(unittest.TestCase):
             self.error(409, lambda: self.store.undo(item['id'], {'decided_at': item['answer']['decided_at']}))
         self.assertFalse(self.store.get(item['id'])['answer']['can_undo'])
 
+    def test_answer_exposes_lease_until_only_while_claimed(self):
+        item = self.answered()
+        self.assertIsNone(item['answer']['lease_until'])
+        with patch('app.time.time', return_value=1000):
+            claim = self.store.claim('worker', 60)
+        answer = self.store.get(item['id'])['answer']
+        # health は number の epoch 秒だけを対象にするので、型も固定する
+        self.assertEqual(answer['lease_until'], 1060)
+        self.assertIsInstance(answer['lease_until'], float)
+        with patch('app.time.time', return_value=1000):
+            self.store.complete(item['id'], claim['token'])
+        self.assertIsNone(self.store.get(item['id'])['answer']['lease_until'])
+
     def test_report_stops_delivery_and_retry_keeps_processing_history(self):
         for status in ('blocked', 'failed'):
             with self.subTest(status=status):

@@ -61,7 +61,7 @@ withdraw は未回答の判断だけを対象にし、DB から行は消さな�
 - `GET /api/tasks` → `{"lanes":[...]}` (`task list --json` と同じ形)
 - `POST /api/decisions/{id}/answer`、body `{"choice":"minimal","memo":"任意のメモ","revision":0}` → 保存後の依頼全体。任意の `revision` は表示中の依頼全体の値で、現在の revision と違えば `409` (表示後に内容が更新された)。取り下げ済みは `409`
 
-依頼全体は登録内容に `id/created_at/answer` を加えたもの。未判断の `answer` は null。判断済みは `{"choice":"minimal","memo":"...","decided_at":"UTC ISO 8601","status":"pending","reason":"","next_step":"","reported_at":null,"can_undo":true}`。status は `pending/processing/completed/blocked/failed`。`reason/next_step` は consumer の停止理由と次の操作で、依頼側の `reason` とは別。`reported_at` は停止報告の時刻で、停止していなければ null。二重判断は `409`、入力は上書きしない。
+依頼全体は登録内容に `id/created_at/answer` を加えたもの。未判断の `answer` は null。判断済みは `{"choice":"minimal","memo":"...","decided_at":"UTC ISO 8601","status":"pending","reason":"","next_step":"","reported_at":null,"lease_until":null,"can_undo":true}`。status は `pending/processing/completed/blocked/failed`。`reason/next_step` は consumer の停止理由と次の操作で、依頼側の `reason` とは別。`reported_at` は停止報告の時刻で、停止していなければ null。`lease_until` は claim の lease 期限 (epoch 秒)。claim されていなければ null で、期限を過ぎた processing は再 claim できる。二重判断は `409`、入力は上書きしない。
 
 `POST /api/decisions/{id}/undo`、body `{"decided_at":"一覧で取得した値"}` で未着手の回答を撤回し、依頼全体を `answer:null` で返す。`can_undo:true` は pending かつ一度も claim されていない状態。処理開始済み・古い回答・他画面で撤回済みなら `409`。元の回答とメモは DB の `answer_history` に保持し、履歴の削除 API は提供しない。
 
