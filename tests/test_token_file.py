@@ -139,6 +139,46 @@ class CliHookAndTokenFileTests(unittest.TestCase):
         self.assertEqual(self.ok('report', '--id', item['id'], '--token-file', str(target), '--status', 'blocked', '--reason', 'r', '--next-step', 'n')['answer']['status'], 'blocked')
         self.assertFalse(target.exists())
 
+    def read_only_token_file(self):
+        # token ファイルの親を書き込み不可にして unlink だけを失敗させる (root は権限を無視するので試験できない)
+        if os.geteuid() == 0:
+            self.skipTest('root は権限で止まらない')
+        item = self.answered()
+        target = self.root / 'locked' / 'mine.json'
+        target.parent.mkdir()
+        self.ok('claim', '--worker', 'w', '--token-file', str(target))
+        target.parent.chmod(0o500)
+        self.addCleanup(target.parent.chmod, 0o700)
+        return item, target
+
+    def test_complete_は_token_ファイルを消せなくても_DB_の完了を成功として返す(self):
+        item, target = self.read_only_token_file()
+        result = self.cli('complete', '--id', item['id'], '--token-file', str(target))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['answer']['status'], 'completed')
+        warning = json.loads(result.stderr)['warning']
+        self.assertTrue(warning.startswith('token ファイルを消せませんでした: '), warning)
+        self.assertNotIn(json.loads(target.read_text())['token'], warning)
+        self.assertTrue(target.exists())
+
+    def test_report_は_token_ファイルを消せなくても_DB_の報告を成功として返す(self):
+        item, target = self.read_only_token_file()
+        result = self.cli('report', '--id', item['id'], '--token-file', str(target), '--status', 'blocked', '--reason', 'r', '--next-step', 'n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['answer']['status'], 'blocked')
+        self.assertTrue(json.loads(result.stderr)['warning'].startswith('token ファイルを消せませんでした: '))
+        self.assertTrue(target.exists())
+
+    def test_commit_の直後に落ちても_token_入りの一時ファイルは残らない(self):
+        # finally の後始末が走らない落ち方 (SIGKILL) を、後始末を空にして近似する
+        self.answered()
+        with mock.patch.object(app, 'unlink_temp', lambda path: None):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.dict(os.environ, {'DECISION_INBOX_CLAIMS_DIR': str(self.claims)}), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = app.main(['--db', str(self.db), 'claim', '--worker', 'w', '--token-file', 'auto'])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual([p.name for p in self.claims.iterdir() if p.name.endswith('.tmp')], [])
+
     def test_再_claim_は別ファイルになり旧ファイルは無効(self):
         item = self.answered()
         first = self.ok('claim', '--worker', 'w', '--token-file', 'auto')
