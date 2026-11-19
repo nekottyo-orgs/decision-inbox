@@ -623,7 +623,7 @@ def task_lines(desk, columns):
             lines.append((f"{'>' if task['id'] == desk.task_id else ' '} {task['title']}", 0))
             updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
             parts = [f"担当 {task['pane']} {task['run']}".strip() if task['pane'] or task['run'] else '']
-            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '']
+            parts += [f"機械 {task['machine']}" if task.get('machine') else '', f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '']
             parts.append(f'更新 {updated}')
             lines.append(('    ' + ' / '.join(part for part in parts if part), 0))
             if task['decision_id']:

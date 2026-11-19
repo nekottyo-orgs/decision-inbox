@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import AppError, Store
 from unittest.mock import patch
 from cue_tui import Desk, draw, focus_pane, handle_key, tmux_clients
-from test_app import request_payload
+from test_app import request_payload, seed_task
 from test_tui import Screen
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,9 +43,10 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.add_task, {'id': 't1', 'title': '別'}), 409)
 
     def test_進んだ_task_への_add_の再送は既存を返す(self):
-        self.store.add_task({'id': 't1', 'title': '題', 'lane': 'todo'})
-        moved = self.store.update_task('t1', {'lane': 'worker', 'remaining': '残り'})
-        self.assertEqual(self.store.add_task({'id': 't1', 'title': '題', 'lane': 'todo'}), moved)
+        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.reconcile_lane('t1', 'worker')
+        moved = self.store.update_task('t1', {'remaining': '残り'})
+        self.assertEqual(self.store.add_task({'id': 't1', 'title': '題'}), moved)
 
     def test_更新は指定項目だけ変え更新時刻が進む(self):
         first = self.store.add_task({'id': 't1', 'title': '題', 'result': 'r'})
@@ -57,32 +58,53 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.update_task, 't1', {'id': 'x'}), 400)
         self.assertEqual(self.status(self.store.update_task, 'none', {'title': 'x'}), 404)
 
-    def test_lane_の移動と不正な_lane(self):
+    def test_add_と_update_は_lane_と_machine_を_payload_で受けず断る(self):
         self.store.add_task({'id': 't1', 'title': '題'})
-        self.assertEqual(self.store.update_task('t1', {'lane': 'done'})['lane'], 'done')
-        self.assertEqual(self.store.tasks('todo'), [])
-        self.assertEqual(len(self.store.tasks('done')), 1)
-        self.assertEqual(self.status(self.store.update_task, 't1', {'lane': 'x'}), 400)
-        self.assertEqual(self.status(self.store.add_task, {'id': 't2', 'title': 'a', 'lane': 'x'}), 400)
+        for payload in ({'lane': 'done'}, {'lane': 'x'}, {'lane': 'todo'}, {'machine': '印'}, {'lane': 'done', 'remaining': '残り'}):
+            with self.assertRaises(AppError) as caught:
+                self.store.update_task('t1', payload)
+            self.assertEqual(caught.exception.status, 400, payload)
+            self.assertNotIn('reconcile-lane', str(caught.exception))
+            with self.assertRaises(AppError) as caught:
+                self.store.add_task({'id': 't2', 'title': 'a', **payload})
+            self.assertEqual(caught.exception.status, 400, payload)
+            self.assertNotIn('reconcile-lane', str(caught.exception))
+        tasks = self.store.tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual((tasks[0]['lane'], tasks[0]['machine'], tasks[0]['remaining']), ('todo', '', ''))
 
-    def test_回答すると紐付く_human_decision_の_task_だけ_todo_へ移る(self):
+    def test_reconcile_lane_は_lane_と機械の欄を同時に書き_remaining_を変えない(self):
+        self.store.add_task({'id': 't1', 'title': '題', 'remaining': '窓口の文章'})
+        written = self.store.reconcile_lane('t1', 'human_action', '停止の疑い (機械判定 2026-11-19)')
+        self.assertEqual((written['lane'], written['machine'], written['remaining']), ('human_action', '停止の疑い (機械判定 2026-11-19)', '窓口の文章'))
+        self.assertEqual(len(self.store.tasks('human_action')), 1)
+        cleared = self.store.reconcile_lane('t1', 'worker')
+        self.assertEqual((cleared['lane'], cleared['machine'], cleared['remaining']), ('worker', '', '窓口の文章'))
+        self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'bogus'), 400)
+        self.assertEqual(self.status(self.store.reconcile_lane, 'nope', 'done'), 404)
+        self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'done', 'あ' * 501), 400)
+
+    def test_machine_の無い既存の_tasks_表へ列を足し中身を残す(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('ALTER TABLE tasks DROP COLUMN machine')
+            connection.execute("INSERT INTO tasks(id, title, lane, created_at, updated_at) VALUES ('old', '旧行', 'worker', 'c', 'u')")
+        task = Store(self.db).tasks()[0]
+        self.assertEqual((task['id'], task['lane'], task['machine']), ('old', 'worker', ''))
+
+    def test_回答しても_task_の_lane_と_remaining_は変わらない(self):
         decision = self.store.add(request_payload())
         other = self.store.add(request_payload(title='別の判断'))
         for identifier, lane, decision_id in (('t1', 'human_decision', decision['id']), ('t2', 'worker', decision['id']), ('t3', 'human_decision', other['id'])):
-            self.store.add_task({'id': identifier, 'title': identifier, 'lane': lane, 'decision_id': decision_id, 'remaining': '残り'})
-        choice = decision['options'][0]['id']
-        self.store.answer(decision['id'], {'choice': choice})
-        tasks = {task['id']: task for task in self.store.tasks()}
-        self.assertEqual((tasks['t1']['lane'], tasks['t1']['remaining']), ('todo', f'Cue 回答済み: {choice}。残り'))
-        self.assertEqual((tasks['t2']['lane'], tasks['t2']['remaining']), ('worker', '残り'))
-        self.assertEqual(tasks['t3']['lane'], 'human_decision')
-        answered = self.store.get(decision['id'])['answer']
-        self.store.undo(decision['id'], {'decided_at': answered['decided_at']})
-        self.assertEqual(next(t for t in self.store.tasks() if t['id'] == 't1')['lane'], 'todo')
+            seed_task(self.store, {'id': identifier, 'title': identifier, 'lane': lane, 'decision_id': decision_id, 'remaining': '残り'})
+        keys = ('lane', 'remaining', 'updated_at', 'machine')
+        before = {task['id']: [task[key] for key in keys] for task in self.store.tasks()}
+        self.store.answer(decision['id'], {'choice': decision['options'][0]['id']})
+        after = {task['id']: [task[key] for key in keys] for task in self.store.tasks()}
+        self.assertEqual(after, before)
 
     def test_一覧は_lane_順で_lane_内は作成順(self):
         for identifier, lane in [('b', 'done'), ('a', 'worker'), ('c', 'todo'), ('d', 'worker')]:
-            self.store.add_task({'id': identifier, 'title': identifier, 'lane': lane})
+            seed_task(self.store, {'id': identifier, 'title': identifier, 'lane': lane})
         self.store.update_task('a', {'title': 'z'})
         self.assertEqual([task['id'] for task in self.store.tasks()], ['c', 'a', 'd', 'b'])
 
@@ -160,11 +182,37 @@ class TaskCliTests(unittest.TestCase):
             self.assertNotEqual(self.cli('reconcile-lane', *arguments).returncode, 0, arguments)
         self.assertEqual(Store(self.db).tasks()[0]['lane'], 'worker')
 
+    def test_move_と_add_の_lane_を断り_lane_は変わらない(self):
+        self.cli('add', '--id', 't1', '--title', '題')
+        for arguments in (('move', '--id', 't1', '--lane', 'done'), ('add', '--id', 't2', '--title', 'a', '--lane', 'worker')):
+            refused = self.cli(*arguments)
+            self.assertNotEqual(refused.returncode, 0, arguments)
+            output = refused.stdout + refused.stderr
+            self.assertIn('lane は reconciler が書く', output)
+            self.assertNotIn('reconcile-lane', output)
+        tasks = Store(self.db).tasks()
+        self.assertEqual([(t['id'], t['lane']) for t in tasks], [('t1', 'todo')])
+        self.assertIn('reconcile-lane', self.cli('--help').stdout)
+        for name in ('add', 'move'):
+            self.assertNotIn('--lane', self.cli(name, '--help').stdout)
+
+    def test_reconcile_lane_は機械の欄を書き_update_の_remaining_と共存する(self):
+        self.cli('add', '--id', 't1', '--title', '題')
+        self.cli('update', '--id', 't1', '--remaining', '残り')
+        written = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--machine', 'Cue 回答済み')
+        self.assertEqual(written.returncode, 0, written.stderr)
+        task = Store(self.db).tasks()[0]
+        self.assertEqual((task['remaining'], task['machine']), ('残り', 'Cue 回答済み'))
+        self.assertNotEqual(self.cli('update', '--id', 't1', '--machine', 'x').returncode, 0)
+        self.assertIn('機械: Cue 回答済み', self.cli('list').stdout)
+        # --lane を付けない move も argparse でなく Store の断りに届く
+        self.assertIn('lane は reconciler が書く', self.cli('move', '--id', 't1').stderr)
+
     def test_task_サブコマンドを通す(self):
         added = self.cli('add', '--id', 't1', '--title', '題', '--pane', 'p1')
         self.assertEqual(added.returncode, 0, added.stderr)
         self.assertEqual(json.loads(added.stdout)['lane'], 'todo')
-        self.assertEqual(json.loads(self.cli('move', '--id', 't1', '--lane', 'human_decision').stdout)['lane'], 'human_decision')
+        self.assertEqual(json.loads(self.cli('reconcile-lane', '--id', 't1', '--lane', 'human_decision').stdout)['lane'], 'human_decision')
         updated = json.loads(self.cli('update', '--id', 't1', '--result', 'ok', '--pane', '').stdout)
         self.assertEqual((updated['result'], updated['pane'], updated['title']), ('ok', '', '題'))
         listed = self.cli('list')
@@ -298,9 +346,9 @@ class TmuxClientTests(unittest.TestCase):
 class TaskTuiTests(unittest.TestCase):
     def make(self, directory, popup=False, results=((True, '移りました'),)):
         store = Store(Path(directory) / 'tui.sqlite3')
-        store.add_task({'id': 't1', 'title': '一つ目', 'lane': 'worker', 'pane': 'w9:p1'})
-        store.add_task({'id': 't2', 'title': '二つ目', 'lane': 'todo', 'pane': 'w9:p2'})
-        store.add_task({'id': 't3', 'title': '三つ目', 'lane': 'worker', 'pane': 'w9:p3'})
+        seed_task(store, {'id': 't1', 'title': '一つ目', 'lane': 'worker', 'pane': 'w9:p1'})
+        seed_task(store, {'id': 't2', 'title': '二つ目', 'lane': 'todo', 'pane': 'w9:p2'})
+        seed_task(store, {'id': 't3', 'title': '三つ目', 'lane': 'worker', 'pane': 'w9:p3'})
         self.focused = []
 
         def focus(pane):
@@ -323,7 +371,7 @@ class TaskTuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store, desk = self.make(directory)
             for identifier in ('d1', 'd2'):
-                store.add_task({'id': identifier, 'title': '終わった ' + identifier, 'lane': 'done', 'pane': 'w9:p9'})
+                seed_task(store, {'id': identifier, 'title': '終わった ' + identifier, 'lane': 'done', 'pane': 'w9:p9'})
             desk.refresh()
 
             def screen_text():
@@ -412,7 +460,7 @@ class TaskTuiTests(unittest.TestCase):
             handle_key(desk, 'j')
             handle_key(desk, 'j')
             self.assertEqual(desk.task_id, 't3')
-            store.add_task({'id': 't0', 'title': '先頭', 'lane': 'todo', 'pane': 'w9:p0'})
+            seed_task(store, {'id': 't0', 'title': '先頭', 'lane': 'todo', 'pane': 'w9:p0'})
             desk.refresh()
             self.assertEqual((desk.task_id, desk.task_index), ('t3', 3))
             store.delete_task('t3')
@@ -423,7 +471,7 @@ class TaskTuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store, desk = self.make(directory)
             for number in range(20):
-                store.add_task({'id': f'x{number}', 'title': f'件{number}', 'lane': 'done'})
+                seed_task(store, {'id': f'x{number}', 'title': f'件{number}', 'lane': 'done'})
             desk.refresh()
             handle_key(desk, 'd')
             for _ in range(22):
@@ -440,10 +488,10 @@ class TaskTuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store, desk = self.make(directory)
             decision = store.add(request_payload(title='途中の判断'))
-            store.add_task({'id': 'd1', 'title': '判断つき', 'lane': 'human_decision', 'decision_id': decision['id']})
+            seed_task(store, {'id': 'd1', 'title': '判断つき', 'lane': 'human_decision', 'decision_id': decision['id']})
             # 判断の行が画面の下端を越える位置に来るよう、前に task を積む
             for number in range(6):
-                store.add_task({'id': f'y{number}', 'title': f'前{number}', 'lane': 'todo'})
+                seed_task(store, {'id': f'y{number}', 'title': f'前{number}', 'lane': 'todo'})
             desk.refresh()
             while desk.task_id != 'd1':
                 handle_key(desk, 'j')
@@ -458,10 +506,10 @@ class TaskTuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store, desk = self.make(directory)
             decision = store.add(request_payload(title='未回答の判断'))
-            store.add_task({'id': 'w1', 'title': '判断待ちの依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
+            seed_task(store, {'id': 'w1', 'title': '判断待ちの依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
             answered = store.add(request_payload(title='回答済みの判断', request_key='answered'))
             store.answer(answered['id'], {'choice': 'minimal'})
-            store.add_task({'id': 'w2', 'title': '作業中の依頼', 'lane': 'worker', 'decision_id': answered['id']})
+            seed_task(store, {'id': 'w2', 'title': '作業中の依頼', 'lane': 'worker', 'decision_id': answered['id']})
             desk.refresh()
             for styles in ({}, {'stopped': curses.A_BOLD | 0x100, 'recommendation': curses.A_BOLD | 0x200}):
                 desk.heading_styles = styles
@@ -484,7 +532,7 @@ class TaskTuiTests(unittest.TestCase):
             store = Store(Path(directory) / 'tui.sqlite3')
             decision = store.add(request_payload(title='方針の判断'))
             store.answer(decision['id'], {'choice': 'minimal'})
-            store.add_task({'id': 't1', 'title': '実装中の依頼', 'lane': 'worker', 'pane': 'p1', 'decision_id': decision['id']})
+            seed_task(store, {'id': 't1', 'title': '実装中の依頼', 'lane': 'worker', 'pane': 'p1', 'decision_id': decision['id']})
             desk = Desk(store)
             self.assertTrue(handle_key(desk, 'b'))
             self.assertEqual(desk.mode, 'tasks')
