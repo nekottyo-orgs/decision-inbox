@@ -23,6 +23,14 @@ def isolated_env(temp):
     return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks'), 'DECISION_INBOX_CLAIMS_DIR': str(Path(temp) / 'claims')}
 
 
+def seed_task(store, payload):
+    """lane は reconcile_lane だけが書くので、lane 付きの task は登録のあとで写して作る"""
+    payload = dict(payload)
+    lane = payload.pop('lane', None)
+    task = store.add_task(payload)
+    return store.reconcile_lane(task['id'], lane) if lane else task
+
+
 def request_payload(**changes):
     value = {
         'title': 'レビュー指摘への対応', 'source': 'テスト担当',
@@ -194,7 +202,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_http_tasks_は_lane_別に判断の要約付きで返し書き込みは受けない(self):
         _, decision, _ = self.request('POST', '/api/decisions', request_payload(title='方針の判断'))
-        Store(self.db).add_task({'id': 't1', 'title': '依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
+        seed_task(Store(self.db), {'id': 't1', 'title': '依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
         status, data, _ = self.request('GET', '/api/tasks')
         self.assertEqual(status, 200)
         self.assertEqual([lane['id'] for lane in data['lanes']], ['todo', 'human_decision', 'worker', 'human_action', 'done'])

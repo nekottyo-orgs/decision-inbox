@@ -20,6 +20,7 @@ function TaskCard({ task, changed, onOpenDecision }) {
     <span className="task-title">{task.title}</span>
     <dl>
       {owner && <><dt>担当</dt><dd>{owner}</dd></>}
+      {task.machine && <><dt>機械</dt><dd>{task.machine}</dd></>}
       {task.remaining && <><dt>残り</dt><dd>{task.remaining}</dd></>}
       {task.result && <><dt>結果</dt><dd>{resultUrl ? <a href={resultUrl} target="_blank" rel="noopener noreferrer">{task.result}</a> : task.result}</dd></>}
       {task.decision_id && <><dt>判断</dt><dd><DecisionRef id={task.decision_id} decision={task.decision} onOpenDecision={onOpenDecision} /></dd></>}
