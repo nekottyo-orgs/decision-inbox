@@ -1063,7 +1063,7 @@ def format_tasks(store, lane=None):
             for task in group:
                 lines.append(f"- {task['title']}  [{task['id']}]")
                 updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
-                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('残り', task['remaining']), ('判断', decision_text(task)), ('更新', updated)]
+                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('機械', task.get('machine', '')), ('残り', task['remaining']), ('判断', decision_text(task)), ('更新', updated)]
                 lines.append('  ' + ' / '.join(f'{name}: {value}' for name, value in parts if value))
     return '\n'.join(lines)
 
@@ -1413,7 +1413,7 @@ def main(argv=None):
             for option in ('request', 'pane', 'run', 'result', 'remaining', 'decision'):
                 sub.add_argument('--' + option)
         if name in ('add', 'move', 'reconcile-lane'):
-            sub.add_argument('--lane', required=name != 'add', help=None if name == 'reconcile-lane' else argparse.SUPPRESS)
+            sub.add_argument('--lane', required=name == 'reconcile-lane', help=None if name == 'reconcile-lane' else argparse.SUPPRESS)
         if name == 'reconcile-lane':
             sub.add_argument('--machine', default='', help='機械の欄。停止の疑い (機械判定の日付) や Cue 回答済みの印。省くと空にする')
         if name == 'list':

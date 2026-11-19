@@ -204,6 +204,9 @@ class TaskCliTests(unittest.TestCase):
         task = Store(self.db).tasks()[0]
         self.assertEqual((task['remaining'], task['machine']), ('残り', 'Cue 回答済み'))
         self.assertNotEqual(self.cli('update', '--id', 't1', '--machine', 'x').returncode, 0)
+        self.assertIn('機械: Cue 回答済み', self.cli('list').stdout)
+        # --lane を付けない move も argparse でなく Store の断りに届く
+        self.assertIn('lane は reconciler が書く', self.cli('move', '--id', 't1').stderr)
 
     def test_task_サブコマンドを通す(self):
         added = self.cli('add', '--id', 't1', '--title', '題', '--pane', 'p1')
