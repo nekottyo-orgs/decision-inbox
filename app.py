@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 MAX_BODY = 131072
 ASSETS = {'/assets/demo-flow.svg': ('assets/demo-flow.svg', 'image/svg+xml')}
 LANES = {'todo': '未着手', 'human_decision': '人の判断待ち', 'worker': 'worker 作業中', 'human_action': '人の操作待ち', 'done': '完了'}
+RECONCILE_HELP = 'reconciler だけが使う。lane を書く。窓口や人は task move を使わない方向 (後続の PR で move / --lane を断る)'
 TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'lane', 'decision_id')
 # add の再送判定で比べる登録内容。lane / result / remaining / decision_id は move / update で進むので比べない
 TASK_IDENTITY = ('title', 'request', 'pane', 'run')
@@ -1376,7 +1377,7 @@ def main(argv=None):
     task_commands = task.add_subparsers(dest='task_command', required=True)
     for name in ('add', 'move', 'reconcile-lane', 'update', 'delete', 'list'):
         # reconcile-lane は lane を書く唯一の経路にする予定の subcommand (move / --lane を断るのは別 PR)
-        sub = task_commands.add_parser(name, formatter_class=epilog_format, help='reconciler だけが使う。lane を書く。窓口や人は task move を使わない方向 (後続の PR で move / --lane を断る)' if name == 'reconcile-lane' else None, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
+        sub = task_commands.add_parser(name, formatter_class=epilog_format, help=RECONCILE_HELP if name == 'reconcile-lane' else None, description=RECONCILE_HELP if name == 'reconcile-lane' else None, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
         if name != 'list':
             sub.add_argument('--id', required=True)
         if name == 'add':
