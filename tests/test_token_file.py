@@ -156,7 +156,9 @@ class CliHookAndTokenFileTests(unittest.TestCase):
         result = self.cli('complete', '--id', item['id'], '--token-file', str(target))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['answer']['status'], 'completed')
-        self.assertIn('warning', json.loads(result.stderr))
+        warning = json.loads(result.stderr)['warning']
+        self.assertTrue(warning.startswith('token ファイルを消せませんでした: '), warning)
+        self.assertNotIn(json.loads(target.read_text())['token'], warning)
         self.assertTrue(target.exists())
 
     def test_report_は_token_ファイルを消せなくても_DB_の報告を成功として返す(self):
@@ -164,7 +166,8 @@ class CliHookAndTokenFileTests(unittest.TestCase):
         result = self.cli('report', '--id', item['id'], '--token-file', str(target), '--status', 'blocked', '--reason', 'r', '--next-step', 'n')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['answer']['status'], 'blocked')
-        self.assertIn('warning', json.loads(result.stderr))
+        self.assertTrue(json.loads(result.stderr)['warning'].startswith('token ファイルを消せませんでした: '))
+        self.assertTrue(target.exists())
 
     def test_commit_の直後に落ちても_token_入りの一時ファイルは残らない(self):
         # finally の後始末が走らない落ち方 (SIGKILL) を、後始末を空にして近似する

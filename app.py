@@ -1254,9 +1254,9 @@ def claim_to_file(store, args):
         os.link(temp, final)
         # 一時名は link の直後に消す。commit の直後に落ちると finally が走らず、有効な token の入った
         # .claim-*.tmp が残る (列挙にも掃除にも掛からない)。ここで失敗しても finally がもう一度試して警告する
+        published.append(final)
         with suppress(OSError):
             temp.unlink(missing_ok=True)
-        published.append(final)
         fsync_dir(final.parent)
         # claims_dir は対象なしの claim でも作られるので、作った回に限らず親も毎回 fsync する
         if target is None:
@@ -1498,7 +1498,7 @@ def main(argv=None):
         else:
             result = store.complete(args.id, token_from(args))
             # DB は commit 済みなので、消せなくても失敗にしない。呼び手が失敗とみなして再試行しても
-            # token は既に無効で断られる。残った file は sweep_claims が lease 期限から 24 時間後に消す
+            # token は既に無効で断られる。auto の file は残っても sweep_claims が lease 期限から 24 時間後に消す (明示パスは消えない)
             if args.token_file:
                 unlink_temp(args.token_file, 'token ファイル')
         print(json.dumps(result, ensure_ascii=False))
