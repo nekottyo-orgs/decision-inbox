@@ -466,6 +466,7 @@ class Store:
             item['answer'] = {
                 'choice': row['choice'], 'memo': row['memo'], 'decided_at': row['decided_at'], 'status': row['status'],
                 'reason': row['reason'], 'next_step': row['next_step'], 'reported_at': row['reported_at'],
+                'lease_until': row['lease_until'],
                 'can_undo': row['status'] == 'pending' and row['worker'] is None and row['token'] is None and row['lease_until'] is None,
             }
         return item
