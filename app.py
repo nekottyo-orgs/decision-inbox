@@ -1165,7 +1165,7 @@ def fsync_dir(path):
         os.close(descriptor)
 
 
-def unlink_temp(path):
+def unlink_temp(path, what='token を含む一時ファイル'):
     try:
         path.unlink(missing_ok=True)
     except OSError as error:
@@ -1173,7 +1173,7 @@ def unlink_temp(path):
         # 書き込みの失敗を投げると finally から claim の結果や元の例外を潰す
         if sys.stderr is not None:
             with suppress(OSError, ValueError):
-                print(json.dumps({'warning': f'token を含む一時ファイルを消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
+                print(json.dumps({'warning': f'{what}を消せませんでした: {path} ({error.strerror or error})'}, ensure_ascii=False), file=sys.stderr)
 
 
 TOKEN_FILE_LIMIT = 65536
@@ -1252,6 +1252,10 @@ def claim_to_file(store, args):
         write_synced(handle, {'id': result['decision']['id'], 'token': result['token'], 'worker': result['worker'], 'expires_at': result['expires_at']})
         # rename でなく link にする。宛先が既にあれば上書きせず失敗させ、他の claim のファイルを壊さない
         os.link(temp, final)
+        # 一時名は link の直後に消す。commit の直後に落ちると finally が走らず、有効な token の入った
+        # .claim-*.tmp が残る (列挙にも掃除にも掛からない)。ここで失敗しても finally がもう一度試して警告する
+        with suppress(OSError):
+            temp.unlink(missing_ok=True)
         published.append(final)
         fsync_dir(final.parent)
         # claims_dir は対象なしの claim でも作られるので、作った回に限らず親も毎回 fsync する
@@ -1271,7 +1275,6 @@ def claim_to_file(store, args):
         if descriptor is not None:
             os.close(descriptor)
         # commit 後に一時名を消せなくても claim は成立しているので、結果は失わず警告だけ出す
-        # (残った .claim-*.tmp は列挙にも掃除にも掛からないので、token 入りのまま誰も消さない)
         unlink_temp(temp)
     result.pop('token', None)
     return result
@@ -1480,7 +1483,7 @@ def main(argv=None):
         elif args.command == 'report':
             result = store.report(args.id, {'token': token_from(args), 'status': args.status, 'reason': args.reason, 'next_step': args.next_step})
             if args.token_file:
-                args.token_file.unlink(missing_ok=True)
+                unlink_temp(args.token_file, 'token ファイル')
         elif args.command == 'retry':
             result = store.retry(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
         elif args.command == 'close':
@@ -1494,8 +1497,10 @@ def main(argv=None):
             result = store.backup(args.output)
         else:
             result = store.complete(args.id, token_from(args))
+            # DB は commit 済みなので、消せなくても失敗にしない。呼び手が失敗とみなして再試行しても
+            # token は既に無効で断られる。残った file は sweep_claims が lease 期限から 24 時間後に消す
             if args.token_file:
-                args.token_file.unlink(missing_ok=True)
+                unlink_temp(args.token_file, 'token ファイル')
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (AppError, sqlite3.Error, OSError) as error:
