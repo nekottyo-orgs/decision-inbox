@@ -150,6 +150,16 @@ class TaskCliTests(unittest.TestCase):
     def cli(self, *arguments):
         return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'task', *arguments], capture_output=True, text=True, timeout=10)
 
+    def test_reconcile_lane_は_lane_を書き不正な_lane_と未登録の_id_を断る(self):
+        self.cli('add', '--id', 't1', '--title', '題')
+        written = self.cli('reconcile-lane', '--id', 't1', '--lane', 'worker')
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual(json.loads(written.stdout)['lane'], 'worker')
+        self.assertEqual(Store(self.db).tasks()[0]['lane'], 'worker')
+        for arguments in (('--id', 't1', '--lane', 'bogus'), ('--id', 'nope', '--lane', 'done'), ('--id', 't1')):
+            self.assertNotEqual(self.cli('reconcile-lane', *arguments).returncode, 0, arguments)
+        self.assertEqual(Store(self.db).tasks()[0]['lane'], 'worker')
+
     def test_task_サブコマンドを通す(self):
         added = self.cli('add', '--id', 't1', '--title', '題', '--pane', 'p1')
         self.assertEqual(added.returncode, 0, added.stderr)

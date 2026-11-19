@@ -106,6 +106,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 run close --run-id RUN --role wor
 python3 app.py --db /tmp/decision-test.sqlite3 run show (--run-id RUN | --pane P --socket SOCKET) [--all]
 python3 app.py --db /tmp/decision-test.sqlite3 task add --id ID --title 題名 [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--lane L] [--decision DECISION_ID]
 python3 app.py --db /tmp/decision-test.sqlite3 task move --id ID --lane worker
+python3 app.py --db /tmp/decision-test.sqlite3 task reconcile-lane --id ID --lane worker   # reconciler だけが使う。窓口や人は task move を使わない方向 (後続の PR で move / --lane を断る)
 python3 app.py --db /tmp/decision-test.sqlite3 task update --id ID [--title T] [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--decision DECISION_ID]
 python3 app.py --db /tmp/decision-test.sqlite3 task delete --id ID
 python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
