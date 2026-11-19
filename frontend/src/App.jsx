@@ -2,6 +2,8 @@ import {useEffect, useLayoutEffect, useRef, useState} from 'react';
 import DecisionDesk from './DecisionDesk.jsx';
 import TaskBoard from './TaskBoard.jsx';
 
+// lease_until は heartbeat のたびに伸びるので、変更の検出から外す (通知が出続けるため)
+const signature = value => JSON.stringify(value, (key, inner) => key === 'lease_until' ? undefined : inner);
 const ranks = {urgent: 0, normal: 1, later: 2};
 const emptyDraft = () => ({choice: '', memo: ''});
 const visibleItems = (cases, view, priority) => cases
@@ -59,7 +61,7 @@ export default function App() {
         const requestedDecision = linkedDecision.current;
         linkedDecision.current = null;
         setState(previous => {
-          const changed = JSON.stringify(previous.cases) !== JSON.stringify(data.decisions);
+          const changed = signature(previous.cases) !== signature(data.decisions);
           let view = previous.view;
           let selectedItem = previous.selectedItem;
           let special = '';
@@ -86,7 +88,7 @@ export default function App() {
           if (special) notice = special;
           else if (!previous.loading && changed) {
             const latest = data.decisions.find(item => item.id === selectedItem?.id);
-            notice = selectedItem && !selectedItem.answer && JSON.stringify(latest) !== JSON.stringify(selectedItem)
+            notice = selectedItem && !selectedItem.answer && signature(latest) !== signature(selectedItem)
               ? '表示中の案件に変更があります。入力を保持しています。一覧から案件を選び直すと最新の状態を確認できます。'
               : '新着または処理状態の変更があります。一覧を更新しました。';
           }

@@ -92,9 +92,14 @@ class RecoveryTests(unittest.TestCase):
         item = self.answered()
         self.assertIsNone(item['answer']['lease_until'])
         with patch('app.time.time', return_value=1000):
-            self.store.claim('worker', 60)
-        self.assertEqual(self.store.get(item['id'])['answer']['lease_until'], 1060)
-        self.assertNotIn('token', self.store.get(item['id'])['answer'])
+            claim = self.store.claim('worker', 60)
+        answer = self.store.get(item['id'])['answer']
+        # health は number の epoch 秒だけを対象にするので、型も固定する
+        self.assertEqual(answer['lease_until'], 1060)
+        self.assertIsInstance(answer['lease_until'], float)
+        with patch('app.time.time', return_value=1000):
+            self.store.complete(item['id'], claim['token'])
+        self.assertIsNone(self.store.get(item['id'])['answer']['lease_until'])
 
     def test_report_stops_delivery_and_retry_keeps_processing_history(self):
         for status in ('blocked', 'failed'):
