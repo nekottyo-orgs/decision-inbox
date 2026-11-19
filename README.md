@@ -80,6 +80,7 @@ Herdr は起動と popup の管理を担い、TUI の task 画面からは担当
 ```sh
 python3 app.py task add --id fix-login --title "ログイン修正" --pane 1-2 --lane worker
 python3 app.py task move --id fix-login --lane human_decision
+python3 app.py task reconcile-lane --id fix-login --lane worker   # reconciler だけが使う。窓口や人は task move を使わない方向になる (後続の PR で move / --lane を断る)
 python3 app.py task update --id fix-login --remaining "回答待ち" --decision DECISION_ID
 python3 app.py task list
 python3 app.py task delete --id fix-login

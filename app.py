@@ -1053,7 +1053,7 @@ def run_task(store, args):
     if args.task_command == 'add':
         payload = {'id': args.id, 'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'lane': args.lane, 'decision_id': args.decision}
         return store.add_task({key: value for key, value in payload.items() if value is not None})
-    if args.task_command == 'move':
+    if args.task_command in ('move', 'reconcile-lane'):
         return store.update_task(args.id, {'lane': args.lane})
     if args.task_command == 'update':
         payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision}
@@ -1374,8 +1374,9 @@ def main(argv=None):
     backup.add_argument('--output', type=Path, required=True)
     task = commands.add_parser('task', help='依頼の進み具合を管理する')
     task_commands = task.add_subparsers(dest='task_command', required=True)
-    for name in ('add', 'move', 'update', 'delete', 'list'):
-        sub = task_commands.add_parser(name, formatter_class=epilog_format, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
+    for name in ('add', 'move', 'reconcile-lane', 'update', 'delete', 'list'):
+        # reconcile-lane は lane を書く唯一の経路にする予定の subcommand (move / --lane を断るのは別 PR)
+        sub = task_commands.add_parser(name, formatter_class=epilog_format, help='reconciler だけが使う。lane を書く。窓口や人は task move を使わない方向 (後続の PR で move / --lane を断る)' if name == 'reconcile-lane' else None, epilog='既定は lane ごとの文字の一覧。--json は {"lanes": [{"id": "lane 名", "label": "表示名", "tasks": [task, ...]}, ...]} (lane は ' + ' / '.join(LANES) + ' の順)' if name == 'list' else None)
         if name != 'list':
             sub.add_argument('--id', required=True)
         if name == 'add':
@@ -1385,8 +1386,8 @@ def main(argv=None):
         if name in ('add', 'update'):
             for option in ('request', 'pane', 'run', 'result', 'remaining', 'decision'):
                 sub.add_argument('--' + option)
-        if name in ('add', 'move'):
-            sub.add_argument('--lane', required=name == 'move')
+        if name in ('add', 'move', 'reconcile-lane'):
+            sub.add_argument('--lane', required=name != 'add')
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')
