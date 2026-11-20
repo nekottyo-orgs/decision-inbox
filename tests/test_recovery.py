@@ -101,6 +101,26 @@ class RecoveryTests(unittest.TestCase):
             self.store.complete(item['id'], claim['token'])
         self.assertIsNone(self.store.get(item['id'])['answer']['lease_until'])
 
+    def test_cli_list_は_claim_中の回答に_status_と_lease_until_を出す(self):
+        # health (nekottyo/agents の frontdesk-health.sh) は CLI の list を jq で読むので、store でなく CLI の JSON 経由で形を固定する
+        def listed():
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = main(['--db', str(self.db), 'list'])
+            self.assertEqual(code, 0, stderr.getvalue())
+            return json.loads(stdout.getvalue())['decisions'][0]['answer']
+
+        self.answered()
+        pending = listed()
+        self.assertEqual(pending['status'], 'pending')
+        self.assertIsNone(pending['lease_until'])
+        with patch('app.time.time', return_value=1000):
+            self.store.claim('worker', 60)
+        processing = listed()
+        self.assertEqual(processing['status'], 'processing')
+        self.assertEqual(processing['lease_until'], 1060)
+        self.assertIsInstance(processing['lease_until'], (int, float))
+
     def test_report_stops_delivery_and_retry_keeps_processing_history(self):
         for status in ('blocked', 'failed'):
             with self.subTest(status=status):
