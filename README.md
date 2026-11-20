@@ -78,7 +78,7 @@ Herdr は起動と popup の管理を担い、TUI の task 画面からは担当
 判断とは別に、依頼 (task) が今どの段階かを lane で追えます。task の登録は CLI で行い、TUI と Web で確認します。lane は reconciler だけが書くので、`task move` と `task add --lane`、payload の lane は error になります。判断に回答しても task の lane は変わりません (TUI からは選んだ task の担当 pane へ移れます)。
 
 ```sh
-python3 app.py task add --id fix-login --title "ログイン修正" --kind implement --done-when "PR が merge される" --pane 1-2   # 新しい task は todo で始まる。--kind と --done-when は必須
+python3 app.py task add --id fix-login --title "ログイン修正" --kind implement --done-when "PR が merge される" --pane 1-2   # 新しい task は todo で始まる。--kind と --done-when は必須。implement は --done-when に PR か issue の URL、decision は --decision が必須
 python3 app.py task reconcile-lane --id fix-login --lane human_action --machine "停止の疑い (機械判定 2026-11-19)"   # reconciler だけが使う。lane と機械の欄を同時に書き、remaining は変えない
 python3 app.py task update --id fix-login --remaining "回答待ち" --decision DECISION_ID
 python3 app.py task list
