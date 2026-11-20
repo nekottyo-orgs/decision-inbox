@@ -296,7 +296,7 @@ def validate_task(payload):
 
 # 依頼の種類ごとの必須。implement は完了の条件に PR か issue の URL (ADR-321 Q19)、decision は判断の ID。
 # 番号だけの「PR 305」は repo が分からず、誰も辿れないので断る
-PR_URL = re.compile(r'https://github\.com/[\w.-]+/[\w.-]+/(?:pull|issues)/[0-9]+')
+PR_URL = re.compile(r'https://github\.com/[\w.-]+/[\w.-]+/(?:pull|issues)/[0-9]+(?![A-Za-z0-9_])')
 
 
 def check_task_rules(kind, done_when, decision_id):
@@ -645,12 +645,13 @@ class Store:
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             self.check_decision(connection, item)
-            check_task_rules(item['kind'], item['done_when'], item['decision_id'])
             row = connection.execute('SELECT * FROM tasks WHERE id=?', (item['id'],)).fetchone()
             if row:
                 if any(row[key] != item[key] for key in TASK_IDENTITY):
                     raise AppError(409, '同じ id に異なる task が登録されています')
                 return dict(row)
+            # 再送は既存を返す約束なので、規則の検査は新規に作る場合だけ行う (この規則より前の行への再送を断らない)
+            check_task_rules(item['kind'], item['done_when'], item['decision_id'])
             now = utc_now()
             # 新しい task は todo で始まり、以後の lane は reconciler が写す
             names = ','.join(('id', *TASK_FIELDS, 'lane', 'created_at', 'updated_at'))

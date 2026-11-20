@@ -145,6 +145,19 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(issue['decision_id'], None)
         self.assertEqual(len(self.store.tasks()), 5)
 
+    def test_規則より前に登録した行への再送は既存を返し_URL_の後ろが英数字なら断る(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("INSERT INTO tasks(id, title, kind, done_when, lane, created_at, updated_at) VALUES ('i', '題', 'implement', '実装が済む', 'worker', 'c', 'u')")
+            connection.execute("INSERT INTO tasks(id, title, kind, done_when, lane, created_at, updated_at) VALUES ('d', '題', 'decision', '回答が届く', 'worker', 'c', 'u')")
+        for identifier, kind, done_when in (('i', 'implement', '実装が済む'), ('d', 'decision', '回答が届く')):
+            self.assertEqual(self.store.add_task({'id': identifier, 'title': '題', 'kind': kind, 'done_when': done_when})['id'], identifier)
+        # 規則を満たさない旧行でも、result などだけの update は止まらない
+        self.assertEqual(self.store.update_task('i', {'result': '済み'})['result'], '済み')
+        self.assertEqual(self.store.update_task('d', {'remaining': '残り'})['remaining'], '残り')
+        for done_when in (PR_URL + 'abc', PR_URL + '_x'):
+            self.assertEqual(self.status(self.store.add_task, {'id': 'n', 'title': '題', 'kind': 'implement', 'done_when': done_when}), 400, done_when)
+        self.assertEqual(self.store.add_task({'id': 'n', 'title': '題', 'kind': 'implement', 'done_when': PR_URL + 'が merge される'})['id'], 'n')
+
     def test_update_も同じ規則で断り指定しない項目と_legacy_行は止めない(self):
         decision = self.store.add(request_payload())
         self.store.add_task({'id': 'i', 'title': '題', 'kind': 'implement', 'done_when': PR_URL})
