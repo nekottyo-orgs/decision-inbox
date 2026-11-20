@@ -27,10 +27,12 @@ LANES = {'todo': '未着手', 'human_decision': '人の判断待ち', 'worker': 
 RECONCILE_HELP = 'reconciler だけが使う。lane と機械の欄 (machine) を同時に書く。remaining は変えない。lane を書く経路はこれだけ'
 LANE_REFUSED = 'lane は reconciler が書く。手で打っても次の reconcile が派生値に戻す'
 # lane と machine は reconciler 専用 (reconcile_lane だけが書く) なので、add / update の項目に入れない
-TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'decision_id')
+TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'decision_id', 'kind', 'done_when')
+# 依頼の種類。判断 / 監視 / 調査 / 実装
+TASK_KINDS = ('decision', 'monitor', 'research', 'implement')
 # add の再送判定で比べる登録内容。result / remaining / decision_id は update で進むので比べない
 TASK_IDENTITY = ('title', 'request', 'pane', 'run')
-TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000, 'machine': 500}
+TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000, 'machine': 500, 'done_when': 1000}
 WEB_ROOT = ROOT / 'frontend' / 'dist'
 STATIC = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/assets/app.js': ('assets/app.js', 'text/javascript; charset=utf-8'), '/assets/app.css': ('assets/app.css', 'text/css; charset=utf-8')}
 
@@ -276,7 +278,11 @@ def validate_task(payload):
             raise AppError(400, 'id は英数字と _ . : / - で指定してください')
     for key, maximum in TASK_LIMITS.items():
         if key in payload:
-            item[key] = text(payload[key], key, maximum, empty=key != 'title')
+            item[key] = text(payload[key], key, maximum, empty=key not in ('title', 'done_when'))
+    if 'kind' in payload:
+        if not isinstance(payload['kind'], str) or payload['kind'] not in TASK_KINDS:
+            raise AppError(400, 'kind は ' + ' / '.join(TASK_KINDS) + ' のいずれかを指定してください')
+        item['kind'] = payload['kind']
     if 'decision_id' in payload:
         value = payload['decision_id']
         if value in ('', None):
@@ -381,6 +387,11 @@ class Store:
             # machine (機械の欄) は reconciler だけが書く。既存の tasks 表へは列を足すだけ。DEFAULT '' があるので旧 release の INSERT も通る
             if 'machine' not in {row['name'] for row in connection.execute('PRAGMA table_info(tasks)')}:
                 connection.execute("ALTER TABLE tasks ADD COLUMN machine TEXT NOT NULL DEFAULT ''")
+            # kind / done_when も同じ流儀で足す。legacy 行は空のまま読み、add だけが必須にする
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(tasks)')}
+            for column in ('kind', 'done_when'):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
             # 更新・取り下げは decisions に列を足さず別表に積む。decisions の列や状態の CHECK を変えると
             # 旧 release が開けなくなるため。取り下げ済み = withdraw 行があること。旧 release に戻すと
             # この表は読まれず、取り下げ済みの判断が未回答として再表示される
@@ -615,7 +626,7 @@ class Store:
 
     def add_task(self, payload):
         self.refuse_lane(payload)
-        object_fields(payload, ('id', 'title'), ('request', 'pane', 'run', 'result', 'remaining', 'decision_id'))
+        object_fields(payload, ('id', 'title', 'kind', 'done_when'), ('request', 'pane', 'run', 'result', 'remaining', 'decision_id'))
         item = validate_task(payload)
         item = {'request': '', 'pane': '', 'run': '', 'result': '', 'remaining': '', 'decision_id': None, **item}
         with self.db() as connection:
@@ -628,7 +639,8 @@ class Store:
                 return dict(row)
             now = utc_now()
             # 新しい task は todo で始まり、以後の lane は reconciler が写す
-            connection.execute('INSERT INTO tasks(id,title,request,pane,run,result,remaining,decision_id,lane,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            names = ','.join(('id', *TASK_FIELDS, 'lane', 'created_at', 'updated_at'))
+            connection.execute(f'INSERT INTO tasks({names}) VALUES({",".join("?" * (len(TASK_FIELDS) + 4))})',
                                (item['id'], *(item[key] for key in TASK_FIELDS), 'todo', now, now))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (item['id'],)).fetchone())
 
@@ -1063,14 +1075,14 @@ def format_tasks(store, lane=None):
             for task in group:
                 lines.append(f"- {task['title']}  [{task['id']}]")
                 updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
-                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('機械', task.get('machine', '')), ('残り', task['remaining']), ('判断', decision_text(task)), ('更新', updated)]
+                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('種類', task.get('kind', '')), ('完了の条件', task.get('done_when', '')), ('機械', task.get('machine', '')), ('残り', task['remaining']), ('判断', decision_text(task)), ('更新', updated)]
                 lines.append('  ' + ' / '.join(f'{name}: {value}' for name, value in parts if value))
     return '\n'.join(lines)
 
 
 def run_task(store, args):
     if args.task_command == 'add':
-        payload = {'id': args.id, 'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision}
+        payload = {'id': args.id, 'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision, 'kind': args.kind, 'done_when': args.done_when}
         if args.lane is not None:
             payload['lane'] = args.lane
         return store.add_task({key: value for key, value in payload.items() if value is not None})
@@ -1079,7 +1091,7 @@ def run_task(store, args):
     if args.task_command == 'reconcile-lane':
         return store.reconcile_lane(args.id, args.lane, args.machine)
     if args.task_command == 'update':
-        payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision}
+        payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision, 'kind': args.kind, 'done_when': args.done_when}
         return store.update_task(args.id, {key: value for key, value in payload.items() if value is not None})
     if args.task_command == 'delete':
         return store.delete_task(args.id)
@@ -1412,6 +1424,9 @@ def main(argv=None):
         if name in ('add', 'update'):
             for option in ('request', 'pane', 'run', 'result', 'remaining', 'decision'):
                 sub.add_argument('--' + option)
+            # choices にせず Store の検査に任せる (error は JSON で exit 1)
+            sub.add_argument('--kind', help='種類 (add では必須): ' + ' / '.join(TASK_KINDS) + ' (判断 / 監視 / 調査 / 実装)')
+            sub.add_argument('--done-when', help='完了の条件 (add では必須。1〜1000 字)')
         if name in ('add', 'move', 'reconcile-lane'):
             sub.add_argument('--lane', required=name == 'reconcile-lane', help=None if name == 'reconcile-lane' else argparse.SUPPRESS)
         if name == 'reconcile-lane':

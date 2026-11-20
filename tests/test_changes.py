@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import SCHEMA, AppError, Store, decision_text
 from cue_tui import Desk, detail_lines, handle_key
-from test_app import request_payload
+from test_app import TASK_DEFAULTS, request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -171,7 +171,7 @@ class ChangeTests(unittest.TestCase):
 
     def test_task_の判断表示は取り下げを区別する(self):
         item = self.store.add(request_payload(title='方針の判断'))
-        self.store.add_task({'id': 't1', 'title': '依頼', 'decision_id': item['id']})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '依頼', 'decision_id': item['id']})
         self.store.withdraw(item['id'], {'note': '不要'})
         task = self.store.tasks()[0]
         self.assertEqual(task['decision'], {'title': '方針の判断', 'answered': False, 'withdrawn': True})
