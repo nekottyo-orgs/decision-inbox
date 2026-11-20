@@ -16,6 +16,7 @@ from test_app import TASK_DEFAULTS, request_payload, seed_task
 from test_tui import Screen
 
 ROOT = Path(__file__).resolve().parents[1]
+PR_URL = 'https://github.com/nekottyo/agents/pull/305'
 ADD_KIND = ('--kind', 'research', '--done-when', TASK_DEFAULTS['done_when'])
 
 
@@ -45,7 +46,7 @@ class TaskTests(unittest.TestCase):
 
     def test_kind_と_done_when_は再送判定に入れず既存の値を返す(self):
         first = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
-        again = self.store.add_task({'id': 't1', 'title': '題', 'kind': 'implement', 'done_when': '別の条件'})
+        again = self.store.add_task({'id': 't1', 'title': '題', 'kind': 'implement', 'done_when': PR_URL + ' が merge される'})
         self.assertEqual(again, first)
         self.assertEqual((again['kind'], again['done_when']), (TASK_DEFAULTS['kind'], TASK_DEFAULTS['done_when']))
         with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
@@ -112,21 +113,75 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.store.add_task({**base, 'done_when': 'あ' * 1000})['done_when'], 'あ' * 1000)
 
     def test_4_つの_kind_を保存し読み出せる(self):
+        decision = self.store.add(request_payload())
         for kind in ('decision', 'monitor', 'research', 'implement'):
-            self.store.add_task({'id': kind, 'title': kind, 'kind': kind, 'done_when': kind + ' が済む'})
+            self.store.add_task({'id': kind, 'title': kind, 'kind': kind, 'done_when': kind + ' が済む ' + PR_URL, 'decision_id': decision['id']})
         self.assertEqual({task['id']: (task['kind'], task['done_when']) for task in self.store.tasks()},
-                         {kind: (kind, kind + ' が済む') for kind in ('decision', 'monitor', 'research', 'implement')})
+                         {kind: (kind, kind + ' が済む ' + PR_URL) for kind in ('decision', 'monitor', 'research', 'implement')})
+
+    def test_implement_の_PR_が_URL_でない_add_は断り_task_は増えない(self):
+        for done_when in ('PR 305 が merge される', 'PR #305 が merge される', '実装が済む', 'https://example.com/pull/1 が merge される', 'github.com/nekottyo/agents/pull/305'):
+            with self.assertRaises(AppError) as caught:
+                self.store.add_task({'id': 't1', 'title': '題', 'kind': 'implement', 'done_when': done_when})
+            self.assertEqual(caught.exception.status, 400, done_when)
+            self.assertIn('URL', str(caught.exception))
+        self.assertEqual(self.store.tasks(), [])
+
+    def test_decision_の_decision_id_が無い_add_は断り_task_は増えない(self):
+        for extra in ({}, {'decision_id': ''}, {'decision_id': None}):
+            with self.assertRaises(AppError) as caught:
+                self.store.add_task({'id': 't1', 'title': '題', 'kind': 'decision', 'done_when': '回答が届く', **extra})
+            self.assertEqual(caught.exception.status, 400, extra)
+            self.assertIn('decision_id', str(caught.exception))
+        self.assertEqual(self.store.tasks(), [])
+
+    def test_PR_の_URL_と_decision_id_がそろった_add_は通る(self):
+        decision = self.store.add(request_payload())
+        for number in (305, 306):
+            for kind in ('implement', 'decision'):
+                task = self.store.add_task({'id': f'{kind}{number}', 'title': '題', 'kind': kind, 'done_when': f'https://github.com/nekottyo/agents/pull/{number} が merge される', 'decision_id': decision['id']})
+                self.assertEqual((task['kind'], task['decision_id']), (kind, decision['id']))
+        issue = self.store.add_task({'id': 'issue', 'title': '題', 'kind': 'implement', 'done_when': 'https://github.com/nekottyo/agents/issues/409 が close される'})
+        self.assertEqual(issue['decision_id'], None)
+        self.assertEqual(len(self.store.tasks()), 5)
+
+    def test_規則より前に登録した行への再送は既存を返し_URL_の後ろが英数字なら断る(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("INSERT INTO tasks(id, title, kind, done_when, lane, created_at, updated_at) VALUES ('i', '題', 'implement', '実装が済む', 'worker', 'c', 'u')")
+            connection.execute("INSERT INTO tasks(id, title, kind, done_when, lane, created_at, updated_at) VALUES ('d', '題', 'decision', '回答が届く', 'worker', 'c', 'u')")
+        for identifier, kind, done_when in (('i', 'implement', '実装が済む'), ('d', 'decision', '回答が届く')):
+            self.assertEqual(self.store.add_task({'id': identifier, 'title': '題', 'kind': kind, 'done_when': done_when})['id'], identifier)
+        # 規則を満たさない旧行でも、result などだけの update は止まらない
+        self.assertEqual(self.store.update_task('i', {'result': '済み'})['result'], '済み')
+        self.assertEqual(self.store.update_task('d', {'remaining': '残り'})['remaining'], '残り')
+        for done_when in (PR_URL + 'abc', PR_URL + '_x'):
+            self.assertEqual(self.status(self.store.add_task, {'id': 'n', 'title': '題', 'kind': 'implement', 'done_when': done_when}), 400, done_when)
+        self.assertEqual(self.store.add_task({'id': 'n', 'title': '題', 'kind': 'implement', 'done_when': PR_URL + 'が merge される'})['id'], 'n')
+
+    def test_update_も同じ規則で断り指定しない項目と_legacy_行は止めない(self):
+        decision = self.store.add(request_payload())
+        self.store.add_task({'id': 'i', 'title': '題', 'kind': 'implement', 'done_when': PR_URL})
+        self.store.add_task({'id': 'd', 'title': '題', 'kind': 'decision', 'done_when': '回答が届く', 'decision_id': decision['id']})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 'r', 'title': '題'})
+        for identifier, payload in (('i', {'done_when': 'PR 305 が merge される'}), ('r', {'kind': 'implement'}), ('r', {'kind': 'decision'}), ('d', {'decision_id': ''}), ('d', {'decision_id': None})):
+            self.assertEqual(self.status(self.store.update_task, identifier, payload), 400, payload)
+        self.assertEqual(self.store.update_task('r', {'kind': 'implement', 'done_when': PR_URL})['kind'], 'implement')
+        self.assertEqual(self.store.update_task('d', {'kind': 'monitor', 'decision_id': ''})['decision_id'], None)
+        self.assertEqual(self.store.update_task('i', {'result': '済み'})['result'], '済み')
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("INSERT INTO tasks(id, title, lane, created_at, updated_at) VALUES ('old', '旧行', 'worker', 'c', 'u')")
+        self.assertEqual(self.store.update_task('old', {'remaining': '残り'})['remaining'], '残り')
 
     def test_update_で_kind_と_done_when_を変えられ空と不正値は断り値は変わらない(self):
         self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
-        changed = self.store.update_task('t1', {'kind': 'implement'})
-        self.assertEqual((changed['kind'], changed['done_when']), ('implement', TASK_DEFAULTS['done_when']))
-        changed = self.store.update_task('t1', {'done_when': 'PR が merge される'})
-        self.assertEqual((changed['kind'], changed['done_when']), ('implement', 'PR が merge される'))
+        changed = self.store.update_task('t1', {'kind': 'monitor'})
+        self.assertEqual((changed['kind'], changed['done_when']), ('monitor', TASK_DEFAULTS['done_when']))
+        changed = self.store.update_task('t1', {'kind': 'implement', 'done_when': PR_URL + ' が merge される'})
+        self.assertEqual((changed['kind'], changed['done_when']), ('implement', PR_URL + ' が merge される'))
         for payload in ({'kind': ''}, {'kind': 'bogus'}, {'kind': 3}, {'kind': ['a']}, {'done_when': ''}, {'done_when': ' '}, {'done_when': 'あ' * 1001}, {'done_when': 3}, {'kind': 'monitor', 'done_when': ''}):
             self.assertEqual(self.status(self.store.update_task, 't1', payload), 400, payload)
         task = self.store.tasks()[0]
-        self.assertEqual((task['kind'], task['done_when']), ('implement', 'PR が merge される'))
+        self.assertEqual((task['kind'], task['done_when']), ('implement', PR_URL + ' が merge される'))
 
     def test_kind_と_done_when_の列が無い既存の_tasks_表へ列を足し旧行は空のまま読める(self):
         with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
@@ -288,15 +343,16 @@ class TaskCliTests(unittest.TestCase):
         added = self.cli('add', '--id', 't1', '--title', '題', '--kind', 'monitor', '--done-when', 'CI が緑になる')
         self.assertEqual(added.returncode, 0, added.stderr)
         self.assertEqual((json.loads(added.stdout)['kind'], json.loads(added.stdout)['done_when']), ('monitor', 'CI が緑になる'))
-        updated = json.loads(self.cli('update', '--id', 't1', '--kind', 'implement').stdout)
-        self.assertEqual((updated['kind'], updated['done_when']), ('implement', 'CI が緑になる'))
+        self.assertEqual(self.cli('update', '--id', 't1', '--kind', 'implement').returncode, 1)
+        updated = json.loads(self.cli('update', '--id', 't1', '--kind', 'implement', '--done-when', PR_URL + ' が merge される').stdout)
+        self.assertEqual((updated['kind'], updated['done_when']), ('implement', PR_URL + ' が merge される'))
         refused = self.cli('update', '--id', 't1', '--kind', 'bogus')
         self.assertEqual(refused.returncode, 1)
         self.assertIn('error', json.loads(refused.stderr))
         self.assertEqual(self.cli('update', '--id', 't1', '--done-when', '').returncode, 1)
         listed = self.cli('list').stdout
         self.assertIn('種類: implement', listed)
-        self.assertIn('完了の条件: CI が緑になる', listed)
+        self.assertIn('完了の条件: ' + PR_URL + ' が merge される', listed)
         self.assertEqual(json.loads(self.cli('list', '--json').stdout)['lanes'][0]['tasks'][0]['kind'], 'implement')
 
     def test_task_サブコマンドを通す(self):

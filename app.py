@@ -294,6 +294,19 @@ def validate_task(payload):
     return item
 
 
+# 依頼の種類ごとの必須。implement は完了の条件に PR か issue の URL (ADR-321 Q19)、decision は判断の ID。
+# 番号だけの「PR 305」は repo が分からず、誰も辿れないので断る
+PR_URL = re.compile(r'https://github\.com/[\w.-]+/[\w.-]+/(?:pull|issues)/[0-9]+(?![A-Za-z0-9_])')
+
+
+def check_task_rules(kind, done_when, decision_id):
+    # kind が空の legacy 行は対象外。add は kind を必須にしているので、ここへは来ない
+    if kind == 'implement' and not PR_URL.search(done_when or ''):
+        raise AppError(400, 'kind が implement のときは done_when に PR か issue の URL (https://github.com/<org>/<repo>/pull/<番号>) を書いてください')
+    if kind == 'decision' and not decision_id:
+        raise AppError(400, 'kind が decision のときは decision_id が必要です。先に判断を登録して --decision で指定してください')
+
+
 def parse_json(raw):
     def pairs(entries):
         result = {}
@@ -637,6 +650,8 @@ class Store:
                 if any(row[key] != item[key] for key in TASK_IDENTITY):
                     raise AppError(409, '同じ id に異なる task が登録されています')
                 return dict(row)
+            # 再送は既存を返す約束なので、規則の検査は新規に作る場合だけ行う (この規則より前の行への再送を断らない)
+            check_task_rules(item['kind'], item['done_when'], item['decision_id'])
             now = utc_now()
             # 新しい task は todo で始まり、以後の lane は reconciler が写す
             names = ','.join(('id', *TASK_FIELDS, 'lane', 'created_at', 'updated_at'))
@@ -658,9 +673,14 @@ class Store:
         item = validate_task(payload)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            if not connection.execute('SELECT 1 FROM tasks WHERE id=?', (identifier,)).fetchone():
+            row = connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone()
+            if not row:
                 raise AppError(404, 'task が見つかりません')
             self.check_decision(connection, item)
+            # 規則に関わる項目を書き換えるときだけ、書き換え後の行で検査する。result などの更新は止めない
+            if {'kind', 'done_when', 'decision_id'} & item.keys():
+                after = {**dict(row), **item}
+                check_task_rules(after['kind'], after['done_when'], after['decision_id'])
             columns = ''.join(f'{key}=?,' for key in item)
             connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?', (*item.values(), utc_now(), identifier))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
