@@ -43,6 +43,16 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'pane': 'p'}), first)
         self.assertEqual(self.status(self.store.add_task, {**TASK_DEFAULTS, 'id': 't1', 'title': '別'}), 409)
 
+    def test_kind_と_done_when_は再送判定に入れず既存の値を返す(self):
+        first = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
+        again = self.store.add_task({'id': 't1', 'title': '題', 'kind': 'implement', 'done_when': '別の条件'})
+        self.assertEqual(again, first)
+        self.assertEqual((again['kind'], again['done_when']), (TASK_DEFAULTS['kind'], TASK_DEFAULTS['done_when']))
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("INSERT INTO tasks(id, title, lane, created_at, updated_at) VALUES ('old', '旧行', 'todo', 'c', 'u')")
+        legacy = self.store.add_task({'id': 'old', 'title': '旧行', 'kind': 'research', 'done_when': 'x'})
+        self.assertEqual((legacy['kind'], legacy['done_when']), ('', ''))
+
     def test_進んだ_task_への_add_の再送は既存を返す(self):
         self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         self.store.reconcile_lane('t1', 'worker')
