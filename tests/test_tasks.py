@@ -188,10 +188,19 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.store.tasks()[0]['decision'], {'title': '方針の判断', 'answered': True, 'withdrawn': False})
 
     def test_入力の検査(self):
-        self.assertEqual(self.status(self.store.add_task, {'id': 'a b', 'title': 'x'}), 400)
-        self.assertEqual(self.status(self.store.add_task, {'id': 'a', 'title': ' '}), 400)
-        self.assertEqual(self.status(self.store.add_task, {'id': 'a', 'title': 'x', 'extra': 1}), 400)
-        self.assertEqual(self.status(self.store.add_task, {'id': 'a', 'title': 'x' * 201}), 400)
+        # kind と done_when は有効な値を足し、各入力が自分の理由で断られることを確かめる
+        cases = [
+            ({'id': 'a b', 'title': 'x'}, 'id'),
+            ({'id': 'a', 'title': ' '}, 'title'),
+            ({'id': 'a', 'title': 'x', 'extra': 1}, 'extra'),
+            ({'id': 'a', 'title': 'x' * 201}, 'title'),
+        ]
+        for payload, reason in cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(AppError) as caught:
+                    self.store.add_task({**TASK_DEFAULTS, **payload})
+                self.assertEqual(caught.exception.status, 400)
+                self.assertIn(reason, str(caught.exception))
 
     def test_user_version_と判断は_task_を足しても変わらない(self):
         decision = self.store.add(request_payload())
