@@ -23,11 +23,14 @@ def isolated_env(temp):
     return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks'), 'DECISION_INBOX_CLAIMS_DIR': str(Path(temp) / 'claims')}
 
 
+TASK_DEFAULTS = {'kind': 'research', 'done_when': 'result が書かれる'}
+
+
 def seed_task(store, payload):
     """lane は reconcile_lane だけが書くので、lane 付きの task は登録のあとで写して作る"""
     payload = dict(payload)
     lane = payload.pop('lane', None)
-    task = store.add_task(payload)
+    task = store.add_task({**TASK_DEFAULTS, **payload})
     return store.reconcile_lane(task['id'], lane) if lane else task
 
 

@@ -12,10 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import AppError, Store
 from unittest.mock import patch
 from cue_tui import Desk, draw, focus_pane, handle_key, tmux_clients
-from test_app import request_payload, seed_task
+from test_app import TASK_DEFAULTS, request_payload, seed_task
 from test_tui import Screen
 
 ROOT = Path(__file__).resolve().parents[1]
+ADD_KIND = ('--kind', 'research', '--done-when', TASK_DEFAULTS['done_when'])
 
 
 class TaskTests(unittest.TestCase):
@@ -31,25 +32,25 @@ class TaskTests(unittest.TestCase):
         return caught.exception.status
 
     def test_追加した_task_は既定で_todo_になり作成と更新が同時刻になる(self):
-        task = self.store.add_task({'id': 't1', 'title': '題'})
+        task = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         self.assertEqual(self.store.tasks(), [{**task, 'decision': None}])
         self.assertEqual(task['lane'], 'todo')
         self.assertEqual(task['created_at'], task['updated_at'])
         self.assertIsNone(task['decision_id'])
 
     def test_同じ内容の追加は既存を返し内容違いは409(self):
-        first = self.store.add_task({'id': 't1', 'title': '題', 'pane': 'p'})
-        self.assertEqual(self.store.add_task({'id': 't1', 'title': '題', 'pane': 'p'}), first)
-        self.assertEqual(self.status(self.store.add_task, {'id': 't1', 'title': '別'}), 409)
+        first = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'pane': 'p'})
+        self.assertEqual(self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'pane': 'p'}), first)
+        self.assertEqual(self.status(self.store.add_task, {**TASK_DEFAULTS, 'id': 't1', 'title': '別'}), 409)
 
     def test_進んだ_task_への_add_の再送は既存を返す(self):
-        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         self.store.reconcile_lane('t1', 'worker')
         moved = self.store.update_task('t1', {'remaining': '残り'})
-        self.assertEqual(self.store.add_task({'id': 't1', 'title': '題'}), moved)
+        self.assertEqual(self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'}), moved)
 
     def test_更新は指定項目だけ変え更新時刻が進む(self):
-        first = self.store.add_task({'id': 't1', 'title': '題', 'result': 'r'})
+        first = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'result': 'r'})
         updated = self.store.update_task('t1', {'remaining': '残り'})
         self.assertEqual((updated['title'], updated['result'], updated['remaining']), ('題', 'r', '残り'))
         self.assertGreater(updated['updated_at'], first['updated_at'])
@@ -59,14 +60,14 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.update_task, 'none', {'title': 'x'}), 404)
 
     def test_add_と_update_は_lane_と_machine_を_payload_で受けず断る(self):
-        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         for payload in ({'lane': 'done'}, {'lane': 'x'}, {'lane': 'todo'}, {'machine': '印'}, {'lane': 'done', 'remaining': '残り'}):
             with self.assertRaises(AppError) as caught:
                 self.store.update_task('t1', payload)
             self.assertEqual(caught.exception.status, 400, payload)
             self.assertNotIn('reconcile-lane', str(caught.exception))
             with self.assertRaises(AppError) as caught:
-                self.store.add_task({'id': 't2', 'title': 'a', **payload})
+                self.store.add_task({**TASK_DEFAULTS, 'id': 't2', 'title': 'a', **payload})
             self.assertEqual(caught.exception.status, 400, payload)
             self.assertNotIn('reconcile-lane', str(caught.exception))
         tasks = self.store.tasks()
@@ -74,7 +75,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual((tasks[0]['lane'], tasks[0]['machine'], tasks[0]['remaining']), ('todo', '', ''))
 
     def test_reconcile_lane_は_lane_と機械の欄を同時に書き_remaining_を変えない(self):
-        self.store.add_task({'id': 't1', 'title': '題', 'remaining': '窓口の文章'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'remaining': '窓口の文章'})
         written = self.store.reconcile_lane('t1', 'human_action', '停止の疑い (機械判定 2026-11-19)')
         self.assertEqual((written['lane'], written['machine'], written['remaining']), ('human_action', '停止の疑い (機械判定 2026-11-19)', '窓口の文章'))
         self.assertEqual(len(self.store.tasks('human_action')), 1)
@@ -90,6 +91,52 @@ class TaskTests(unittest.TestCase):
             connection.execute("INSERT INTO tasks(id, title, lane, created_at, updated_at) VALUES ('old', '旧行', 'worker', 'c', 'u')")
         task = Store(self.db).tasks()[0]
         self.assertEqual((task['id'], task['lane'], task['machine']), ('old', 'worker', ''))
+
+    def test_kind_か_done_when_が無い_空_不正値の_add_は断り_task_は増えない(self):
+        base = {'id': 't1', 'title': '題', 'kind': 'research', 'done_when': '終わる'}
+        missing = [{key: value for key, value in base.items() if key != gone} for gone in ('kind', 'done_when')]
+        wrong = [{**base, key: value} for key, values in (('kind', ('', ' ', 'bogus', 'Research', 5, ['research'], None)), ('done_when', ('', ' ', '\n', 'あ' * 1001, 5, ['x'], None))) for value in values]
+        for payload in missing + wrong:
+            self.assertEqual(self.status(self.store.add_task, payload), 400, payload)
+        self.assertEqual(self.store.tasks(), [])
+        self.assertEqual(self.store.add_task({**base, 'done_when': 'あ' * 1000})['done_when'], 'あ' * 1000)
+
+    def test_4_つの_kind_を保存し読み出せる(self):
+        for kind in ('decision', 'monitor', 'research', 'implement'):
+            self.store.add_task({'id': kind, 'title': kind, 'kind': kind, 'done_when': kind + ' が済む'})
+        self.assertEqual({task['id']: (task['kind'], task['done_when']) for task in self.store.tasks()},
+                         {kind: (kind, kind + ' が済む') for kind in ('decision', 'monitor', 'research', 'implement')})
+
+    def test_update_で_kind_と_done_when_を変えられ空と不正値は断り値は変わらない(self):
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
+        changed = self.store.update_task('t1', {'kind': 'implement'})
+        self.assertEqual((changed['kind'], changed['done_when']), ('implement', TASK_DEFAULTS['done_when']))
+        changed = self.store.update_task('t1', {'done_when': 'PR が merge される'})
+        self.assertEqual((changed['kind'], changed['done_when']), ('implement', 'PR が merge される'))
+        for payload in ({'kind': ''}, {'kind': 'bogus'}, {'kind': 3}, {'kind': ['a']}, {'done_when': ''}, {'done_when': ' '}, {'done_when': 'あ' * 1001}, {'done_when': 3}, {'kind': 'monitor', 'done_when': ''}):
+            self.assertEqual(self.status(self.store.update_task, 't1', payload), 400, payload)
+        task = self.store.tasks()[0]
+        self.assertEqual((task['kind'], task['done_when']), ('implement', 'PR が merge される'))
+
+    def test_kind_と_done_when_の列が無い既存の_tasks_表へ列を足し旧行は空のまま読める(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('ALTER TABLE tasks DROP COLUMN kind')
+            connection.execute('ALTER TABLE tasks DROP COLUMN done_when')
+            connection.execute("INSERT INTO tasks(id, title, lane, created_at, updated_at) VALUES ('old', '旧行', 'worker', 'c', 'u')")
+        store = Store(self.db)
+        task = store.tasks()[0]
+        self.assertEqual((task['id'], task['lane'], task['kind'], task['done_when']), ('old', 'worker', '', ''))
+        self.assertEqual(store.update_task('old', {'remaining': '残り'})['remaining'], '残り')
+        self.assertEqual(self.status(store.add_task, {'id': 'new', 'title': '新'}), 400)
+        self.assertEqual(store.add_task({**TASK_DEFAULTS, 'id': 'new', 'title': '新'})['kind'], 'research')
+        with contextlib.closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 2)
+
+    def test_旧_release_の_INSERT_は_kind_と_done_when_を指定せず通り空になる(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("INSERT INTO tasks(id, title, request, pane, run, result, remaining, decision_id, lane, created_at, updated_at) VALUES ('old', '旧', '', '', '', '', '', NULL, 'todo', 'c', 'u')")
+        task = self.store.tasks()[0]
+        self.assertEqual((task['kind'], task['done_when']), ('', ''))
 
     def test_回答しても_task_の_lane_と_remaining_は変わらない(self):
         decision = self.store.add(request_payload())
@@ -109,14 +156,14 @@ class TaskTests(unittest.TestCase):
         self.assertEqual([task['id'] for task in self.store.tasks()], ['c', 'a', 'd', 'b'])
 
     def test_削除と無い_id_の404(self):
-        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         self.assertEqual(self.store.delete_task('t1'), {'deleted': 't1'})
         self.assertEqual(self.store.tasks(), [])
         self.assertEqual(self.status(self.store.delete_task, 't1'), 404)
 
     def test_decision_id_の保存と検査(self):
         decision = self.store.add(request_payload())
-        task = self.store.add_task({'id': 't1', 'title': '題', 'decision_id': decision['id']})
+        task = self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'decision_id': decision['id']})
         self.assertEqual(task['decision_id'], decision['id'])
         self.assertEqual(self.status(self.store.update_task, 't1', {'decision_id': 'a' * 32}), 404)
         self.assertEqual(self.status(self.store.update_task, 't1', {'decision_id': 'zz'}), 400)
@@ -124,8 +171,8 @@ class TaskTests(unittest.TestCase):
 
     def test_一覧は判断の題名と回答の有無を添える(self):
         decision = self.store.add(request_payload(title='方針の判断'))
-        self.store.add_task({'id': 't1', 'title': '題', 'decision_id': decision['id']})
-        self.store.add_task({'id': 't2', 'title': '判断なし'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'decision_id': decision['id']})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't2', 'title': '判断なし'})
         self.assertEqual([task['decision'] for task in self.store.tasks()], [{'title': '方針の判断', 'answered': False, 'withdrawn': False}, None])
         self.store.answer(decision['id'], {'choice': 'minimal'})
         self.assertEqual(self.store.tasks()[0]['decision'], {'title': '方針の判断', 'answered': True, 'withdrawn': False})
@@ -139,7 +186,7 @@ class TaskTests(unittest.TestCase):
     def test_user_version_と判断は_task_を足しても変わらない(self):
         decision = self.store.add(request_payload())
         self.store.answer(decision['id'], {'choice': 'minimal'})
-        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         reopened = Store(self.db)
         self.assertEqual(reopened.get(decision['id'])['answer']['choice'], 'minimal')
         with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
@@ -156,7 +203,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(reopened.get(decision['id'])['id'], decision['id'])
 
     def test_backup_に_task_が入る(self):
-        self.store.add_task({'id': 't1', 'title': '題'})
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
         output = Path(self.temp.name) / 'backup.sqlite3'
         self.store.backup(output)
         with contextlib.closing(sqlite3.connect(output)) as connection, connection:
@@ -173,7 +220,7 @@ class TaskCliTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'task', *arguments], capture_output=True, text=True, timeout=10)
 
     def test_reconcile_lane_は_lane_を書き不正な_lane_と未登録の_id_を断る(self):
-        self.cli('add', '--id', 't1', '--title', '題')
+        self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
         written = self.cli('reconcile-lane', '--id', 't1', '--lane', 'worker')
         self.assertEqual(written.returncode, 0, written.stderr)
         self.assertEqual(json.loads(written.stdout)['lane'], 'worker')
@@ -183,7 +230,7 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(Store(self.db).tasks()[0]['lane'], 'worker')
 
     def test_move_と_add_の_lane_を断り_lane_は変わらない(self):
-        self.cli('add', '--id', 't1', '--title', '題')
+        self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
         for arguments in (('move', '--id', 't1', '--lane', 'done'), ('add', '--id', 't2', '--title', 'a', '--lane', 'worker')):
             refused = self.cli(*arguments)
             self.assertNotEqual(refused.returncode, 0, arguments)
@@ -197,7 +244,7 @@ class TaskCliTests(unittest.TestCase):
             self.assertNotIn('--lane', self.cli(name, '--help').stdout)
 
     def test_reconcile_lane_は機械の欄を書き_update_の_remaining_と共存する(self):
-        self.cli('add', '--id', 't1', '--title', '題')
+        self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
         self.cli('update', '--id', 't1', '--remaining', '残り')
         written = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--machine', 'Cue 回答済み')
         self.assertEqual(written.returncode, 0, written.stderr)
@@ -208,8 +255,33 @@ class TaskCliTests(unittest.TestCase):
         # --lane を付けない move も argparse でなく Store の断りに届く
         self.assertIn('lane は reconciler が書く', self.cli('move', '--id', 't1').stderr)
 
+    def test_kind_と_done_when_が欠けた_add_は_JSON_の_error_で断る(self):
+        for arguments in (('--id', 't1', '--title', '題'), ('--id', 't1', '--title', '題', '--kind', 'research'), ('--id', 't1', '--title', '題', '--done-when', '終わる'),
+                          ('--id', 't1', '--title', '題', '--kind', 'bogus', '--done-when', '終わる'), ('--id', 't1', '--title', '題', '--kind', 'research', '--done-when', ' ')):
+            refused = self.cli('add', *arguments)
+            self.assertEqual((refused.returncode, refused.stdout), (1, ''), arguments)
+            self.assertIn('error', json.loads(refused.stderr))
+        self.assertEqual(Store(self.db).tasks(), [])
+        self.assertIn('kind', self.cli('add', '--help').stdout)
+        self.assertIn('implement', self.cli('add', '--help').stdout)
+
+    def test_kind_と_done_when_を_add_と_update_で扱い_list_に出す(self):
+        added = self.cli('add', '--id', 't1', '--title', '題', '--kind', 'monitor', '--done-when', 'CI が緑になる')
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual((json.loads(added.stdout)['kind'], json.loads(added.stdout)['done_when']), ('monitor', 'CI が緑になる'))
+        updated = json.loads(self.cli('update', '--id', 't1', '--kind', 'implement').stdout)
+        self.assertEqual((updated['kind'], updated['done_when']), ('implement', 'CI が緑になる'))
+        refused = self.cli('update', '--id', 't1', '--kind', 'bogus')
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('error', json.loads(refused.stderr))
+        self.assertEqual(self.cli('update', '--id', 't1', '--done-when', '').returncode, 1)
+        listed = self.cli('list').stdout
+        self.assertIn('種類: implement', listed)
+        self.assertIn('完了の条件: CI が緑になる', listed)
+        self.assertEqual(json.loads(self.cli('list', '--json').stdout)['lanes'][0]['tasks'][0]['kind'], 'implement')
+
     def test_task_サブコマンドを通す(self):
-        added = self.cli('add', '--id', 't1', '--title', '題', '--pane', 'p1')
+        added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題', '--pane', 'p1')
         self.assertEqual(added.returncode, 0, added.stderr)
         self.assertEqual(json.loads(added.stdout)['lane'], 'todo')
         self.assertEqual(json.loads(self.cli('reconcile-lane', '--id', 't1', '--lane', 'human_decision').stdout)['lane'], 'human_decision')

@@ -78,7 +78,7 @@ Herdr は起動と popup の管理を担い、TUI の task 画面からは担当
 判断とは別に、依頼 (task) が今どの段階かを lane で追えます。task の登録は CLI で行い、TUI と Web で確認します。lane は reconciler だけが書くので、`task move` と `task add --lane`、payload の lane は error になります。判断に回答しても task の lane は変わりません (TUI からは選んだ task の担当 pane へ移れます)。
 
 ```sh
-python3 app.py task add --id fix-login --title "ログイン修正" --pane 1-2   # 新しい task は todo で始まる
+python3 app.py task add --id fix-login --title "ログイン修正" --kind implement --done-when "PR が merge される" --pane 1-2   # 新しい task は todo で始まる。--kind と --done-when は必須
 python3 app.py task reconcile-lane --id fix-login --lane human_action --machine "停止の疑い (機械判定 2026-11-19)"   # reconciler だけが使う。lane と機械の欄を同時に書き、remaining は変えない
 python3 app.py task update --id fix-login --remaining "回答待ち" --decision DECISION_ID
 python3 app.py task list
@@ -86,6 +86,7 @@ python3 app.py task delete --id fix-login
 ```
 
 - 機械の欄 (`machine`): reconciler だけが書く。停止の疑い (機械判定の日付) や Cue 回答済みの印を入れる。`reconcile-lane` が lane と同時に書き、`--machine` を省くと空になる。`remaining` は窓口の文章だけを書く
+- 種類 (`kind`): `decision` (判断) / `monitor` (監視) / `research` (調査) / `implement` (実装) のどれか。`task add` では `--kind` と、完了の条件 (`--done-when`、1〜1000 字) のどちらかが無いと error。`task update` は指定した項目だけを検査して変える。欄が空の既存 task はそのまま読め、`update` も通る
 - lane: `todo` (未着手) / `human_decision` (人の判断待ち) / `worker` (worker 作業中) / `human_action` (人の操作待ち) / `done` (完了)
 
 TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。完了の lane は既定で畳まれ、「完了 (件数)」だけが出ます。`d` で開閉します (Web でも完了は件数付きで畳まれています。開閉の状態は保存しません)。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済み / 取り下げを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
