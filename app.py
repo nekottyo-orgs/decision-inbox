@@ -694,8 +694,9 @@ class Store:
 
         expect があるときは今の lane が一致する場合だけ書く (compare-and-set)。reconciler は古い snapshot で判定するので、
         その間に別の書き手が進めた lane (窓口の done など) を戻さないために使う。lane 違いは 409 で、task 無しの 404 と分ける"""
-        for name, value in (('lane', lane), ('--from', expect)):
-            if value is not None and value not in LANES:
+        # lane は必須なので None も 400 (省略可なのは --from だけ)
+        for name, value, optional in (('lane', lane, False), ('--from', expect, True)):
+            if value not in LANES and not (optional and value is None):
                 raise AppError(400, f'{name} は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
         machine = text(machine, 'machine', TASK_LIMITS['machine'], empty=True)
         with self.db() as connection:

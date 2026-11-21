@@ -108,6 +108,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.store.tasks()[0], before)
         self.assertEqual(self.status(self.store.reconcile_lane, 'nope', 'todo', '', 'worker'), 404)
         self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'todo', '', 'bogus'), 400)
+        self.assertEqual(self.status(self.store.reconcile_lane, 't1', None), 400)
         moved = self.store.reconcile_lane('t1', 'todo', '', 'done')
         self.assertEqual(moved['lane'], 'todo')
         # expect を省くと従来どおり lane を確かめずに書く
@@ -329,7 +330,9 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(Store(self.db).tasks()[0]['lane'], 'done')
         missing = self.cli('reconcile-lane', '--id', 'nope', '--lane', 'todo', '--from', 'done')
         self.assertEqual(missing.returncode, 1)
-        self.assertNotEqual(self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'bogus').returncode, 0)
+        invalid = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'bogus')
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn('--from', json.loads(invalid.stderr)['error'])
         matched = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'done')
         self.assertEqual(matched.returncode, 0, matched.stderr)
         self.assertEqual(json.loads(matched.stdout)['lane'], 'todo')
