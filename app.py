@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local decision inbox, using only the Python standard library."""
 import argparse
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -791,16 +791,32 @@ class Store:
             row = connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone()
             return {'imported': bool(cursor.rowcount), 'message': dict(row)}
 
-    def move_message(self, payload):
+    def _upsert_message(self, connection, payload, now, *, touch=True):
         tag, sender = self._message_fields(payload)
-        now = utc_now()
+        connection.execute('''INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(run_id,msg) DO UPDATE SET state=excluded.state, wait=excluded.wait, updated_at=excluded.updated_at, req=COALESCE(excluded.req, req)
+            WHERE ? OR state IS NOT excluded.state OR wait IS NOT excluded.wait OR req IS NOT COALESCE(excluded.req, req)''',
+                            (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now, touch))
+
+    def move_message(self, payload):
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            # ack が watch の取り込みより先に来た msg も落とさないため upsert にする。req は渡されたときだけ上書きする
-            connection.execute('''INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(run_id,msg) DO UPDATE SET state=excluded.state, wait=excluded.wait, updated_at=excluded.updated_at, req=COALESCE(excluded.req, req)''',
-                                (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now))
+            self._upsert_message(connection, payload, utc_now())
             return dict(connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone())
+
+    def sync_messages(self, run_id, inbox):
+        text(run_id, 'run_id', 200)
+        with self.db() as connection:
+            # 読み取りの前に lock を取り、先に走査した同期が後から新しい結果を上書きするのを防ぐ。
+            connection.execute('BEGIN IMMEDIATE')
+            messages = inbox_messages(inbox)
+            now = utc_now()
+            for msg, fields in messages.items():
+                self._upsert_message(connection, {'run_id': run_id, 'msg': msg, **fields}, now, touch=False)
+            active = connection.execute("SELECT id,msg FROM messages WHERE run_id=? AND state!='done'", (run_id,))
+            done_ids = [(now, row['id']) for row in active if row['msg'] not in messages]
+            connection.executemany("UPDATE messages SET state='done', wait=NULL, updated_at=? WHERE id=?", done_ids)
+            return {'targets': len(messages), 'done': len(done_ids)}
 
     def messages(self, run_id, state=None):
         text(run_id, 'run_id', 200)
@@ -1327,7 +1343,74 @@ MSG_NAME = re.compile(r'[01]-[0-9]+-([a-z]+)-([A-Za-z0-9:_.]+)-([A-Za-z0-9]+)\.m
 MSG_STATES = ('new', 'held', 'done')
 MSG_WAIT = re.compile(r'(decision|pr|msg)=\S+')
 MSG_REQ = re.compile(r'[A-Za-z0-9._:/-]+')
+INBOX_WAIT = re.compile(rb'(decision=[0-9a-f]{32}|pr=https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|msg=[A-Za-z0-9_.:/-]+)')
+INBOX_HEADER_LIMIT = 65536
 CLAIM_FILE = re.compile(r'([0-9a-f]{32})-[0-9a-f]{16}\.json')
+
+
+@contextmanager
+def open_message_file(directory, name):
+    try:
+        # 送り手が置いたリンクをたどらず、FIFO でも待ち続けない。
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError
+            yield handle
+    except OSError:
+        raise AppError(400, f'msg のファイルを読めません: {name}') from None
+
+
+def message_request(handle):
+    remaining = INBOX_HEADER_LIMIT
+    while remaining > 0:
+        line = handle.readline(remaining + 1)
+        remaining -= len(line)
+        if remaining < 0 or line in (b'', b'\n', b'\r\n'):
+            return None
+        if line.startswith(b'req: '):
+            req = line[5:].rstrip(b'\r\n').decode('ascii', errors='replace')
+            return req if len(req) <= 200 and not req.startswith('-') and MSG_REQ.fullmatch(req) else None
+    return None
+
+
+def inbox_messages(inbox):
+    def version(info):
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
+
+    messages = {}
+    try:
+        with ExitStack() as files:
+            boxes = {}
+            for name in ('new', 'hold'):
+                box = inbox / name
+                fd = os.open(box, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                files.callback(os.close, fd)
+                boxes[box] = fd, version(os.fstat(fd))
+            for box, (fd, _) in boxes.items():
+                for msg in sorted(os.listdir(fd)):
+                    if not msg.endswith('.msg'):
+                        continue
+                    if len(msg) > 200 or not MSG_NAME.fullmatch(msg):
+                        raise AppError(400, f'{box.name}/ に不正な msg 名があります')
+                    if msg in messages:
+                        raise AppError(409, f'new/ と hold/ に同じ msg があります: {msg}')
+                    with open_message_file(fd, msg) as handle:
+                        req = message_request(handle)
+                    fields = {'state': 'new' if box.name == 'new' else 'held', 'req': req}
+                    if box.name == 'hold':
+                        with open_message_file(fd, msg + '.wait') as handle:
+                            wait = handle.readline(502).rstrip(b'\n')
+                        if len(wait) > 500 or not INBOX_WAIT.fullmatch(wait):
+                            raise AppError(400, f'hold/ に不正な待ち先があります: {msg}')
+                        fields['wait'] = wait.decode('ascii')
+                    messages[msg] = fields
+            # new/ から hold/ へ移動するときは .wait が先に置かれる。走査中の移動や待ち先の置き換えは次の同期に任せる。
+            if any(version(box.lstat()) != before for box, (_, before) in boxes.items()):
+                raise AppError(409, '走査中に inbox が更新されました。次の同期で再試行してください')
+    except OSError:
+        raise AppError(400, 'inbox の new/ と hold/ を読み取れるディレクトリにしてください') from None
+    return messages
 
 
 def sweep_claims(store, directory, now):
@@ -1543,12 +1626,14 @@ def main(argv=None):
             sub.add_argument('--socket', required=True)
     msg = commands.add_parser('msg', help='窓口が受けた msg の状態を messages 表に記録する (本文はファイルが運ぶ)')
     msg_commands = msg.add_subparsers(dest='msg_command', required=True)
-    for name in ('import', 'move', 'list'):
-        sub = msg_commands.add_parser(name, help={'import': 'msg を取り込む。あれば何もしない (冪等)', 'move': 'msg の状態を更新する。無ければ入れる', 'list': 'run の msg を id 順に出す'}[name])
+    for name in ('import', 'move', 'list', 'sync'):
+        sub = msg_commands.add_parser(name, help={'import': 'msg を取り込む。あれば何もしない (冪等)', 'move': 'msg の状態を更新する。無ければ入れる', 'list': 'run の msg を id 順に出す', 'sync': 'inbox の new/ と hold/ から run の msg を同期する'}[name])
         sub.add_argument('--run-id', required=True)
         if name == 'list':
             # choices にせず Store の検査に任せる (error は JSON で exit 1)
             sub.add_argument('--state', help=' / '.join(MSG_STATES))
+        elif name == 'sync':
+            sub.add_argument('--inbox', required=True, type=Path, help='対象 run の inbox ディレクトリ')
         else:
             sub.add_argument('--msg', required=True)
             sub.add_argument('--state', required=True, help=' / '.join(MSG_STATES))
@@ -1597,6 +1682,8 @@ def main(argv=None):
         if args.command == 'msg':
             if args.msg_command == 'list':
                 result = store.messages(args.run_id, args.state)
+            elif args.msg_command == 'sync':
+                result = store.sync_messages(args.run_id, args.inbox)
             else:
                 payload = {'run_id': args.run_id, 'msg': args.msg, 'state': args.state, **{k: v for k, v in (('wait', args.wait), ('req', args.req)) if v is not None}}
                 result = (store.import_message if args.msg_command == 'import' else store.move_message)(payload)

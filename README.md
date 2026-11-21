@@ -96,10 +96,13 @@ TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担�
 窓口の受信 msg はファイルが運び役で、messages 表は窓口側が取り込む写しです (本文は持ちません)。HTTP API はありません。
 
 ```sh
+python3 app.py msg sync --run-id RUN --inbox PATH
 python3 app.py msg import --run-id RUN --msg NAME.msg --state new
 python3 app.py msg move --run-id RUN --msg NAME.msg --state held --wait decision=ID
 python3 app.py msg list --run-id RUN [--state new|held|done]
 ```
+
+`sync` は `new/` と `hold/` の内容を反映し、どちらにも無い既存の非 `done` 行を `done` にします。同期までに処理を終えた msg は、表に行が無ければ追加されません。
 
 ## run と pane の対応を記録する
 

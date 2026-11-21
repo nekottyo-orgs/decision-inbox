@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import AppError, Store
@@ -85,6 +86,80 @@ class MessageTests(unittest.TestCase):
                 bad = self.cli('msg', arguments[0], '--run-id', 'r1', *arguments[1:])
                 self.assertEqual(bad.returncode, 1, bad.stderr)
                 self.assertTrue(json.loads(bad.stderr)['error'])
+
+    def inbox(self):
+        inbox = Path(self.temp.name) / 'inbox'
+        inbox.mkdir()
+        for box in ('new', 'hold', 'cur'):
+            (inbox / box).mkdir()
+        return inbox
+
+    def test_sync_で_new_held_done_を反映し_別_run_と既存_done_は保つ(self):
+        inbox = self.inbox()
+        message = inbox / 'new' / NAME
+        message.write_text('req: task/1\n\n本文\n', encoding='utf-8')
+        (inbox / 'cur' / OTHER).write_text('本文', encoding='utf-8')
+        other_run = self.store.move_message(self.payload(run_id='r2'))
+        initial = self.cli('msg', 'sync', '--run-id', 'r1', '--inbox', str(inbox))
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        self.assertEqual(json.loads(initial.stdout), {'targets': 1, 'done': 0})
+        first, = self.store.messages('r1')['messages']
+        self.assertEqual((first['state'], first['req']), ('new', 'task/1'))
+        self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 1, 'done': 0})
+        self.assertEqual(self.store.messages('r1')['messages'], [first])
+
+        held = inbox / 'hold' / NAME
+        wait = inbox / 'hold' / (NAME + '.wait')
+        wait.write_text('msg=task/2\n', encoding='ascii')
+        message.rename(held)
+        self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 1, 'done': 0})
+        row, = self.store.messages('r1')['messages']
+        self.assertEqual((row['id'], row['state'], row['wait'], row['received_at']), (first['id'], 'held', 'msg=task/2', first['received_at']))
+        wait.write_text('msg=task/3\n', encoding='ascii')
+        self.store.sync_messages('r1', inbox)
+        self.assertEqual(self.store.messages('r1')['messages'][0]['wait'], 'msg=task/3')
+
+        held.rename(inbox / 'cur' / NAME)
+        self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 0, 'done': 1})
+        done, = self.store.messages('r1')['messages']
+        self.assertEqual((done['id'], done['state'], done['wait'], done['req']), (first['id'], 'done', None, 'task/1'))
+        self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 0, 'done': 0})
+        self.assertEqual(self.store.messages('r1')['messages'], [done])
+        self.assertEqual(self.store.messages('r2')['messages'], [other_run])
+
+    def test_sync_は不正な待ち先や置き場の欠損で行を更新しない(self):
+        inbox = self.inbox()
+        existing = self.store.move_message(self.payload())
+        (inbox / 'new' / OTHER).write_text('\nreq: 本文\n', encoding='utf-8')
+        held = inbox / 'hold' / NAME
+        held.touch()
+        wait = inbox / 'hold' / (NAME + '.wait')
+        wait.write_text('decision=short\n', encoding='ascii')
+        bad = self.cli('msg', 'sync', '--run-id', 'r1', '--inbox', str(inbox))
+        self.assertEqual(bad.returncode, 1, bad.stderr)
+        self.assertIn(NAME, json.loads(bad.stderr)['error'])
+        held.unlink()
+        wait.unlink()
+        (inbox / 'hold').rmdir()
+        self.assertEqual(self.status(self.store.sync_messages, 'r1', inbox), 400)
+        self.assertEqual(self.store.messages('r1')['messages'], [existing])
+        (inbox / 'hold').mkdir()
+        self.store.sync_messages('r1', inbox)
+        done, new = self.store.messages('r1')['messages']
+        self.assertEqual((done['state'], new['state'], new['req']), ('done', 'new', None))
+
+    def test_sync_は走査中の移動を検出して終端化しない(self):
+        inbox = self.inbox()
+        existing = self.store.move_message(self.payload())
+        message = inbox / 'new' / NAME
+        message.touch()
+
+        def move_during_scan(_handle):
+            message.rename(inbox / 'cur' / NAME)
+
+        with patch('app.message_request', side_effect=move_during_scan):
+            self.assertEqual(self.status(self.store.sync_messages, 'r1', inbox), 409)
+        self.assertEqual(self.store.messages('r1')['messages'], [existing])
 
     def test_旧_release_の_app_py_が_messages_表のある_DB_でも動く(self):
         # skip にすると互換の守りが無いことに気づけないので、取り出せなければ失敗にする

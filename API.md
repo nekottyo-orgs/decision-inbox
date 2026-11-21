@@ -105,6 +105,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 run open --run-id RUN --role work
 python3 app.py --db /tmp/decision-test.sqlite3 run close --run-id RUN --role worker
 python3 app.py --db /tmp/decision-test.sqlite3 run show (--run-id RUN | --pane P --socket SOCKET) [--all]
 python3 app.py --db /tmp/decision-test.sqlite3 msg import|move --run-id RUN --msg NAME --state new|held|done [--wait decision=ID|pr=URL|msg=NAME] [--req KEY]
+python3 app.py --db /tmp/decision-test.sqlite3 msg sync --run-id RUN --inbox PATH
 python3 app.py --db /tmp/decision-test.sqlite3 msg list --run-id RUN [--state new|held|done]
 python3 app.py --db /tmp/decision-test.sqlite3 task add --id ID --title 題名 --kind decision|monitor|research|implement --done-when 完了の条件 [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--decision DECISION_ID]
 python3 app.py --db /tmp/decision-test.sqlite3 task reconcile-lane --id ID --lane worker [--machine M] [--from LANE]   # reconciler だけが使う。lane と機械の欄を同時に書く。--from は今の lane が一致するときだけ書く
@@ -118,6 +119,8 @@ python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 `run` は agent の実行と pane の対応を runs 表に記録する CLI 専用の機能で、HTTP API は無い。行は `{"id","run_id","role","pane","socket","opened_at","closed_at"}` で、開いた行は `closed_at` が null。`open` は 4 項目すべて必須 (1 から 200 文字) で、同じ `run_id` と `role` の開いた行があれば断る (閉じれば開き直せる)。`close` は `run_id` と `role` の開いた行に `closed_at` を入れ、無ければ断る。断ったときと、引数は解析できたが値が不正なとき (`show` で引く条件が無い、文字数超過など) は exit 1 で stderr に `{"error":"説明"}` を出す (HTTP の status は出ない)。必須のオプションが無い・知らないオプションがあるといった構文の誤りは、JSON の処理より前に argparse が exit 2 で stderr に usage を出す。`show` は `--run-id` か `--pane` と `--socket` の組のどちらか一方で引き、`{"runs":[...]}` を返す。既定は開いた行だけで、`--all` で閉じた行も出す。runs 表は tasks 表と同じく足すだけで既存の表を変えず、`PRAGMA user_version` は 2 のまま。
 
 `msg` は窓口が受けた msg の状態を messages 表に記録する CLI 専用の機能で、HTTP API は無い。msg の本文はファイルが運び役で、この表は窓口側がファイル名をキーに取り込む写し (本文は持たない)。行は `{"id","run_id","msg","tag","from_pane","req","state","wait","received_at","updated_at"}` で、`(run_id, msg)` が一意。`msg` は `<prio>-<micros>-<tag>-<from>-<rand>.msg` の形 (200 字以内) で、`tag` と `from_pane` は名前から入れる。`state` は `new` / `held` / `done`、`wait` は `held` のときだけ必須で、`held` 以外で渡すと断る (`decision=` / `pr=` / `msg=` で始まる 500 字以内)、`req` は任意 (200 字以内、request_key の文字種)。`import` は行が無いときだけ入れ (`{"imported":bool,"message":行}`)、`move` は無ければ入れ、あれば `state` / `wait` / `updated_at` を更新する (`held` から動かすと既存の `wait` は消え、`req` は渡したときだけ更新)。`list` は `{"messages":[...]}` を id 順に返す。値が不正なときは exit 1 で stderr に `{"error":"説明"}`。messages 表も足すだけで `PRAGMA user_version` は 2 のまま。
+
+`msg sync` の `--inbox` には対象 run の inbox を指定する。必須の `new/` と `hold/` を走査し、`new/*.msg` を `new`、`hold/*.msg` を同名の `.wait` の待ち先付きで `held` として、同じ run の表に追加・更新する。待ち先は `decision=32 桁の小文字 hex`、`pr=GitHub の PR URL`、`msg=英数字と _ . : / - の組み合わせ` のいずれか。先頭 64 KiB のヘッダ内に形式に合う `req:` があれば記録する。どちらの置き場にもない既存の非 `done` 行を `done` にし、`wait` を消す。`cur/` は走査しないため、巡回の間に処理された msg は表に行が無ければ追加されない。行の内容に変化が無ければ時刻も変えない。`received_at` は初回登録時刻。成功時に `{"targets":N,"done":N}` (走査対象件数、この回に `done` にした件数) を返す。ディレクトリの欠損、走査中の置き場の変更、不正な名前や待ち先、読み書きの失敗は exit 1 で stderr に JSON の error を出し、行の更新をまとめて取り消す。
 
 `add --help` で必須・任意の項目と型の一覧・最小 JSON 例、`list --help` と `task list --help` で出力の形 (`list` は `{"decisions":[...],"demo":false}` の object、`task list --json` は `{"lanes":[...]}`) を確認できる。
 
