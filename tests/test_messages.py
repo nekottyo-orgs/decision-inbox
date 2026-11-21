@@ -48,6 +48,8 @@ class MessageTests(unittest.TestCase):
         done = self.store.move_message(self.payload(state='done'))
         self.assertEqual((done['state'], done['wait'], done['req']), ('done', None, 'k/1'))
         self.assertEqual(done['id'], held['id'])
+        renamed = self.store.move_message(self.payload(state='done', req='k/2'))
+        self.assertEqual(renamed['req'], 'k/2')
 
     def test_tag_と_from_pane_は名前から入る(self):
         row = self.store.import_message(self.payload())['message']
@@ -77,16 +79,17 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(json.loads(moved.stdout)['wait'], 'pr=u')
         listed = self.cli('msg', 'list', '--run-id', 'r1', '--state', 'held')
         self.assertEqual([m['msg'] for m in json.loads(listed.stdout)['messages']], [NAME])
-        bad = self.cli('msg', 'move', '--run-id', 'r1', '--msg', NAME, '--state', 'held')
-        self.assertEqual(bad.returncode, 1)
+        # 呼ぶ側 (run-inbox.sh) は stderr の先頭行を警告に出すので、error の JSON も契約に含める
+        for arguments in (('move', '--msg', NAME, '--state', 'held'), ('move', '--msg', NAME, '--state', 'gone'), ('list', '--state', 'gone')):
+            with self.subTest(arguments=arguments):
+                bad = self.cli('msg', arguments[0], '--run-id', 'r1', *arguments[1:])
+                self.assertEqual(bad.returncode, 1, bad.stderr)
+                self.assertTrue(json.loads(bad.stderr)['error'])
 
     def test_旧_release_の_app_py_が_messages_表のある_DB_でも動く(self):
-        try:
-            shown = subprocess.run(['git', 'show', f'{OLD_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
-        except FileNotFoundError:
-            self.skipTest('git が無い')
-        if shown.returncode != 0:
-            self.skipTest('旧 release の app.py を git から取り出せない')
+        # skip にすると互換の守りが無いことに気づけないので、取り出せなければ失敗にする
+        shown = subprocess.run(['git', 'show', f'{OLD_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
+        self.assertEqual(shown.returncode, 0, '旧 release の app.py を git から取り出せない')
         old = Path(self.temp.name) / 'old_app.py'
         old.write_bytes(shown.stdout)
         self.store.import_message(self.payload())

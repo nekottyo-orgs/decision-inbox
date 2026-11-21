@@ -1547,10 +1547,11 @@ def main(argv=None):
         sub = msg_commands.add_parser(name, help={'import': 'msg を取り込む。あれば何もしない (冪等)', 'move': 'msg の状態を更新する。無ければ入れる', 'list': 'run の msg を id 順に出す'}[name])
         sub.add_argument('--run-id', required=True)
         if name == 'list':
-            sub.add_argument('--state', choices=('new', 'held', 'done'))
+            # choices にせず Store の検査に任せる (error は JSON で exit 1)
+            sub.add_argument('--state', help=' / '.join(MSG_STATES))
         else:
             sub.add_argument('--msg', required=True)
-            sub.add_argument('--state', required=True, choices=('new', 'held', 'done'))
+            sub.add_argument('--state', required=True, help=' / '.join(MSG_STATES))
             sub.add_argument('--wait', help='state が held のときだけ。decision=ID / pr=URL / msg=名前')
             sub.add_argument('--req', help='msg の req: ヘッダの依頼 id (task id)')
     for sub in (complete, report, renew):
