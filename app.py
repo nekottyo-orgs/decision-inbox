@@ -1552,7 +1552,7 @@ def main(argv=None):
             sub.add_argument('--msg', required=True)
             sub.add_argument('--state', required=True, choices=('new', 'held', 'done'))
             sub.add_argument('--wait', help='state が held のときだけ。decision=ID / pr=URL / msg=名前')
-            sub.add_argument('--req', help='依頼の request_key')
+            sub.add_argument('--req', help='msg の req: ヘッダの依頼 id (task id)')
     for sub in (complete, report, renew):
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument('--token')
