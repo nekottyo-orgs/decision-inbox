@@ -102,7 +102,7 @@ python3 app.py msg move --run-id RUN --msg NAME.msg --state held --wait decision
 python3 app.py msg list --run-id RUN [--state new|held|done]
 ```
 
-`sync` は `new/` と `hold/` の内容を反映し、どちらにも無い既存の非 `done` 行を `done` にします。同期までに処理を終えた msg は、表に行が無ければ追加されません。
+`sync` は `new/` と `hold/` の内容を反映し、どちらにも無い既存の非 `done` 行を `done` にします。`hold/` の既存の待ち先は 500 字を超えても同期できます。同期までに処理を終えた msg は、表に行が無ければ追加されません。
 
 ## run と pane の対応を記録する
 

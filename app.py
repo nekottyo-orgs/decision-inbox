@@ -791,17 +791,19 @@ class Store:
             row = connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone()
             return {'imported': bool(cursor.rowcount), 'message': dict(row)}
 
-    def _upsert_message(self, connection, payload, now, *, touch=True):
-        tag, sender = self._message_fields(payload)
+    def _upsert_message(self, connection, payload, tags, now, *, touch=True):
+        tag, sender = tags
         connection.execute('''INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(run_id,msg) DO UPDATE SET state=excluded.state, wait=excluded.wait, updated_at=excluded.updated_at, req=COALESCE(excluded.req, req)
             WHERE ? OR state IS NOT excluded.state OR wait IS NOT excluded.wait OR req IS NOT COALESCE(excluded.req, req)''',
                             (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now, touch))
 
     def move_message(self, payload):
+        tags = self._message_fields(payload)
+        now = utc_now()
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            self._upsert_message(connection, payload, utc_now())
+            self._upsert_message(connection, payload, tags, now)
             return dict(connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone())
 
     def sync_messages(self, run_id, inbox):
@@ -811,8 +813,8 @@ class Store:
             connection.execute('BEGIN IMMEDIATE')
             messages = inbox_messages(inbox)
             now = utc_now()
-            for msg, fields in messages.items():
-                self._upsert_message(connection, {'run_id': run_id, 'msg': msg, **fields}, now, touch=False)
+            for msg, (tags, fields) in messages.items():
+                self._upsert_message(connection, {'run_id': run_id, 'msg': msg, **fields}, tags, now, touch=False)
             active = connection.execute("SELECT id,msg FROM messages WHERE run_id=? AND state!='done'", (run_id,))
             done_ids = [(now, row['id']) for row in active if row['msg'] not in messages]
             connection.executemany("UPDATE messages SET state='done', wait=NULL, updated_at=? WHERE id=?", done_ids)
@@ -1378,6 +1380,8 @@ def inbox_messages(inbox):
     def version(info):
         return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
+    # hold は待ち先を CLI 引数で受け取る。個別の msg move より長い既存値も、OS の引数上限まで読む。
+    wait_limit = os.sysconf('SC_ARG_MAX')
     messages = {}
     try:
         with ExitStack() as files:
@@ -1391,7 +1395,8 @@ def inbox_messages(inbox):
                 for msg in sorted(os.listdir(fd)):
                     if not msg.endswith('.msg'):
                         continue
-                    if len(msg) > 200 or not MSG_NAME.fullmatch(msg):
+                    match = MSG_NAME.fullmatch(msg)
+                    if len(msg) > 200 or not match:
                         raise AppError(400, f'{box.name}/ に不正な msg 名があります')
                     if msg in messages:
                         raise AppError(409, f'new/ と hold/ に同じ msg があります: {msg}')
@@ -1400,12 +1405,12 @@ def inbox_messages(inbox):
                     fields = {'state': 'new' if box.name == 'new' else 'held', 'req': req}
                     if box.name == 'hold':
                         with open_message_file(fd, msg + '.wait') as handle:
-                            wait = handle.readline(502).rstrip(b'\n')
-                        if len(wait) > 500 or not INBOX_WAIT.fullmatch(wait):
+                            wait = handle.readline(wait_limit + 2).rstrip(b'\n')
+                        if len(wait) > wait_limit or not INBOX_WAIT.fullmatch(wait):
                             raise AppError(400, f'hold/ に不正な待ち先があります: {msg}')
                         fields['wait'] = wait.decode('ascii')
-                    messages[msg] = fields
-            # new/ から hold/ へ移動するときは .wait が先に置かれる。走査中の移動や待ち先の置き換えは次の同期に任せる。
+                    messages[msg] = (match.group(1, 2), fields)
+            # new/ から hold/ へ移動するときは .wait が先に置かれる。ここで検出した置き場の変更は次の同期に任せる。
             if any(version(box.lstat()) != before for box, (_, before) in boxes.items()):
                 raise AppError(409, '走査中に inbox が更新されました。次の同期で再試行してください')
     except OSError:

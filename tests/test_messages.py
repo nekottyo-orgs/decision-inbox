@@ -148,6 +148,22 @@ class MessageTests(unittest.TestCase):
         done, new = self.store.messages('r1')['messages']
         self.assertEqual((done['state'], new['state'], new['req']), ('done', 'new', None))
 
+    def test_sync_は個別の_msg_move_より長い既存の待ち先も反映する(self):
+        inbox = self.inbox()
+        wait = 'msg=' + 'x' * 1024
+        (inbox / 'hold' / NAME).touch()
+        (inbox / 'hold' / (NAME + '.wait')).write_text(wait + '\n', encoding='ascii')
+        (inbox / 'new' / OTHER).touch()
+
+        self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 2, 'done': 0})
+        rows = {row['msg']: row for row in self.store.messages('r1')['messages']}
+        self.assertEqual((rows[NAME]['state'], rows[NAME]['wait']), ('held', wait))
+        self.assertEqual(rows[OTHER]['state'], 'new')
+        for subcommand in ('import', 'move'):
+            result = self.cli('msg', subcommand, '--run-id', 'r1', '--msg', NAME, '--state', 'held', '--wait', wait)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('wait', json.loads(result.stderr)['error'])
+
     def test_sync_は走査中の移動を検出して終端化しない(self):
         inbox = self.inbox()
         existing = self.store.move_message(self.payload())
