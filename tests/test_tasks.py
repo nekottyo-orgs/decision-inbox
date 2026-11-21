@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import AppError, Store
+from app import AppError, LaneConflict, Store
 from unittest.mock import patch
 from cue_tui import Desk, draw, focus_pane, handle_key, tmux_clients
 from test_app import TASK_DEFAULTS, request_payload, seed_task
@@ -95,6 +95,24 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'bogus'), 400)
         self.assertEqual(self.status(self.store.reconcile_lane, 'nope', 'done'), 404)
         self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'done', 'あ' * 501), 400)
+
+    def test_reconcile_lane_の_expect_は今の_lane_が一致するときだけ書き競合と未登録を分ける(self):
+        self.store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題'})
+        self.store.reconcile_lane('t1', 'done', '窓口')
+        before = self.store.tasks()[0]
+        # 窓口が done にした後、古い snapshot (worker) で todo に戻そうとする書き込み
+        with self.assertRaises(LaneConflict) as caught:
+            self.store.reconcile_lane('t1', 'todo', '', 'worker')
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn('今は done', str(caught.exception))
+        self.assertEqual(self.store.tasks()[0], before)
+        self.assertEqual(self.status(self.store.reconcile_lane, 'nope', 'todo', '', 'worker'), 404)
+        self.assertEqual(self.status(self.store.reconcile_lane, 't1', 'todo', '', 'bogus'), 400)
+        self.assertEqual(self.status(self.store.reconcile_lane, 't1', None), 400)
+        moved = self.store.reconcile_lane('t1', 'todo', '', 'done')
+        self.assertEqual(moved['lane'], 'todo')
+        # expect を省くと従来どおり lane を確かめずに書く
+        self.assertEqual(self.store.reconcile_lane('t1', 'worker')['lane'], 'worker')
 
     def test_machine_の無い既存の_tasks_表へ列を足し中身を残す(self):
         with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
@@ -302,6 +320,23 @@ class TaskCliTests(unittest.TestCase):
         for arguments in (('--id', 't1', '--lane', 'bogus'), ('--id', 'nope', '--lane', 'done'), ('--id', 't1')):
             self.assertNotEqual(self.cli('reconcile-lane', *arguments).returncode, 0, arguments)
         self.assertEqual(Store(self.db).tasks()[0]['lane'], 'worker')
+
+    def test_reconcile_lane_の_from_は一致で書き競合は_exit_3_task_無しは_exit_1(self):
+        self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
+        self.assertEqual(self.cli('reconcile-lane', '--id', 't1', '--lane', 'done').returncode, 0)
+        conflict = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'worker')
+        self.assertEqual(conflict.returncode, 3, conflict.stderr)
+        self.assertIn('lane が違う', json.loads(conflict.stderr)['error'])
+        self.assertEqual(Store(self.db).tasks()[0]['lane'], 'done')
+        missing = self.cli('reconcile-lane', '--id', 'nope', '--lane', 'todo', '--from', 'done')
+        self.assertEqual(missing.returncode, 1)
+        invalid = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'bogus')
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn('--from', json.loads(invalid.stderr)['error'])
+        matched = self.cli('reconcile-lane', '--id', 't1', '--lane', 'todo', '--from', 'done')
+        self.assertEqual(matched.returncode, 0, matched.stderr)
+        self.assertEqual(json.loads(matched.stdout)['lane'], 'todo')
+        self.assertIn('--from', self.cli('reconcile-lane', '--help').stdout)
 
     def test_move_と_add_の_lane_を断り_lane_は変わらない(self):
         self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')

@@ -79,7 +79,7 @@ Herdr は起動と popup の管理を担い、TUI の task 画面からは担当
 
 ```sh
 python3 app.py task add --id fix-login --title "ログイン修正" --kind implement --done-when "https://github.com/example/repo/pull/1 が merge される" --pane 1-2   # 新しい task は todo で始まる。--kind と --done-when は必須。implement は --done-when に PR か issue の URL、decision は --decision が必須
-python3 app.py task reconcile-lane --id fix-login --lane human_action --machine "停止の疑い (機械判定 2026-11-19)"   # reconciler だけが使う。lane と機械の欄を同時に書き、remaining は変えない
+python3 app.py task reconcile-lane --id fix-login --lane human_action --machine "停止の疑い (機械判定 2026-11-19)" [--from worker]   # reconciler だけが使う。lane と機械の欄を同時に書き、remaining は変えない。--from は今の lane が一致するときだけ書く (違えば exit 3)
 python3 app.py task update --id fix-login --remaining "回答待ち" --decision DECISION_ID
 python3 app.py task list
 python3 app.py task delete --id fix-login
