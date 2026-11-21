@@ -180,7 +180,7 @@ class MessageTests(unittest.TestCase):
     def test_旧_release_の_app_py_が_messages_表のある_DB_でも動く(self):
         # skip にすると互換の守りが無いことに気づけないので、取り出せなければ失敗にする
         shown = subprocess.run(['git', 'show', f'{OLD_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
-        self.assertEqual(shown.returncode, 0, '旧 release の app.py を git から取り出せない')
+        self.assertEqual(shown.returncode, 0, f'互換試験には {OLD_RELEASE}:app.py を取得できる Git 履歴が必要です')
         old = Path(self.temp.name) / 'old_app.py'
         old.write_bytes(shown.stdout)
         self.store.import_message(self.payload())

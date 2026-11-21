@@ -222,6 +222,8 @@ decision-inbox backup --output /absolute/path/to/cue-backup.sqlite3
 
 ## 検証と再開
 
+旧 release との互換試験には、コミット `0e7cd80` を含む Git の作業ツリーが必要です。浅い clone ではそのコミットまで履歴を取得してください。`git archive` の展開先からは互換試験を実行できません。
+
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 npm --prefix frontend run build
