@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local decision inbox, using only the Python standard library."""
 import argparse
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -421,6 +421,10 @@ class Store:
                 id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, role TEXT NOT NULL, pane TEXT NOT NULL, socket TEXT NOT NULL,
                 opened_at TEXT NOT NULL, closed_at TEXT)''')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS runs_open ON runs(run_id, role) WHERE closed_at IS NULL')
+            # messages も同じく足すだけ。本文は持たない (本文はファイルが運ぶ外部入力で、これは窓口側が取り込む写し)
+            connection.execute('''CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, msg TEXT NOT NULL, tag TEXT NOT NULL, from_pane TEXT NOT NULL, req TEXT,
+                state TEXT NOT NULL, wait TEXT, received_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, msg))''')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -757,6 +761,72 @@ class Store:
         with self.db() as connection:
             rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
             return {'runs': [dict(row) for row in rows]}
+
+    def _message_fields(self, payload):
+        object_fields(payload, ('run_id', 'msg', 'state'), ('wait', 'req'))
+        text(payload['run_id'], 'run_id', 200)
+        text(payload['msg'], 'msg', 200)
+        found = MSG_NAME.fullmatch(payload['msg'])
+        if not found:
+            raise AppError(400, 'msg の形が不正です')
+        if payload['state'] not in MSG_STATES:
+            raise AppError(400, 'state は ' + ' / '.join(MSG_STATES) + ' のいずれかを指定してください')
+        wait = payload.get('wait')
+        if (payload['state'] == 'held') != (wait is not None):
+            raise AppError(400, 'wait は state が held のときだけ必要です')
+        if wait is not None and (len(text(wait, 'wait', 500)) > 500 or not MSG_WAIT.fullmatch(wait)):
+            raise AppError(400, 'wait は decision= / pr= / msg= の形で指定してください')
+        req = payload.get('req')
+        if req is not None and (len(text(req, 'req', 200)) > 200 or not MSG_REQ.fullmatch(req)):
+            raise AppError(400, 'req の形が不正です')
+        return found.group(1), found.group(2)
+
+    def import_message(self, payload):
+        tag, sender = self._message_fields(payload)
+        now = utc_now()
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            cursor = connection.execute('INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,msg) DO NOTHING',
+                                        (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now))
+            row = connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone()
+            return {'imported': bool(cursor.rowcount), 'message': dict(row)}
+
+    def _upsert_message(self, connection, payload, tags, now, *, touch=True):
+        tag, sender = tags
+        connection.execute('''INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(run_id,msg) DO UPDATE SET state=excluded.state, wait=excluded.wait, updated_at=excluded.updated_at, req=COALESCE(excluded.req, req)
+            WHERE ? OR state IS NOT excluded.state OR wait IS NOT excluded.wait OR req IS NOT COALESCE(excluded.req, req)''',
+                            (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now, touch))
+
+    def move_message(self, payload):
+        tags = self._message_fields(payload)
+        now = utc_now()
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self._upsert_message(connection, payload, tags, now)
+            return dict(connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone())
+
+    def sync_messages(self, run_id, inbox):
+        text(run_id, 'run_id', 200)
+        with self.db() as connection:
+            # 読み取りの前に lock を取り、先に走査した同期が後から新しい結果を上書きするのを防ぐ。
+            connection.execute('BEGIN IMMEDIATE')
+            messages = inbox_messages(inbox)
+            now = utc_now()
+            for msg, (tags, fields) in messages.items():
+                self._upsert_message(connection, {'run_id': run_id, 'msg': msg, **fields}, tags, now, touch=False)
+            active = connection.execute("SELECT id,msg FROM messages WHERE run_id=? AND state!='done'", (run_id,))
+            done_ids = [(now, row['id']) for row in active if row['msg'] not in messages]
+            connection.executemany("UPDATE messages SET state='done', wait=NULL, updated_at=? WHERE id=?", done_ids)
+            return {'targets': len(messages), 'done': len(done_ids)}
+
+    def messages(self, run_id, state=None):
+        text(run_id, 'run_id', 200)
+        if state is not None and state not in MSG_STATES:
+            raise AppError(400, 'state は ' + ' / '.join(MSG_STATES) + ' のいずれかを指定してください')
+        with self.db() as connection:
+            rows = connection.execute('SELECT * FROM messages WHERE run_id=?' + ('' if state is None else ' AND state=?') + ' ORDER BY id', (run_id,) if state is None else (run_id, state))
+            return {'messages': [dict(row) for row in rows]}
 
     def tasks(self, lane=None):
         if lane is not None and lane not in LANES:
@@ -1270,7 +1340,82 @@ def read_token_file(path, identifier):
     return data
 
 
+# run-inbox.sh の publish が作る "<prio>-<micros>-<tag>-<from>-<rand>.msg"
+MSG_NAME = re.compile(r'[01]-[0-9]+-([a-z]+)-([A-Za-z0-9:_.]+)-([A-Za-z0-9]+)\.msg')
+MSG_STATES = ('new', 'held', 'done')
+MSG_WAIT = re.compile(r'(decision|pr|msg)=\S+')
+MSG_REQ = re.compile(r'[A-Za-z0-9._:/-]+')
+INBOX_WAIT = re.compile(rb'(decision=[0-9a-f]{32}|pr=https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|msg=[A-Za-z0-9_.:/-]+)')
+INBOX_HEADER_LIMIT = 65536
 CLAIM_FILE = re.compile(r'([0-9a-f]{32})-[0-9a-f]{16}\.json')
+
+
+@contextmanager
+def open_message_file(directory, name):
+    try:
+        # 送り手が置いたリンクをたどらず、FIFO でも待ち続けない。
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError
+            yield handle
+    except OSError:
+        raise AppError(400, f'msg のファイルを読めません: {name}') from None
+
+
+def message_request(handle):
+    remaining = INBOX_HEADER_LIMIT
+    while remaining > 0:
+        line = handle.readline(remaining + 1)
+        remaining -= len(line)
+        if remaining < 0 or line in (b'', b'\n', b'\r\n'):
+            return None
+        if line.startswith(b'req: '):
+            req = line[5:].rstrip(b'\r\n').decode('ascii', errors='replace')
+            return req if len(req) <= 200 and MSG_REQ.fullmatch(req) else None
+    return None
+
+
+def inbox_messages(inbox):
+    def version(info):
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
+
+    # hold は待ち先を CLI 引数で受け取る。個別の msg move より長い既存値も、OS の引数上限まで読む。
+    wait_limit = os.sysconf('SC_ARG_MAX')
+    messages = {}
+    try:
+        with ExitStack() as files:
+            boxes = {}
+            for name in ('new', 'hold'):
+                box = inbox / name
+                fd = os.open(box, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                files.callback(os.close, fd)
+                boxes[box] = fd, version(os.fstat(fd))
+            for box, (fd, _) in boxes.items():
+                for msg in sorted(os.listdir(fd)):
+                    if not msg.endswith('.msg'):
+                        continue
+                    match = MSG_NAME.fullmatch(msg)
+                    if len(msg) > 200 or not match:
+                        raise AppError(400, f'{box.name}/ に不正な msg 名があります')
+                    if msg in messages:
+                        raise AppError(409, f'new/ と hold/ に同じ msg があります: {msg}')
+                    with open_message_file(fd, msg) as handle:
+                        req = message_request(handle)
+                    fields = {'state': 'new' if box.name == 'new' else 'held', 'req': req}
+                    if box.name == 'hold':
+                        with open_message_file(fd, msg + '.wait') as handle:
+                            wait = handle.readline(wait_limit + 2).rstrip(b'\n')
+                        if len(wait) > wait_limit or not INBOX_WAIT.fullmatch(wait):
+                            raise AppError(400, f'hold/ に不正な待ち先があります: {msg}')
+                        fields['wait'] = wait.decode('ascii')
+                    messages[msg] = (match.group(1, 2), fields)
+            # new/ から hold/ へ移動するときは .wait が先に置かれる。ここで検出した置き場の変更は次の同期に任せる。
+            if any(version(box.lstat()) != before for box, (_, before) in boxes.items()):
+                raise AppError(409, '走査中に inbox が更新されました。次の同期で再試行してください')
+    except OSError:
+        raise AppError(400, 'inbox の new/ と hold/ を読み取れるディレクトリにしてください') from None
+    return messages
 
 
 def sweep_claims(store, directory, now):
@@ -1484,6 +1629,21 @@ def main(argv=None):
         if name == 'open':
             sub.add_argument('--pane', required=True)
             sub.add_argument('--socket', required=True)
+    msg = commands.add_parser('msg', help='窓口が受けた msg の状態を messages 表に記録する (本文はファイルが運ぶ)')
+    msg_commands = msg.add_subparsers(dest='msg_command', required=True)
+    for name in ('import', 'move', 'list', 'sync'):
+        sub = msg_commands.add_parser(name, help={'import': 'msg を取り込む。あれば何もしない (冪等)', 'move': 'msg の状態を更新する。無ければ入れる', 'list': 'run の msg を id 順に出す', 'sync': 'inbox の new/ と hold/ から run の msg を同期する'}[name])
+        sub.add_argument('--run-id', required=True)
+        if name == 'list':
+            # choices にせず Store の検査に任せる (error は JSON で exit 1)
+            sub.add_argument('--state', help=' / '.join(MSG_STATES))
+        elif name == 'sync':
+            sub.add_argument('--inbox', required=True, type=Path, help='対象 run の inbox ディレクトリ')
+        else:
+            sub.add_argument('--msg', required=True)
+            sub.add_argument('--state', required=True, help=' / '.join(MSG_STATES))
+            sub.add_argument('--wait', help='state が held のときだけ。decision=ID / pr=URL / msg=名前')
+            sub.add_argument('--req', help='msg の req: ヘッダの依頼 id (task id)')
     for sub in (complete, report, renew):
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument('--token')
@@ -1522,6 +1682,16 @@ def main(argv=None):
                 result = store.close_run(args.run_id, args.role)
             else:
                 result = store.runs(args.run_id, args.pane, args.socket, args.all)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.command == 'msg':
+            if args.msg_command == 'list':
+                result = store.messages(args.run_id, args.state)
+            elif args.msg_command == 'sync':
+                result = store.sync_messages(args.run_id, args.inbox)
+            else:
+                payload = {'run_id': args.run_id, 'msg': args.msg, 'state': args.state, **{k: v for k, v in (('wait', args.wait), ('req', args.req)) if v is not None}}
+                result = (store.import_message if args.msg_command == 'import' else store.move_message)(payload)
             print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.command == 'task':

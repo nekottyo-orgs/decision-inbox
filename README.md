@@ -91,6 +91,19 @@ python3 app.py task delete --id fix-login
 
 TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。完了の lane は既定で畳まれ、「完了 (件数)」だけが出ます。`d` で開閉します (Web でも完了は件数付きで畳まれています。開閉の状態は保存しません)。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済み / 取り下げを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
 
+## msg の受信状態を記録する
+
+窓口の受信 msg はファイルが運び役で、messages 表は窓口側が取り込む写しです (本文は持ちません)。HTTP API はありません。
+
+```sh
+python3 app.py msg sync --run-id RUN --inbox PATH
+python3 app.py msg import --run-id RUN --msg NAME.msg --state new
+python3 app.py msg move --run-id RUN --msg NAME.msg --state held --wait decision=ID
+python3 app.py msg list --run-id RUN [--state new|held|done]
+```
+
+`sync` は `new/` と `hold/` の内容を反映し、どちらにも無い既存の非 `done` 行を `done` にします。`hold/` の既存の待ち先は 500 字を超えても同期できます。同期までに処理を終えた msg は、表に行が無ければ追加されません。
+
 ## run と pane の対応を記録する
 
 agent の実行 (run) がどの pane・socket で動いているかを CLI で記録します。HTTP API はありません。`PRAGMA user_version` は 2 のままで、旧 release に戻してもそのまま動きます (runs 表は無視されます)。
@@ -208,6 +221,8 @@ decision-inbox backup --output /absolute/path/to/cue-backup.sqlite3
 定期実行する場合は OS のスケジューラーに `backup` コマンドを登録し、保存先・実行時刻・ログ・保管期間を管理してください。このアプリ自体は定期実行の設定や過去のファイルの自動削除を行いません。初めて旧 DB を開く際の形式変更前バックアップも、DB と同じディレクトリの `<DB 名>.pre-v2-<ID>.sqlite3` として保持します。
 
 ## 検証と再開
+
+旧 release との互換試験には、コミット `0e7cd80` を含む Git の作業ツリーが必要です。浅い clone ではそのコミットまで履歴を取得してください。`git archive` の展開先からは互換試験を実行できません。
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
