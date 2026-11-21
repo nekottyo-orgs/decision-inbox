@@ -421,6 +421,10 @@ class Store:
                 id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, role TEXT NOT NULL, pane TEXT NOT NULL, socket TEXT NOT NULL,
                 opened_at TEXT NOT NULL, closed_at TEXT)''')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS runs_open ON runs(run_id, role) WHERE closed_at IS NULL')
+            # messages も同じく足すだけ。本文は持たない (本文はファイルが運ぶ外部入力で、これは窓口側が取り込む写し)
+            connection.execute('''CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, msg TEXT NOT NULL, tag TEXT NOT NULL, from_pane TEXT NOT NULL, req TEXT,
+                state TEXT NOT NULL, wait TEXT, received_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, msg))''')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -757,6 +761,54 @@ class Store:
         with self.db() as connection:
             rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
             return {'runs': [dict(row) for row in rows]}
+
+    def _message_fields(self, payload):
+        object_fields(payload, ('run_id', 'msg', 'state'), ('wait', 'req'))
+        text(payload['run_id'], 'run_id', 200)
+        text(payload['msg'], 'msg', 200)
+        found = MSG_NAME.fullmatch(payload['msg'])
+        if not found:
+            raise AppError(400, 'msg の形が不正です')
+        if payload['state'] not in MSG_STATES:
+            raise AppError(400, 'state は ' + ' / '.join(MSG_STATES) + ' のいずれかを指定してください')
+        wait = payload.get('wait')
+        if (payload['state'] == 'held') != (wait is not None):
+            raise AppError(400, 'wait は state が held のときだけ必要です')
+        if wait is not None and (len(text(wait, 'wait', 500)) > 500 or not MSG_WAIT.fullmatch(wait)):
+            raise AppError(400, 'wait は decision= / pr= / msg= の形で指定してください')
+        req = payload.get('req')
+        if req is not None and (len(text(req, 'req', 200)) > 200 or not MSG_REQ.fullmatch(req)):
+            raise AppError(400, 'req の形が不正です')
+        return found.group(1), found.group(2)
+
+    def import_message(self, payload):
+        tag, sender = self._message_fields(payload)
+        now = utc_now()
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            cursor = connection.execute('INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,msg) DO NOTHING',
+                                        (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now))
+            row = connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone()
+            return {'imported': bool(cursor.rowcount), 'message': dict(row)}
+
+    def move_message(self, payload):
+        tag, sender = self._message_fields(payload)
+        now = utc_now()
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            # ack が watch の取り込みより先に来た msg も落とさないため upsert にする。req は渡されたときだけ上書きする
+            connection.execute('''INSERT INTO messages(run_id,msg,tag,from_pane,req,state,wait,received_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,msg) DO UPDATE SET state=excluded.state, wait=excluded.wait, updated_at=excluded.updated_at, req=COALESCE(excluded.req, req)''',
+                                (payload['run_id'], payload['msg'], tag, sender, payload.get('req'), payload['state'], payload.get('wait'), now, now))
+            return dict(connection.execute('SELECT * FROM messages WHERE run_id=? AND msg=?', (payload['run_id'], payload['msg'])).fetchone())
+
+    def messages(self, run_id, state=None):
+        text(run_id, 'run_id', 200)
+        if state is not None and state not in MSG_STATES:
+            raise AppError(400, 'state は ' + ' / '.join(MSG_STATES) + ' のいずれかを指定してください')
+        with self.db() as connection:
+            rows = connection.execute('SELECT * FROM messages WHERE run_id=?' + ('' if state is None else ' AND state=?') + ' ORDER BY id', (run_id,) if state is None else (run_id, state))
+            return {'messages': [dict(row) for row in rows]}
 
     def tasks(self, lane=None):
         if lane is not None and lane not in LANES:
@@ -1270,6 +1322,11 @@ def read_token_file(path, identifier):
     return data
 
 
+# run-inbox.sh の publish が作る "<prio>-<micros>-<tag>-<from>-<rand>.msg"
+MSG_NAME = re.compile(r'[01]-[0-9]+-([a-z]+)-([A-Za-z0-9:_.]+)-([A-Za-z0-9]+)\.msg')
+MSG_STATES = ('new', 'held', 'done')
+MSG_WAIT = re.compile(r'(decision|pr|msg)=\S+')
+MSG_REQ = re.compile(r'[A-Za-z0-9._:/-]+')
 CLAIM_FILE = re.compile(r'([0-9a-f]{32})-[0-9a-f]{16}\.json')
 
 
@@ -1484,6 +1541,18 @@ def main(argv=None):
         if name == 'open':
             sub.add_argument('--pane', required=True)
             sub.add_argument('--socket', required=True)
+    msg = commands.add_parser('msg', help='窓口が受けた msg の状態を messages 表に記録する (本文はファイルが運ぶ)')
+    msg_commands = msg.add_subparsers(dest='msg_command', required=True)
+    for name in ('import', 'move', 'list'):
+        sub = msg_commands.add_parser(name, help={'import': 'msg を取り込む。あれば何もしない (冪等)', 'move': 'msg の状態を更新する。無ければ入れる', 'list': 'run の msg を id 順に出す'}[name])
+        sub.add_argument('--run-id', required=True)
+        if name == 'list':
+            sub.add_argument('--state', choices=('new', 'held', 'done'))
+        else:
+            sub.add_argument('--msg', required=True)
+            sub.add_argument('--state', required=True, choices=('new', 'held', 'done'))
+            sub.add_argument('--wait', help='state が held のときだけ。decision=ID / pr=URL / msg=名前')
+            sub.add_argument('--req', help='依頼の request_key')
     for sub in (complete, report, renew):
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument('--token')
@@ -1522,6 +1591,14 @@ def main(argv=None):
                 result = store.close_run(args.run_id, args.role)
             else:
                 result = store.runs(args.run_id, args.pane, args.socket, args.all)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.command == 'msg':
+            if args.msg_command == 'list':
+                result = store.messages(args.run_id, args.state)
+            else:
+                payload = {'run_id': args.run_id, 'msg': args.msg, 'state': args.state, **{k: v for k, v in (('wait', args.wait), ('req', args.req)) if v is not None}}
+                result = (store.import_message if args.msg_command == 'import' else store.move_message)(payload)
             print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.command == 'task':
