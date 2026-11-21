@@ -1372,7 +1372,7 @@ def message_request(handle):
             return None
         if line.startswith(b'req: '):
             req = line[5:].rstrip(b'\r\n').decode('ascii', errors='replace')
-            return req if len(req) <= 200 and not req.startswith('-') and MSG_REQ.fullmatch(req) else None
+            return req if len(req) <= 200 and MSG_REQ.fullmatch(req) else None
     return None
 
 

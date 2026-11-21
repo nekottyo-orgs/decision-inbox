@@ -97,14 +97,14 @@ class MessageTests(unittest.TestCase):
     def test_sync_で_new_held_done_を反映し_別_run_と既存_done_は保つ(self):
         inbox = self.inbox()
         message = inbox / 'new' / NAME
-        message.write_text('req: task/1\n\n本文\n', encoding='utf-8')
+        message.write_text('req: -task/1\n\n本文\n', encoding='utf-8')
         (inbox / 'cur' / OTHER).write_text('本文', encoding='utf-8')
         other_run = self.store.move_message(self.payload(run_id='r2'))
         initial = self.cli('msg', 'sync', '--run-id', 'r1', '--inbox', str(inbox))
         self.assertEqual(initial.returncode, 0, initial.stderr)
         self.assertEqual(json.loads(initial.stdout), {'targets': 1, 'done': 0})
         first, = self.store.messages('r1')['messages']
-        self.assertEqual((first['state'], first['req']), ('new', 'task/1'))
+        self.assertEqual((first['state'], first['req']), ('new', '-task/1'))
         self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 1, 'done': 0})
         self.assertEqual(self.store.messages('r1')['messages'], [first])
 
@@ -122,7 +122,7 @@ class MessageTests(unittest.TestCase):
         held.rename(inbox / 'cur' / NAME)
         self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 0, 'done': 1})
         done, = self.store.messages('r1')['messages']
-        self.assertEqual((done['id'], done['state'], done['wait'], done['req']), (first['id'], 'done', None, 'task/1'))
+        self.assertEqual((done['id'], done['state'], done['wait'], done['req']), (first['id'], 'done', None, '-task/1'))
         self.assertEqual(self.store.sync_messages('r1', inbox), {'targets': 0, 'done': 0})
         self.assertEqual(self.store.messages('r1')['messages'], [done])
         self.assertEqual(self.store.messages('r2')['messages'], [other_run])
