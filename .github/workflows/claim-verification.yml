@@ -1,0 +1,44 @@
+name: Claim verification
+
+on:
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'API.md'
+      - 'proofs/**'
+      - 'tests/**'
+      - '.github/workflows/claim-verification.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'API.md'
+      - 'proofs/**'
+      - 'tests/**'
+      - '.github/workflows/claim-verification.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Lean
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o elan.tar.gz https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  elan.tar.gz" | sha256sum -c -
+          tar xzf elan.tar.gz
+          ./elan-init -y --no-modify-path --default-toolchain leanprover/lean4:v4.36.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Check the claim model
+        run: lean proofs/ClaimLease.lean
+
+      - name: Test the implementation
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
