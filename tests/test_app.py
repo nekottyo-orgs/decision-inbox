@@ -113,7 +113,9 @@ class StoreTests(unittest.TestCase):
         item = self.answered()
         with patch('app.time.time', return_value=1000):
             first = self.store.claim('worker-a', 10)
-        with patch('app.time.time', return_value=1011):
+        with patch('app.time.time', return_value=1009):
+            self.assertIsNone(self.store.claim('worker-b')['decision'])
+        with patch('app.time.time', return_value=1010):
             self.assert_app_error(409, lambda: self.store.complete(item['id'], first['token']))
             second = Store(self.db).claim('worker-b', 30)
             self.assertEqual(second['decision']['id'], item['id'])
