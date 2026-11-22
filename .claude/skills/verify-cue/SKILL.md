@@ -25,7 +25,7 @@ macOS の Chrome が別の場所にある場合や Linux では、`CUE_VERIFY_CH
 
 ## 読み取り点検
 
-書き込み前の点検は helper が実行する。対象の commit と Python、CLI の実体を `run.jsonl` に記録し、`hooks` が `{"pre_add":null}`、起動したプロセスの `GET /api/decisions` が HTTP 200 かつ空であることを照合する。実行対象にコミットされていない変更がある場合は、先に検証対象をコミットして版を確定する。
+書き込み前の点検は helper が実行する。対象の commit と Python、CLI の実体を `run.jsonl` に記録し、`hooks` が `{"pre_add":null}`、起動したプロセスの `GET /api/decisions` が HTTP 200 かつ空であることを照合する。helper と依頼 JSON を含む実行対象の追跡状態と内容を対象 commit と照合する。前提不足の場合は実行対象をコミットして版を確定する。
 
 Mac に反映した版を確認する場合は、`command -v decision-inbox`、`readlink ~/.local/bin/decision-inbox`、`readlink ~/.local/share/cue/current`、`decision-inbox hooks` で配線を読み、反映先と検証対象の commit を照合する。最後のコマンドは DB を開かない。配線の観測は隔離環境での操作結果と一緒に記録する。
 
@@ -41,4 +41,4 @@ Mac に反映した版を確認する場合は、`command -v decision-inbox`、`
 
 ## 後片付け
 
-終了時に起動したプロセスと Web の専用セッションを止め、一時 HOME・DB・token・プロファイルを削除する。失敗時も `run.jsonl` の `cleanup` が `state_removed: true` であることと、証跡ファイルが読めることを確認する。
+終了時に起動したプロセスと Web の専用セッションを止め、一時 HOME・DB・token・プロファイルを削除する。Web の合格には、自己検査でのブラウザ終了と、専用セッションの `session info --json` が `active: false` と `pid: null` を返すことが必要。終了確認は `run.jsonl` に残る。失敗時も `cleanup` が `state_removed: true` であることと、証跡ファイルが読めることを確認する。

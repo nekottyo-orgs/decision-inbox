@@ -101,9 +101,24 @@ def journey(mode, evidence, state):
                unverified=['実 Herdr popup', '共有 DB', '実アカウント', '実モデル'] +
                           (['ブラウザ表示 (web で別に検証)'] if mode == 'tui' else
                            ['TUI の回答連結 (tui で別に検証)']))
-        tracked_runtime = ['app.py', 'cue_tui.py', 'frontend', 'tests/self-check.sh']
-        if subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--', *tracked_runtime], cwd=REPO).returncode:
-            raise Unavailable('実行対象に未コミットの変更があり、HEAD だけでは版を特定できません')
+        runtime = ['app.py', 'cue_tui.py', 'assets/demo-flow.svg', 'tests/self-check.sh',
+                   str((SKILL / 'verify.py').relative_to(REPO)), str((SKILL / 'request.json').relative_to(REPO))]
+        paths = [*runtime, 'frontend']
+        status = subprocess.check_output(['git', 'status', '--porcelain=v1', '--untracked-files=all',
+                                          '--', *paths], cwd=REPO)
+        tree = subprocess.check_output(['git', 'ls-tree', '-rz', revision, '--', *paths], cwd=REPO,
+                                        text=True, encoding='utf-8')
+        blobs = {}
+        for entry in tree.split('\0')[:-1]:
+            metadata, path = entry.split('\t', 1)
+            blobs[path] = metadata.split()[2]
+        if status or any(path not in blobs for path in runtime) or any(
+                not (REPO / path).is_file() or (REPO / path).is_symlink() for path in blobs):
+            raise Unavailable('実行対象に未コミットの変更があるか、HEAD で追跡されていません')
+        hashes = subprocess.check_output(['git', 'hash-object', '--no-filters', '--', *blobs],
+                                         cwd=REPO, text=True).splitlines()
+        if hashes != list(blobs.values()):
+            raise Unavailable('実行対象に未コミットの変更があり、HEAD の内容と一致しません')
         with socket.socket() as can_bind:
             try:
                 can_bind.bind(('127.0.0.1', 0))
@@ -139,7 +154,7 @@ def journey(mode, evidence, state):
                 url = match[1]
                 require(get('api/decisions') == {'decisions': [], 'demo': False}, '専用 DB の初期状態が空ではありません')
                 if mode == 'web':
-                    web_check(start, record, env, evidence, url)
+                    web_check(start, run, record, env['AGENT_BROWSER_NAMESPACE'], evidence, url)
                 else:
                     request = SKILL / 'request.json'
                     item = json.loads(run(app + ['add', '--file', str(request)]))
@@ -211,18 +226,28 @@ def answer_in_tui(start, record, evidence, command):
         os.close(slave)
 
 
-def web_check(start, record, env, evidence, url):
+def web_check(start, run, record, namespace, evidence, url):
+    def session_closed():
+        info = json.loads(run([*browser, 'session', 'info', '--json']))
+        data = info['data']
+        return (info['success'] is True and data['session'] == session and
+                data['namespace'] == namespace and data['active'] is False and data['pid'] is None)
+
+    session = None
     with (evidence / 'web.log').open('wb') as output:
-        with start(['bash', str(REPO / 'tests/self-check.sh'), url], stdout=output, stderr=output) as check:
-            try:
+        try:
+            with start(['bash', str(REPO / 'tests/self-check.sh'), url], stdout=output, stderr=output) as check:
+                session = f'decision-inbox-api-selfcheck-{check.pid}'
+                browser = ['agent-browser', '--session', session]
                 require(check.wait(timeout=120) == 0, 'ブラウザ自己検査が失敗しました。web.log を参照してください')
-            finally:
-                if check.poll() is None:
-                    # 自己検査が異常終了しても、その検査専用のブラウザだけを閉じる。
-                    session = f'decision-inbox-api-selfcheck-{check.pid}'
-                    subprocess.run(['agent-browser', '--session', session, 'close'], cwd=REPO, env=env,
-                                   stdout=output, stderr=output, timeout=10)
-            record('browser_check', log='web.log')
+        finally:
+            if session is not None and not session_closed():
+                try:
+                    run([*browser, 'close'])
+                finally:
+                    require(session_closed(), '検査専用のブラウザが終了していません')
+                raise ValueError('ブラウザ自己検査の終了後も専用セッションが残っていました')
+    record('browser_check', log='web.log', session=session, session_closed=True)
 
 
 def main():

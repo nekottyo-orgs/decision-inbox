@@ -7,7 +7,8 @@ ab() { agent-browser --session "$check_session" "$@"; }
 js() {
   { printf '%s\n' '(async () => { const assert = (ok, message) => { if (!ok) throw new Error(message); };'; cat; printf '\n})();\n'; } | ab eval --stdin
 }
-trap 'ab close >/dev/null' EXIT
+# 異常時にも専用セッションを閉じ、最初の失敗を終了コードに残す。
+trap 'ab close >/dev/null || true' EXIT
 ab open "$check_url" >/dev/null
 ab wait '#detail' >/dev/null
 js <<'JS'
@@ -174,4 +175,6 @@ assert(document.querySelector('#detail').getBoundingClientRect().top>=list.botto
 assert(!document.querySelector('#reset'),'実データを削除するボタンなし');
 return '合格：処理状態の定期更新・モバイル・削除操作なし';
 JS
+ab close >/dev/null
+trap - EXIT
 printf '%s\n' '合格：API 接続の UI self-check 全項目'
