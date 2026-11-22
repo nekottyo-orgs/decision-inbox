@@ -41,4 +41,4 @@ Mac に反映した版を確認する場合は、`command -v decision-inbox`、`
 
 ## 後片付け
 
-終了時に起動したプロセスと Web の専用セッションを止め、一時 HOME・DB・token・プロファイルを削除する。Web の合格には、自己検査でのブラウザ終了と、専用セッションの `session info --json` が `active: false` と `pid: null` を返すことが必要。終了確認は `run.jsonl` に残る。失敗時も `cleanup` が `state_removed: true` であることと、証跡ファイルが読めることを確認する。
+終了時に起動したプロセスと Web の専用セッションを止め、一時 HOME・DB・token・プロファイルを削除する。Web の合格には、自己検査でのブラウザ終了と、専用セッションの `session info --json` が `active: false` と `pid: null` を返すことが必要。終了の照会に失敗した場合は専用セッションの終了を再試行し、結果を `run.jsonl` に残す。最後の `result` には一時領域の削除結果も反映する。失敗時も `cleanup` が `state_removed: true` であることと、証跡ファイルが読めることを確認する。

@@ -35,11 +35,7 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def journey(mode, evidence, state):
-    def record(event, **fields):
-        with (evidence / 'run.jsonl').open('a', encoding='utf-8') as log:
-            print(json.dumps({'event': event, **fields}, ensure_ascii=False), file=log)
-
+def journey(mode, evidence, state, record):
     def run(command, *, capture=True):
         record('command', argv=command)
         result = subprocess.run(command, cwd=REPO, env=env, capture_output=True,
@@ -187,13 +183,10 @@ def journey(mode, evidence, state):
                                identifier, 'completed')
                     check_item(get(path), identifier, 'completed')
     except Unavailable as error:
-        record('result', status='unavailable', code=2, message=str(error))
-        return 2
+        return {'status': 'unavailable', 'code': 2, 'message': str(error)}
     except (Exception, KeyboardInterrupt) as error:
-        record('result', status='failed', code=1, message=f'{type(error).__name__}: {error}')
-        return 1
-    record('result', status='passed', code=0)
-    return 0
+        return {'status': 'failed', 'code': 1, 'message': f'{type(error).__name__}: {error}'}
+    return {'status': 'passed', 'code': 0}
 
 
 def answer_in_tui(start, record, evidence, command):
@@ -227,11 +220,12 @@ def answer_in_tui(start, record, evidence, command):
 
 
 def web_check(start, run, record, namespace, evidence, url):
-    def session_closed():
+    def confirm_session_closed():
         info = json.loads(run([*browser, 'session', 'info', '--json']))
         data = info['data']
-        return (info['success'] is True and data['session'] == session and
-                data['namespace'] == namespace and data['active'] is False and data['pid'] is None)
+        require(info['success'] is True and data['session'] == session and
+                data['namespace'] == namespace and data['active'] is False and data['pid'] is None,
+                '検査専用のブラウザの終了を確認できません')
 
     session = None
     with (evidence / 'web.log').open('wb') as output:
@@ -241,12 +235,19 @@ def web_check(start, run, record, namespace, evidence, url):
                 browser = ['agent-browser', '--session', session]
                 require(check.wait(timeout=120) == 0, 'ブラウザ自己検査が失敗しました。web.log を参照してください')
         finally:
-            if session is not None and not session_closed():
+            if session is not None:
                 try:
-                    run([*browser, 'close'])
-                finally:
-                    require(session_closed(), '検査専用のブラウザが終了していません')
-                raise ValueError('ブラウザ自己検査の終了後も専用セッションが残っていました')
+                    confirm_session_closed()
+                except (Exception, KeyboardInterrupt):
+                    try:
+                        run([*browser, 'close'])
+                        confirm_session_closed()
+                    except (Exception, KeyboardInterrupt) as error:
+                        record('browser_cleanup', session=session, status='failed',
+                               message=f'{type(error).__name__}: {error}')
+                    else:
+                        record('browser_cleanup', session=session, status='passed')
+                    raise
     record('browser_check', log='web.log', session=session, session_closed=True)
 
 
@@ -256,12 +257,29 @@ def main():
     parser.add_argument('evidence', type=Path, help='証跡専用の新しいディレクトリ')
     args = parser.parse_args()
     args.evidence.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix='cv-', dir='/tmp') as directory:
-        result = journey(args.mode, args.evidence, Path(directory))
-    with (args.evidence / 'run.jsonl').open('a', encoding='utf-8') as log:
-        print(json.dumps({'event': 'cleanup', 'state_removed': not Path(directory).exists()}), file=log)
+
+    def record(event, **fields):
+        with (args.evidence / 'run.jsonl').open('a', encoding='utf-8') as log:
+            print(json.dumps({'event': event, **fields}, ensure_ascii=False), file=log)
+
+    state = None
+    result = None
+    cleanup = {}
+    try:
+        with tempfile.TemporaryDirectory(prefix='cv-', dir='/tmp') as directory:
+            state = Path(directory)
+            result = journey(args.mode, args.evidence, state, record)
+    except (Exception, KeyboardInterrupt) as error:
+        cleanup['message'] = f'{type(error).__name__}: {error}'
+    cleanup['state_removed'] = state is None or not state.exists()
+    if not cleanup['state_removed']:
+        cleanup.setdefault('message', '検証の一時領域が残っています')
+    record('cleanup', **cleanup)
+    if 'message' in cleanup and (result is None or result['code'] != 1):
+        result = {'status': 'failed', 'code': 1, 'message': cleanup['message']}
+    record('result', **result)
     print(args.evidence.resolve(), flush=True)
-    return result
+    return result['code']
 
 
 if __name__ == '__main__':
