@@ -16,7 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
 from app import AppError, Store
-from test_app import isolated_env, request_payload
+from test_app import claim_across_commit_wait, isolated_env, request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -439,6 +439,58 @@ class InProcessTokenFileTests(unittest.TestCase):
         self.assertEqual(ran, [self.item['id']])
         self.assertEqual((caught.exception.status, str(caught.exception)), (409, 'token ファイルの書き込み中に lease が切れました'))
         self.assertEqual(self.store.get(self.item['id'])['answer']['status'], 'pending')
+
+    def test_cli_claim_は_commit_待ちで期限が切れると_token_を返さない(self):
+        target = self.root / 'mine.json'
+        for now, token_args in enumerate(((), ('--token-file', str(target))), start=1000):
+            with self.subTest(token_file=bool(token_args)):
+                out, err = io.StringIO(), io.StringIO()
+                # CLI 起動時のスキーマ確認の commit を避け、claim の commit に読取ロックを当てる。
+                with mock.patch('app.Store', return_value=self.store), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = claim_across_commit_wait(
+                        self, self.db,
+                        lambda: app.main(['--db', str(self.db), 'claim', '--worker', 'first', '--lease-seconds', '1', *token_args]),
+                        now=now,
+                    )
+                self.assertEqual(code, 1)
+                self.assertEqual(out.getvalue(), '')
+                self.assertIn('保存しましたが lease は既に切れています', json.loads(err.getvalue())['error'])
+                self.assertFalse(target.exists())
+                self.assertEqual(list(self.root.glob('.claim-*.tmp')), [])
+                answer = self.store.get(self.item['id'])['answer']
+                self.assertEqual((answer['status'], answer['lease_until']), ('processing', now + 1))
+        new_claim = self.main('claim', '--worker', 'next', '--token-file', str(target))
+        self.assertEqual((new_claim['decision']['id'], new_claim['token_file']), (self.item['id'], str(target)))
+        self.assertNotIn('token', new_claim)
+        self.assertEqual(self.main('complete', '--id', self.item['id'], '--token-file', str(target))['answer']['status'], 'completed')
+
+    def test_cli_claim_は_commit_できなければ_DB_と_token_ファイルを戻す(self):
+        target = self.root / 'mine.json'
+        connect = sqlite3.connect
+
+        def no_wait(*args, **kwargs):
+            return connect(*args, **{**kwargs, 'timeout': 0})
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.closing(connect(self.db)) as reader:
+            reader.execute('BEGIN')
+            reader.execute('SELECT COUNT(*) FROM decisions').fetchone()
+            with (
+                mock.patch('app.Store', return_value=self.store),
+                mock.patch.object(app.sqlite3, 'connect', no_wait),
+                mock.patch.object(app.os, 'link', wraps=os.link) as link,
+                contextlib.redirect_stdout(out),
+                contextlib.redirect_stderr(err),
+            ):
+                code = app.main(['--db', str(self.db), 'claim', '--worker', 'first', '--token-file', str(target)])
+            link.assert_called_once()
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(json.loads(err.getvalue()), {'error': 'データの読み書きに失敗しました'})
+        self.assertFalse(target.exists())
+        self.assertEqual(list(self.root.glob('.claim-*.tmp')), [])
+        self.assertEqual(self.store.get(self.item['id']), self.item)
+        self.assertEqual(self.main('claim', '--worker', 'next', '--token-file', str(target))['decision']['id'], self.item['id'])
 
     def lease_until(self):
         with self.store.db() as connection:

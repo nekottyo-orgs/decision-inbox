@@ -15,6 +15,13 @@ def claim (now duration : Nat) (state : State) : Option State :=
         if expires ≤ now then some (.processing (last + 1) (now + duration)) else none
     | _ => none
 
+-- A failed commit preserves the previous row. A successful commit leaves
+-- the new row in place even if the lease expires while waiting for it.
+def finishClaim (committed : Bool) (now : Nat) (previous : State)
+    (token expires : Nat) : State × Bool :=
+  if committed then (.processing token expires, decide (now < expires))
+  else (previous, false)
+
 def active (now token : Nat) (state : State) : Prop :=
   match state with
   | .processing current expires => token = current ∧ now < expires
@@ -57,6 +64,20 @@ theorem expiredClaimGetsFreshToken (expired : expires ≤ now) (positive : durat
     claim now duration (.processing current expires) =
       some (.processing (current + 1) (now + duration)) := by
   simp [claim, expired, Nat.ne_of_gt positive]
+
+theorem failedCommitPreservesClaim :
+    finishClaim false now previous token expires = (previous, false) := by
+  rfl
+
+theorem liveCommittedClaimSucceeds (live : now < expires) :
+    finishClaim true now previous token expires = (.processing token expires, true) := by
+  simp [finishClaim, live]
+
+theorem expiredCommittedClaimCanBeReclaimed (expired : expires ≤ now) (positive : duration > 0) :
+    finishClaim true now previous token expires = (.processing token expires, false) ∧
+    claim now duration (finishClaim true now previous token expires).1 =
+      some (.processing (token + 1) (now + duration)) := by
+  simp [finishClaim, Nat.not_lt_of_ge expired, expiredClaimGetsFreshToken expired positive]
 
 theorem expiredOrSupersededTokenRejected
     (invalid : expires ≤ now ∨ token ≠ current) :

@@ -7,6 +7,7 @@
 | モデル | 実装 |
 | --- | --- |
 | `claim` と `processing` | `Store.claim` が書き込みロックを取得してから、pending または期限切れの行を選び、token と期限を更新 |
+| `finishClaim` | commit 前の失敗では元の行に戻る。commit が成功したら更新後の行を保持し、その直後に現在時刻が期限未満のときだけ取得成功を返す。期限ちょうどから新しい token で再取得可能 |
 | `active`、`complete`、`report`、`renew` | `Store.active` が状態・token・期限を照合。各書き込みは同じ transaction 内で行い、renew は現在の期限と要求期限の最大値を使用 |
 | `retry` | `Store.retry` が現在の回答と停止報告の時刻を照合して pending に戻す。モデルでは回答を固定し、その回答に対する停止報告を claim の世代で表現 |
 
@@ -24,7 +25,7 @@ lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-実装テストでは、SQLite の独立した接続から競合して claim したときの勝者、期限ちょうどと再取得後の旧 token、古い停止報告、短い renew を照合する。関連ファイルの変更では、CI が上記と同じ証明と実装テストを実行する。
+実装テストでは、SQLite の独立した接続から競合して claim したときの勝者、読み取りロックによる commit 待ちでの失効、commit 失敗時の元の行、再取得後の旧 token、古い停止報告、短い renew を照合する。モデルの時刻は commit 直後の照合時点で、応答の転送時間は含まない。関連ファイルの変更では、CI が上記と同じ証明と実装テストを実行する。
 
 
 ## 担当を更新する条件

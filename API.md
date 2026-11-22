@@ -79,6 +79,8 @@ claim の body と CLI `--key-prefix` に任意の `key_prefix` を渡すと、r
 
 lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定。回答日時順 (同時刻は ID 順) の FIFO。期限切れの processing は再 claim 可能。有効かつ一致する token のみ complete 可能、それ以外は `409`。consumer は decision ID で冪等に処理し、外部副作用前に適用済みか確認。claim token は通常の一覧・詳細・履歴には含めない。
 
+claim の commit が失敗した場合は元の状態に戻り、永続化エラーになる。commit 成功直後の時刻が lease 期限以上なら、期限切れの processing を残して `409` (CLI は exit 1) を返す。token は返さず、次の claim で再取得できる。`--token-file` で公開済みのファイルもエラー時に削除を試みる。
+
 処理失敗や承認待ちは complete せず、期限内に report して停止理由を残す。report できなかった状態で lease が切れた場合だけ再配送される。renew だけで二重実行を防げるとは扱わず、再取得や再試行の前に適用済みか確認する。
 
 ## CLI

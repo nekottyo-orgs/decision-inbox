@@ -1,4 +1,5 @@
 import copy
+from contextlib import closing
 import http.client
 import json
 import os
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +23,28 @@ ROOT = Path(__file__).resolve().parents[1]
 def isolated_env(temp):
     # 端末に配線した pre-add と実 claims_dir を CLI のテストが踏まないようにする
     return {**os.environ, 'DECISION_INBOX_HOOKS_DIR': str(Path(temp) / 'hooks'), 'DECISION_INBOX_CLAIMS_DIR': str(Path(temp) / 'claims')}
+
+
+def claim_across_commit_wait(test, db, operation, *, now=1000):
+    with ThreadPoolExecutor(max_workers=1) as executor, patch('app.time.time', return_value=now) as clock:
+        with closing(sqlite3.connect(db)) as reader, closing(sqlite3.connect(db, timeout=0)) as probe:
+            reader.execute('BEGIN')
+            reader.execute('SELECT COUNT(*) FROM decisions').fetchone()
+            result = executor.submit(operation)
+            deadline = time.monotonic() + 3
+            # 新しい reader が待たされ始めたら、writer は commit のために排他ロックを要求済み。
+            while True:
+                try:
+                    probe.execute('SELECT COUNT(*) FROM decisions').fetchone()
+                except sqlite3.OperationalError as error:
+                    if str(error) != 'database is locked':
+                        raise
+                    break
+                if result.done() or time.monotonic() >= deadline:
+                    test.fail('claim の commit が読取ロックを待つ状態にならなかった')
+                time.sleep(0.005)
+            clock.return_value = now + 1
+        return result.result(timeout=5)
 
 
 TASK_DEFAULTS = {'kind': 'research', 'done_when': 'result が書かれる'}
@@ -242,6 +266,20 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual((status, miss), (200, {'decision': None}))
         status, hit, _ = self.request('POST', '/api/claim', {'worker': 'w', 'key_prefix': 'run-b/'})
         self.assertEqual(hit['decision']['request_key'], 'run-b/1')
+
+    def test_http_claim_は_commit_待ちで期限が切れると_409_を返す(self):
+        store = Store(self.db)
+        item = store.add(request_payload())
+        store.answer(item['id'], {'choice': 'minimal'})
+        status, body, _ = claim_across_commit_wait(
+            self, self.db, lambda: self.request('POST', '/api/claim', {'worker': 'first', 'lease_seconds': 1}),
+        )
+        self.assertEqual(status, 409)
+        self.assertIn('保存しましたが lease は既に切れています', body['error'])
+        self.assertNotIn('token', body)
+        self.assertEqual(store.get(item['id'])['answer']['status'], 'processing')
+        status, next_claim, _ = self.request('POST', '/api/claim', {'worker': 'next'})
+        self.assertEqual((status, next_claim['decision']['id'], next_claim['worker']), (200, item['id'], 'next'))
 
     def test_http_restart_preserves_answer_and_consumer_round_trip(self):
         status, item, _ = self.request('POST', '/api/decisions', request_payload())
