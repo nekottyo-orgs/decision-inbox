@@ -887,6 +887,9 @@ class Store:
                 # 書き込みに lease 以上かかると、成功を返しても complete / renew が token を断る claim になる
                 if time.time() >= expires:
                     raise AppError(409, 'token ファイルの書き込み中に lease が切れました')
+        # 読み取りロックで commit が待たされる間に失効した行は、次の claim で再取得できる
+        if time.time() >= expires:
+            raise AppError(409, 'claim は保存しましたが lease は既に切れています。この token は使えません')
         return result
 
     def report(self, identifier, payload):
