@@ -244,6 +244,8 @@ decision-inbox backup --output /absolute/path/to/cue-backup.sqlite3
 
 ## 検証と再開
 
+CLI 登録から実 TUI の回答、後続処理、Web API までの確認手順は [Cue の動作確認](.claude/skills/verify-cue/SKILL.md) にあります。
+
 旧 release との互換試験には、コミット `0e7cd80` を含む Git の作業ツリーが必要です。浅い clone ではそのコミットまで履歴を取得してください。`git archive` の展開先からは互換試験を実行できません。
 
 ```sh
