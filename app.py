@@ -547,6 +547,8 @@ class Store:
 
     def list(self, include_withdrawn=False):
         with self.db() as connection:
+            # 履歴と本文を同じ読み取り時点にそろえる
+            connection.execute('BEGIN')
             changes = self.changes(connection)
             items = [self.public(row, changes.get(row['id'], [])) for row in connection.execute('SELECT * FROM decisions ORDER BY created_at,id')]
         # 窓口は answer が null の判断を未判断として人に案内するため、取り下げ済みは既定で外す
@@ -559,6 +561,7 @@ class Store:
 
     def get(self, identifier):
         with self.db() as connection:
+            connection.execute('BEGIN')
             return self.fetch(connection, identifier)
 
     def answer(self, identifier, payload):

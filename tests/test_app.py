@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from uuid import UUID
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -250,11 +251,28 @@ class HTTPTests(unittest.TestCase):
         self.assertIn('更新されています', body['error'])
         status, withdrawn, _ = self.request('POST', path + '/withdraw', {'note': '不要'})
         self.assertEqual((status, withdrawn['withdrawn']['note']), (200, '不要'))
-        self.assertEqual(self.request('GET', '/api/decisions')[1]['decisions'], [])
-        self.assertEqual(self.request('GET', path)[1]['withdrawn']['note'], '不要')
+        self.assertEqual(self.request('GET', '/api/decisions')[:2], (200, {'decisions': [], 'demo': False}))
+        self.assertEqual(self.request('GET', path)[:2], (200, withdrawn))
         _, other, _ = self.request('POST', '/api/decisions', request_payload())
         self.request('POST', f"/api/decisions/{other['id']}/answer", {'choice': 'minimal'})
         self.assertEqual(self.request('POST', f"/api/decisions/{other['id']}/withdraw", {'note': '不要'})[0], 409)
+
+    def test_http_判断一覧と詳細は既存の_JSON_形式と並び順で返る(self):
+        early, late = '2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00'
+        payload = request_payload()
+        decisions = []
+        for number, created_at in ((1, late), (3, early), (2, early)):
+            identifier = UUID(int=number).hex
+            with patch('app.uuid.uuid4', return_value=UUID(int=number)), patch('app.utc_now', return_value=created_at):
+                self.assertEqual(self.request('POST', '/api/decisions', payload)[0], 201)
+            decisions.append({
+                **payload, 'files': [], 'deadline': None, 'image': None, 'id': identifier, 'created_at': created_at,
+                'answer': None, 'revision': 0, 'updated_at': None, 'update_note': None, 'withdrawn': None,
+            })
+        listing = self.request('GET', '/api/decisions')
+        self.assertEqual(listing[:2], (200, {'decisions': [decisions[2], decisions[1], decisions[0]], 'demo': False}))
+        detail = self.request('GET', '/api/decisions/' + decisions[2]['id'])
+        self.assertEqual(detail[:2], (200, decisions[2]))
 
     def test_http_claim_key_prefix_filters_and_rejects_null(self):
         for key in ('run-a/1', 'run-b/1'):

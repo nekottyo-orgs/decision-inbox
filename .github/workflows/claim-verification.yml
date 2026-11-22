@@ -43,6 +43,7 @@ jobs:
         run: |
           lean proofs/ClaimLease.lean
           lean proofs/TaskAssignment.lean
+          lean proofs/DecisionSnapshot.lean
 
       - name: Test the implementation
         # PR では Release の build が同じ回帰テストを実行する。
