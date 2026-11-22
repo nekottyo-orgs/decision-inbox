@@ -1,0 +1,12 @@
+{
+  "request_key": "verify-cue/tui",
+  "title": "Cue verification request",
+  "source": "検証",
+  "reason": "TUI の回答が処理側に届くことを確認",
+  "options": [
+    {"id": "first", "title": "最初の候補", "benefits": "操作が少ない", "concerns": "確認範囲が狭い"},
+    {"id": "second", "title": "次の候補", "benefits": "確認範囲が広い", "concerns": "操作が増える"}
+  ],
+  "recommended": "second",
+  "recommendation": "推奨と異なる先頭候補が選択されることも確認"
+}
