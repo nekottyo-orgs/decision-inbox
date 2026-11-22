@@ -149,6 +149,10 @@ shasum -a 256 -c decision-inbox.tar.gz.sha256
 
 `APP_CLIENT_ID` が空の間は `main` への push で Release PR を作る処理をスキップします。通常の PR のビルド検証は続きます。手動で `main` の Release workflow を実行して設定が不足していれば、エラーで止まります。
 
+`main` の release run は待機中のものを 100 件まで保持します。上限に達した場合、その後の run は取り消されます。
+
+公開が途中で失敗した場合は、その回の workflow run で失敗した job だけを再実行します (`gh run rerun <run-id> --failed`)。全 job の再実行や、後続の `main` からの手動実行では、その回の draft を回収しません。
+
 ## 依頼と回答の受け渡し
 
 次の内容を `request.json` として保存し、投入します。登録後は API / CLI の両方で同じ DB を扱えます。

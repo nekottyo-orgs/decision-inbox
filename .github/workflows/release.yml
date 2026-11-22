@@ -10,7 +10,7 @@ permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   tagpr:
@@ -61,6 +61,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tagpr.outputs.tag && format('refs/tags/{0}', needs.tagpr.outputs.tag) || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Record source revision
         id: source
@@ -131,7 +132,7 @@ jobs:
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
           case "$draft" in
             true) gh release upload "$TAG" decision-inbox.tar.gz decision-inbox.tar.gz.sha256 --clobber ;;
-            false) ;; # A retry may arrive after the release was published.
+            false) ;; # Retrying this job in the original run may find an already-published release.
             *) echo "Unexpected draft status: $draft" >&2; exit 1 ;;
           esac
           assets=$(gh release view "$TAG" --json assets)
