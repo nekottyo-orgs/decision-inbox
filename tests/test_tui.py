@@ -66,14 +66,17 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(self.desk.draft()['choice'], 'refactor')
         handle_key(self.desk, curses.KEY_UP)
         self.assertEqual(self.desk.draft()['choice'], 'minimal')
+        self.desk.scroll = 12
         handle_key(self.desk, '\r')
         self.assertEqual(self.store.get(self.first['id'])['answer']['choice'], 'minimal')
         self.assertEqual(self.store.get(self.first['id'])['answer']['status'], 'pending')
         self.assertEqual(self.desk.item['id'], self.second['id'])
+        self.assertEqual(self.desk.scroll, 0)
         self.assertEqual(self.desk.draft()['choice'], 'minimal')
         self.assertIsNone(self.store.get(self.second['id'])['answer'])
         handle_key(self.desk, '\r')
         self.assertEqual(self.store.get(self.second['id'])['answer']['choice'], 'minimal')
+        self.assertIsNone(self.desk.item)
 
     def test_default_enter_saves_and_only_success_flushes_buffered_input(self):
         with patch('cue_tui.curses.flushinp') as flush:
@@ -111,11 +114,27 @@ class TuiTests(unittest.TestCase):
         self.desk.draft()['memo'] = '入力中の日本語'
         self.desk.scroll = 12
         urgent = self.store.add(request_payload(title='新着', priority='urgent'))
-        self.desk.refresh()
+        self.store.update(self.first['id'], {'note': '前提を補足', 'changes': {'title': '更新した判断'}})
+        handle_key(self.desk, 'r')
         self.assertEqual(self.desk.visible()[0]['id'], urgent['id'])
         self.assertEqual(self.desk.item['id'], self.first['id'])
+        self.assertEqual(self.desk.item['title'], '更新した判断')
         self.assertEqual(self.desk.draft(), {'choice': 'minimal', 'memo': '入力中の日本語'})
         self.assertEqual(self.desk.scroll, 12)
+        self.assertIn('内容が更新されました: 前提を補足', self.desk.notice)
+        handle_key(self.desk, 'r')
+        self.assertIn('内容が更新されました: 前提を補足', self.desk.notice)
+        handle_key(self.desk, 'f')
+        self.assertEqual(self.desk.item['id'], urgent['id'])
+        self.assertEqual(self.desk.scroll, 0)
+
+    def test_refresh_selects_next_case_after_withdrawal(self):
+        self.desk.scroll = 12
+        self.store.withdraw(self.first['id'], {'note': '不要になった'})
+        handle_key(self.desk, 'r')
+        self.assertEqual(self.desk.item['id'], self.second['id'])
+        self.assertEqual(self.desk.scroll, 0)
+        self.assertIn('この判断は取り下げられました: 不要になった', self.desk.notice)
 
     def test_undo_returns_answer_to_pending_and_retains_its_draft(self):
         self.store.answer(self.first['id'], {'choice': 'refactor', 'memo': '回答のメモ'})
@@ -204,12 +223,16 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(self.desk.draft()['memo'], '下書き')
         self.assertEqual(self.desk.draft()['choice'], 'refactor')
         self.store.answer(self.first['id'], {'choice': 'minimal'})
+        self.desk.scroll = 12
         handle_key(self.desk, '\t')
         self.assertEqual(self.desk.view, 'done')
         self.assertEqual(self.desk.item['id'], self.first['id'])
+        self.assertEqual(self.desk.scroll, 0)
+        self.desk.scroll = 12
         handle_key(self.desk, 'f')
         self.assertEqual(self.desk.priority, 'urgent')
         self.assertIsNone(self.desk.item)
+        self.assertEqual(self.desk.scroll, 0)
         self.assertEqual(self.desk.visible(), [])
 
     def test_quit_confirmation_uses_only_arrows_and_enter(self):
@@ -463,9 +486,21 @@ class TuiTests(unittest.TestCase):
             os.kill(process.pid, signal.SIGWINCH)
             os.write(master, b'\x1bOBm')
             pump_until(lambda: 'メモを下書きに反映'.encode() in output)
+            self.store.update(self.first['id'], {'note': '前提を補足', 'changes': {'title': '更新した判断'}})
+            os.write(master, b'r')
+            pump_until(lambda: '内容が更新されました'.encode() in output)
+            os.write(master, b'f')
+            pump_until(lambda: '判断待ちの案件はありません'.encode() in output)
+            before_tab = len(output)
+            os.write(master, b'\t')
+            pump_until(lambda: '済み'.encode() in output[before_tab:])
+            before_return = len(output)
+            os.write(master, b'f\t')
+            pump_until(lambda: '更新した判断'.encode() in output[before_return:])
             os.write(master, b'\r\r')
             pump_until(lambda: self.store.get(self.first['id'])['answer'] is not None)
             self.assertEqual(self.store.get(self.first['id'])['answer']['memo'], '端末からのメモ')
+            self.assertEqual(self.store.get(self.first['id'])['answer']['choice'], 'refactor')
             pump_until(lambda: '回答を保存しました'.encode() in output)
             settled = time.monotonic()
             pump_until(lambda: time.monotonic() - settled >= 0.2)
