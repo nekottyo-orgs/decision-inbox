@@ -325,13 +325,11 @@ class Desk:
                     gone = self.store.get(previous['id'])
                 except Exception:
                     gone = None
-                self.item, self.scroll = None, 0
-                if self.visible():
-                    self.select(self.visible()[0])
+                self.select()
                 if gone and gone['withdrawn']:
                     self.notice = f"この判断は取り下げられました: {gone['withdrawn']['note']}"
             else:
-                self.item = current
+                self.select(current, keep_scroll=True)
                 if previous['answer'] is None and current['answer'] is not None:
                     self.notice = '別の画面で判断済みです。下書きは保持しています。←→で案件を移動できます'
                 elif previous['answer'] is not None and current['answer'] is None:
@@ -339,8 +337,8 @@ class Desk:
                     self.notice = '回答が取り消され、判断待ちへ戻りました。下書きは保持しています'
                 elif current['answer'] is None and current['revision'] > previous['revision']:
                     self.notice = f"内容が更新されました: {current['update_note']}。最新の内容を表示しています"
-        elif self.visible():
-            self.select(self.visible()[0])
+        elif items := self.visible():
+            self.select(items[0])
         if old_ids and {item['id'] for item in fresh} - old_ids and not self.notice:
             self.notice = '新しい判断が届きました。閲覧中の案件と下書きは保持しています'
 
@@ -379,10 +377,12 @@ class Desk:
         ok, self.task_message = self.focus(tasks[self.task_index]['pane'])
         return ok and self.popup and not self.task_message.endswith(NO_TMUX_NOTE)
 
-    def select(self, item):
-        self.item, self.scroll = item, 0
-        if item['answer'] is None:
-            self.drafts.setdefault(item['id'], {'choice': item['options'][0]['id'], 'memo': ''})
+    def select(self, item=None, *, keep_scroll=False):
+        self.item = item if item is not None else next(iter(self.visible()), None)
+        if not keep_scroll:
+            self.scroll = 0
+        if self.item is not None and self.item['answer'] is None:
+            self.draft()
 
     def draft(self):
         if not self.item:
@@ -394,7 +394,7 @@ class Desk:
     def move_case(self, direction):
         items = self.visible()
         if not items:
-            self.item, self.scroll = None, 0
+            self.select()
             return
         current = next((index for index, item in enumerate(items) if self.item and item['id'] == self.item['id']), None)
         self.select(items[(current + direction) % len(items)] if current is not None else items[0 if direction > 0 else -1])
@@ -402,19 +402,14 @@ class Desk:
     def change_view(self):
         self.refresh()
         self.view = 'done' if self.view == 'pending' else 'pending'
-        items = self.visible()
-        self.item, self.scroll = None, 0
-        if items:
-            self.select(items[0])
+        self.select()
 
     def change_filter(self):
         self.refresh()
         self.priority = FILTERS[(FILTERS.index(self.priority) + 1) % len(FILTERS)]
         items = self.visible()
         if not self.item or all(item['id'] != self.item['id'] for item in items):
-            self.item, self.scroll = None, 0
-            if items:
-                self.select(items[0])
+            self.select(items[0] if items else None)
 
     def choose(self, number=None, direction=0):
         if not self.item or self.item['answer'] is not None:
@@ -448,10 +443,7 @@ class Desk:
         self.drafts.pop(identifier, None)
         self.item = saved
         self.refresh()
-        items = self.visible()
-        self.item, self.scroll = None, 0
-        if items:
-            self.select(items[0])
+        self.select()
         self.notice = '回答を保存しました。依頼元の処理を待っています'
         return True
 
