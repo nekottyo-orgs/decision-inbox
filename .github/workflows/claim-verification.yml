@@ -45,4 +45,6 @@ jobs:
           lean proofs/TaskAssignment.lean
 
       - name: Test the implementation
+        # PR では Release の build が同じ回帰テストを実行する。
+        if: github.event_name == 'push'
         run: python3 -m unittest discover -s tests -p 'test_*.py'
