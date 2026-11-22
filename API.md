@@ -150,7 +150,8 @@ HTTP API は変わらない。
 - **claims [--id ID]**: `{"claims":[{"id","token_file","worker","expires_at","active"}]}`。active は DB の現在の token と一致し lease 内か (ファイルの expires_at ではなく DB で判定)。token の値は出さない。読めないファイルは飛ばす
 - `--token-file` を付けない claim は従来どおり token を stdout に出す。complete / report / renew は token を `--token` で受け、結果に token は含めない
 - **complete / report の確定後に token ファイルを消せなかったとき**: DB の状態は `completed` (complete) または `blocked` / `failed` (report) に確定したまま。CLI は stdout に通常の結果 JSON を返して exit 0 になる。stderr に書き込める場合は、ファイルのパスと削除エラーを含む `{"warning":"token ファイルを消せませんでした: ..."}` を stderr に出す
-  - 警告が出たら `list` で対象 ID の状態を確認する。`auto` の残存ファイルは `claims --id ID` で `active: false` の行からパスを確認できる。claims_dir の外に指定した PATH は `claims` に出ないので、警告のパスとファイル内の `id` を照合する。確定済みの判断に対応するファイルだと確認できたら、token を表示・共有せず、削除できるようにしてそのファイルだけを削除する
+  - 回収を始める前に、対象 ID の `retry` と、残存ファイルと同じ明示 PATH を使う `claim` を、回収が終わるまで止める。先に `retry` が必要なら、古い PATH を回収までどの `claim` にも使わせず、次の `claim` には `--token-file auto` または未使用の別の PATH を使う。古い PATH がすでに再利用された可能性がある場合は、残存ファイルと確認できるまで削除を保留する
+  - `list` で対象 ID の状態を確認する。`auto` の残存ファイルは `claims --id ID` で `active: false` の行からパスを確認できる。claims_dir の外に指定した PATH は `claims` に出ないので、警告のパスとファイル内の `id` を照合する。先の complete / report で残ったファイルと確認できたら、token を表示・共有せず、そのファイルだけを削除する
   - 残ったファイルを使って同じ token で complete / report を再実行すると、claim の競合 (409 に相当) として exit 1 になり、stderr に `{"error":"claim token が無効または期限切れです"}` を返す。DB の確定状態と残存ファイルはそのまま
 - **renew の失敗からの戻し方**: renew が失敗したときは DB も rollback されるので、lease は延びていない。ただし置き換えの後 (ディレクトリの fsync、lease の再確認、commit) で失敗したときは、ファイルの `expires_at` が試みた新しい期限のまま残り、DB より先に進む。ファイルの `expires_at` を再試行の期限に使わない。例外は commit の後に lease 切れを見つけたときで、延長は保存したまま 409 (exit 1) で `延長は保存しましたが lease は既に切れています` を返す。どの場合も所有権が残っているかは `claims` の active で確かめる (`claims` は DB の lease の期限を返さない)。active が true なら元の lease はまだ有効なので renew をやり直す。false なら同じ token では lease を戻せないので、その token での作業を止め、通常の claim からやり直し、前の作業の副作用が適用済みでないかを確かめてから再開する
 
