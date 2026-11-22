@@ -1,4 +1,5 @@
 import curses
+from concurrent.futures import ThreadPoolExecutor
 import json
 import contextlib
 import sqlite3
@@ -337,6 +338,60 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(matched.returncode, 0, matched.stderr)
         self.assertEqual(json.loads(matched.stdout)['lane'], 'todo')
         self.assertIn('--from', self.cli('reconcile-lane', '--help').stdout)
+
+    def test_担当の条件付き更新は全条件を確認し他の項目を保つ(self):
+        added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題', '--run', 'run-a',
+                         '--request', '依頼', '--remaining', '残り')
+        self.assertEqual(added.returncode, 0, added.stderr)
+        before = json.loads(added.stdout)
+        expected = {'from': 'todo', 'from-pane': '', 'from-machine': '',
+                    'from-run': before['run'], 'from-request': before['request'], 'from-kind': before['kind']}
+
+        def assign(conditions, *, lane='worker', pane='w1:p2', machine='受理'):
+            arguments = [argument for key, value in conditions.items() for argument in ('--' + key, value)]
+            return self.cli('reconcile-lane', '--id', 't1', '--lane', lane, '--pane', pane,
+                            '--machine', machine, *arguments)
+
+        for field, other in (('from', 'done'), ('from-pane', 'w1:p9'), ('from-machine', '別の理由'),
+                             ('from-run', 'run-b'), ('from-request', '別の依頼'), ('from-kind', 'monitor')):
+            with self.subTest(field=field):
+                conflict = assign({**expected, field: other})
+                self.assertEqual(conflict.returncode, 3, conflict.stderr)
+                self.assertTrue(json.loads(conflict.stderr)['error'])
+                self.assertEqual(Store(self.db).tasks()[0], {**before, 'decision': None})
+
+        for omitted in expected:
+            with self.subTest(omitted=omitted):
+                invalid = assign({key: value for key, value in expected.items() if key != omitted})
+                self.assertEqual(invalid.returncode, 1, invalid.stderr)
+
+        applied = assign(expected)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        after = json.loads(applied.stdout)
+        self.assertEqual(after, {**before, 'lane': 'worker', 'pane': 'w1:p2', 'machine': '受理', 'updated_at': after['updated_at']})
+        matched = assign({**expected, 'from': 'worker', 'from-pane': 'w1:p2', 'from-machine': '受理'})
+        self.assertEqual(matched.returncode, 0, matched.stderr)
+        self.assertEqual(json.loads(matched.stdout), after)
+        cleared = assign({'from': 'worker', 'from-pane': 'w1:p2', 'from-machine': '受理'},
+                         lane='todo', pane='', machine='')
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(json.loads(cleared.stdout)['pane'], '')
+
+    def test_同じ担当を観測した二つの_CLI_のうち一方だけが更新する(self):
+        added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
+        self.assertEqual(added.returncode, 0, added.stderr)
+
+        def assign(pane):
+            return self.cli('reconcile-lane', '--id', 't1', '--lane', 'worker', '--pane', pane,
+                            '--machine', pane, '--from', 'todo', '--from-pane', '', '--from-machine', '',
+                            '--from-run', '', '--from-request', '', '--from-kind', 'research')
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(assign, ('w1:p1', 'w2:p1')))
+        self.assertEqual(sorted(result.returncode for result in results), [0, 3], results)
+        winner = json.loads(next(result.stdout for result in results if result.returncode == 0))
+        self.assertEqual(winner['pane'], winner['machine'])
+        self.assertEqual(Store(self.db).tasks()[0], {**winner, 'decision': None})
 
     def test_move_と_add_の_lane_を断り_lane_は変わらない(self):
         self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
