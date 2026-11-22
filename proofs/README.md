@@ -22,6 +22,7 @@
 ```sh
 lean +leanprover/lean4:v4.36.0 proofs/ClaimLease.lean
 lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
+lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -33,3 +34,9 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 [TaskAssignment.lean](TaskAssignment.lean) は、旧 lane・pane・machine と、指定があれば旧 run・request・kind が一致したときだけ担当を更新できることを検査する。一致後に同じ担当を指定すると、モデル上の revision も含めて行はそのままになる。担当が変わる場合も、所属と remaining は保持する。
 
 `Store.reconcile_lane` は `BEGIN IMMEDIATE` で SQLite の書き込みを直列化し、比較条件を `UPDATE` の `WHERE` に入れる。同値の確認も同じ transaction 内で行い、実装では `updated_at` を進めず既存の行を返す。実装テストでは 6 項目それぞれの不一致、空文字の比較、同じ行を観測した 2 つの CLI の競合を検査する。モデルの範囲は Cue 内の 1 行。Herdr の pane 起動・終了と一体の操作にはならない。
+
+## 判断の一覧と詳細の読み取り
+
+[DecisionSnapshot.lean](DecisionSnapshot.lean) は、最初の読み取りから応答までに他の接続が何回確定しても、一覧 (履歴から先に読む) と詳細 (本文から先に読む) の本文・revision・履歴が最初の読み取り時点と一致することを検査する。revision は更新履歴の件数とする。
+
+`Store.list` と `Store.get` の `BEGIN` から、SQLite が最初の SELECT のスナップショットをトランザクション終了まで保持することを前提とする。モデルは判断 1 件の本文と更新履歴を扱う。JSON の項目、並び順、取り下げ、古い revision への回答拒否と、実際の 2 接続の動作は Python の回帰テストで検査する。

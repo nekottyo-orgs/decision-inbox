@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import SCHEMA, AppError, Store, decision_text
@@ -47,6 +48,34 @@ class ChangeTests(unittest.TestCase):
         self.assertEqual(again, updated)
         second = self.store.update(item['id'], {'note': '候補を入れ替え', 'changes': {'options': request_payload()['options'][::-1]}})
         self.assertEqual((second['revision'], second['update_note']), (2, '候補を入れ替え'))
+
+    def test_一覧と詳細は読取中に更新が確定しても本文と履歴が揃う(self):
+        with self.store.db() as connection:
+            self.assertEqual(connection.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+        identifier = self.store.add(request_payload())['id']
+        reader = Store(self.db, readonly=True)
+        for read in ('list', 'get'):
+            with self.subTest(read=read):
+                before = reader.get(identifier)
+                update = {'note': read + ' の読取中', 'changes': {'title': read + ' の新しい題名'}}
+                original_changes = reader.changes
+
+                def changes_during_commit(connection, decision_id=None):
+                    if read == 'get':
+                        self.store.update(identifier, update)
+                    history = original_changes(connection, decision_id)
+                    if read == 'list':
+                        self.store.update(identifier, update)
+                    return history
+
+                with patch.object(reader, 'changes', side_effect=changes_during_commit):
+                    if read == 'list':
+                        self.assertEqual(reader.list(), [before])
+                    else:
+                        self.assertEqual(reader.get(identifier), before)
+                after = reader.get(identifier)
+                self.assertEqual((after['title'], after['revision'], after['update_note']),
+                                 (update['changes']['title'], before['revision'] + 1, update['note']))
 
     def test_update_の入力検査と状態による拒否(self):
         item = self.store.add(request_payload(request_key='run/1'))
