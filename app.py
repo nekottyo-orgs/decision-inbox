@@ -912,22 +912,16 @@ class Store:
         return self.get(identifier)
 
     def retry(self, identifier, payload):
-        object_fields(payload, ('decided_at', 'reported_at'))
-        decided_at = text(payload['decided_at'], 'decided_at', 64)
-        reported_at = text(payload['reported_at'], 'reported_at', 64)
-        with self.db() as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
-            self.public(row, [])
-            if row['status'] not in ('blocked', 'failed') or row['decided_at'] != decided_at or row['reported_at'] != reported_at:
-                raise AppError(409, '停止理由が変更済み、または再試行できない状態です')
-            self.record(connection, row, 'retry')
-            connection.execute("UPDATE decisions SET status='pending',reason='',next_step='',reported_at=NULL WHERE id=?", (identifier,))
-        return self.get(identifier)
+        return self._update_stopped(identifier, payload, 'retry', '再試行できない',
+                                    "UPDATE decisions SET status='pending',reason='',next_step='',reported_at=NULL WHERE id=?")
 
     def close(self, identifier, payload):
         # 終端は completed を流用する。status の CHECK を変えると旧 release が開けなくなるため。
         # 閉じた判断は reason / reported_at が残ったままの completed で、通常の完了 (reason 空) と見分けられる。
+        return self._update_stopped(identifier, payload, 'close', '閉じられない',
+                                    "UPDATE decisions SET status='completed' WHERE id=?")
+
+    def _update_stopped(self, identifier, payload, event, invalid_state, update_sql):
         object_fields(payload, ('decided_at', 'reported_at'))
         decided_at = text(payload['decided_at'], 'decided_at', 64)
         reported_at = text(payload['reported_at'], 'reported_at', 64)
@@ -936,9 +930,9 @@ class Store:
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
             self.public(row, [])
             if row['status'] not in ('blocked', 'failed') or row['decided_at'] != decided_at or row['reported_at'] != reported_at:
-                raise AppError(409, '停止理由が変更済み、または閉じられない状態です')
-            self.record(connection, row, 'close')
-            connection.execute("UPDATE decisions SET status='completed' WHERE id=?", (identifier,))
+                raise AppError(409, f'停止理由が変更済み、または{invalid_state}状態です')
+            self.record(connection, row, event)
+            connection.execute(update_sql, (identifier,))
         return self.get(identifier)
 
     def renew(self, identifier, payload, on_renew=None):

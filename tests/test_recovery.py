@@ -38,6 +38,10 @@ class RecoveryTests(unittest.TestCase):
     def retry_payload(self, item):
         return {key: item['answer'][key] for key in ('decided_at', 'reported_at')}
 
+    def answer_history(self):
+        with self.store.db() as connection:
+            return connection.execute('SELECT * FROM answer_history ORDER BY id').fetchall()
+
     def test_undo_preserves_original_answer_and_rejects_stale_requests(self):
         item = self.answered()
         self.assertTrue(item['answer']['can_undo'])
@@ -136,7 +140,9 @@ class RecoveryTests(unittest.TestCase):
                 retried = self.store.retry(item['id'], self.retry_payload(stopped))
                 self.assertEqual(retried['answer']['status'], 'pending')
                 self.assertEqual(retried['answer']['reason'], '')
+                self.assertEqual(retried['answer']['next_step'], '')
                 self.assertIsNone(retried['answer']['reported_at'])
+                self.assertEqual(json.loads(self.answer_history()[-1]['answer']), stopped['answer'])
                 self.assertFalse(retried['answer']['can_undo'])
                 self.error(409, lambda: self.store.undo(item['id'], {'decided_at': item['answer']['decided_at']}))
                 claim = self.store.claim('worker')
@@ -159,6 +165,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.store.get(item['id']), stopped)
         closed = self.store.close(item['id'], self.retry_payload(stopped))
         self.assertEqual(closed['answer'], {**stopped['answer'], 'status': 'completed'})
+        self.assertEqual(json.loads(self.answer_history()[-1]['answer']), stopped['answer'])
         self.assertEqual(self.store.ready(), [])
         self.assertIsNone(self.store.claim('other')['decision'])
         self.error(409, lambda: self.store.close(item['id'], self.retry_payload(stopped)))
@@ -183,6 +190,44 @@ class RecoveryTests(unittest.TestCase):
         self.error(409, lambda: self.store.retry(item['id'], self.retry_payload(first)))
         self.error(409, lambda: self.store.retry(item['id'], {**self.retry_payload(second), 'decided_at': '古い回答'}))
         self.assertEqual(self.store.get(item['id']), second)
+
+    def test_stopped_operations_conflict_without_changing_answer_or_history(self):
+        stopped = self.report(self.answered())
+        identifier = stopped['id']
+        payload = self.retry_payload(stopped)
+        operations = (
+            (self.store.retry, '停止理由が変更済み、または再試行できない状態です'),
+            (self.store.close, '停止理由が変更済み、または閉じられない状態です'),
+        )
+        for field in ('decided_at', 'reported_at', 'status'):
+            expected = self.store.close(identifier, payload) if field == 'status' else stopped
+            stale = payload if field == 'status' else {**payload, field: '古い時刻'}
+            history = self.answer_history()
+            for operation, message in operations:
+                with self.subTest(operation=operation.__name__, field=field):
+                    with self.assertRaises(AppError) as caught:
+                        operation(identifier, stale)
+                    self.assertEqual((caught.exception.status, str(caught.exception)), (409, message))
+                    self.assertEqual(self.store.get(identifier), expected)
+                    self.assertEqual(self.answer_history(), history)
+
+    def test_stopped_operations_roll_back_history_when_status_update_fails(self):
+        stopped = self.report(self.answered())
+        history = self.answer_history()
+        with self.store.db() as connection:
+            connection.execute("""CREATE TRIGGER fail_stopped_update BEFORE UPDATE OF status ON decisions
+                BEGIN
+                    SELECT CASE WHEN EXISTS (
+                        SELECT 1 FROM answer_history WHERE decision_id = OLD.id AND event IN ('retry', 'close')
+                    ) THEN RAISE(ABORT, '履歴の追加後に状態更新が失敗')
+                    ELSE RAISE(ABORT, '履歴の追加前に状態を更新') END;
+                END""")
+        for operation in (self.store.retry, self.store.close):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(sqlite3.IntegrityError, '履歴の追加後に状態更新が失敗'):
+                    operation(stopped['id'], self.retry_payload(stopped))
+                self.assertEqual(self.store.get(stopped['id']), stopped)
+                self.assertEqual(self.answer_history(), history)
 
     def test_frozen_clock_cannot_reuse_answer_or_report_expectations(self):
         with patch('app.utc_now', return_value='2026-11-10T00:00:00.000000+00:00'):
