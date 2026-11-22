@@ -131,6 +131,28 @@ herdr plugin link ~/.local/share/cue/current/herdr-plugin
 
 起動済みの Web server と popup は新しい release で開き直します。古い release に戻すときも、DB の形式が対応していることを先に確認してください。release の切り替えだけでは DB の形式や回答は巻き戻りません。
 
+### 公開アーカイブから更新する
+
+GitHub Release の `decision-inbox.tar.gz` には CLI、TUI、Herdr plugin、ビルド済みの Web を含みます。展開先の直下に `app.py` があり、上の手順と同じ構成で使えます。更新の前に `decision-inbox.tar.gz.sha256` と照合してください。
+
+```sh
+shasum -a 256 -c decision-inbox.tar.gz.sha256
+```
+
+アーカイブは空の release ディレクトリに展開します。共有 DB・端末の設定は既存の場所に保持します。
+
+#### 公開の準備
+
+`main` を対象に tagpr が Release PR を作ります。マージ後は同じ workflow がタグの commit をビルドし、公開物とチェックサムを draft に載せてから公開します。通常の PR でも公開物をビルドして内容を検査できます。
+
+このリポジトリに GitHub App をインストールし、Actions の repository variable `APP_CLIENT_ID` と repository secret `APP_PRIVATE_KEY` を設定します。App には Contents と Pull requests の Read and write、および Issues の Read が必要です。設定後、Actions の Release workflow を `main` で実行すると初回の Release PR を作れます。
+
+`APP_CLIENT_ID` が空の間は `main` への push で Release PR を作る処理をスキップします。通常の PR のビルド検証は続きます。手動で `main` の Release workflow を実行して設定が不足していれば、エラーで止まります。
+
+`main` の release run は待機中のものを 100 件まで保持します。上限に達した場合、その後の run は取り消されます。
+
+公開が途中で失敗した場合は、その回の workflow run で失敗した job だけを再実行します (`gh run rerun <run-id> --failed`)。全 job の再実行や、後続の `main` からの手動実行では、その回の draft を回収しません。
+
 ## 依頼と回答の受け渡し
 
 次の内容を `request.json` として保存し、投入します。登録後は API / CLI の両方で同じ DB を扱えます。

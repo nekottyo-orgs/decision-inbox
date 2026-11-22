@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  queue: max
+
+jobs:
+  tagpr:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && vars.APP_CLIENT_ID != ''))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tagpr.outputs.tag }}
+    steps:
+      - name: Check the release App configuration
+        env:
+          APP_CONFIGURED: ${{ vars.APP_CLIENT_ID != '' && secrets.APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$APP_CONFIGURED" != true ]; then
+            echo "::error::Set APP_CLIENT_ID and APP_PRIVATE_KEY before releasing."
+            exit 1
+          fi
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Songmu/tagpr@047aec4b6c0ce166f52958b5a97f5a3d927fd65b # v1.22.0
+        id: tagpr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  build:
+    needs: tagpr
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.tagpr.outputs.tag != '') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tagpr.outputs.tag && format('refs/tags/{0}', needs.tagpr.outputs.tag) || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record source revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test
+        run: python3 -m unittest discover -s tests
+      - name: Package
+        run: bash scripts/package-release.sh "${RUNNER_TEMP}/cue-assets"
+      - name: Smoke test the archive
+        run: |
+          extracted=$(mktemp -d)
+          trap 'rm -rf "$extracted"' EXIT
+          tar -xzf "$RUNNER_TEMP/cue-assets/decision-inbox.tar.gz" -C "$extracted"
+          cd "$extracted"
+          ln -s app.py decision-inbox
+          ./decision-inbox --db "$extracted/queue.sqlite3" list | jq -e '.decisions == []'
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+          from threading import Thread
+          from urllib.request import urlopen
+          from app import make_server
+
+          with make_server(Path("queue.sqlite3").resolve(), port=0) as server:
+              thread = Thread(target=server.serve_forever, daemon=True)
+              thread.start()
+              try:
+                  for path in ("/", "/assets/app.css", "/assets/app.js", "/api/decisions"):
+                      with urlopen(f"http://127.0.0.1:{server.server_port}{path}", timeout=5) as response:
+                          contents = response.read()
+                          assert response.status == 200 and contents, path
+                          if path == "/api/decisions":
+                              assert json.loads(contents)["decisions"] == []
+              finally:
+                  server.shutdown()
+                  thread.join()
+          PYTHON
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: needs.tagpr.outputs.tag != ''
+        with:
+          name: cue-release-assets
+          path: ${{ runner.temp }}/cue-assets/
+          if-no-files-found: error
+
+  publish:
+    needs: [tagpr, build]
+    if: needs.tagpr.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.tagpr.outputs.tag }}
+      SOURCE_SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cue-release-assets
+      - name: Publish the verified draft release
+        run: |
+          shasum -a 256 -c decision-inbox.tar.gz.sha256
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$SOURCE_SHA"
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          case "$draft" in
+            true) gh release upload "$TAG" decision-inbox.tar.gz decision-inbox.tar.gz.sha256 --clobber ;;
+            false) ;; # Retrying this job in the original run may find an already-published release.
+            *) echo "Unexpected draft status: $draft" >&2; exit 1 ;;
+          esac
+          assets=$(gh release view "$TAG" --json assets)
+          jq -e '[.assets[].name] | sort == ["decision-inbox.tar.gz", "decision-inbox.tar.gz.sha256"]' <<<"$assets"
+          for asset in decision-inbox.tar.gz decision-inbox.tar.gz.sha256; do
+            digest=$(shasum -a 256 "$asset" | cut -d ' ' -f 1)
+            jq -e --arg name "$asset" --arg digest "sha256:$digest"               'any(.assets[]; .name == $name and .digest == $digest)' <<<"$assets"
+          done
+          if [ "$draft" = true ]; then
+            gh release edit "$TAG" --draft=false
+          fi
