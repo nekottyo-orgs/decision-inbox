@@ -147,6 +147,8 @@ shasum -a 256 -c decision-inbox.tar.gz.sha256
 
 このリポジトリに GitHub App をインストールし、Actions の repository variable `APP_CLIENT_ID` と repository secret `APP_PRIVATE_KEY` を設定します。App には Contents と Pull requests の Read and write、および Issues の Read が必要です。設定後、Actions の Release workflow を `main` で実行すると初回の Release PR を作れます。
 
+`APP_CLIENT_ID` が空の間は `main` への push で Release PR を作る処理をスキップします。通常の PR のビルド検証は続きます。手動で `main` の Release workflow を実行して設定が不足していれば、エラーで止まります。
+
 ## 依頼と回答の受け渡し
 
 次の内容を `request.json` として保存し、投入します。登録後は API / CLI の両方で同じ DB を扱えます。
