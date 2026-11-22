@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 MAX_BODY = 131072
 ASSETS = {'/assets/demo-flow.svg': ('assets/demo-flow.svg', 'image/svg+xml')}
 LANES = {'todo': '未着手', 'human_decision': '人の判断待ち', 'worker': 'worker 作業中', 'human_action': '人の操作待ち', 'done': '完了'}
-RECONCILE_HELP = 'reconciler だけが使う。lane と機械の欄 (machine) を同時に書く。remaining は変えない。lane を書く経路はこれだけ。--from を付けると今の lane が一致するときだけ書く (一致しなければ exit 3)'
+RECONCILE_HELP = 'reconciler だけが使う。lane と機械の欄 (machine) を同時に書く。remaining は変えない。lane を書く経路はこれだけ。指定した --from 系の条件が一致するときだけ書く (一致しなければ exit 3)'
 LANE_REFUSED = 'lane は reconciler が書く。手で打っても次の reconcile が派生値に戻す'
 # lane と machine は reconciler 専用 (reconcile_lane だけが書く) なので、add / update の項目に入れない
 TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'decision_id', 'kind', 'done_when')
@@ -44,7 +44,7 @@ class AppError(Exception):
 
 
 class LaneConflict(AppError):
-    """reconcile-lane --from の lane 違い。409 は他の断りにも使うので、CLI が exit 3 に分けるための専用の型"""
+    """reconcile-lane の比較条件の不一致。409 は他の断りにも使うので、CLI が exit 3 に分けるための専用の型"""
 
 
 def utc_now():
@@ -693,25 +693,49 @@ class Store:
             connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?', (*item.values(), utc_now(), identifier))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
-    def reconcile_lane(self, identifier, lane, machine='', expect=None):
-        """lane と機械の欄を同時に書く唯一の経路。remaining には触れない。
-
-        expect があるときは今の lane が一致する場合だけ書く (compare-and-set)。reconciler は古い snapshot で判定するので、
-        その間に別の書き手が進めた lane (窓口の done など) を戻さないために使う。lane 違いは 409 で、task 無しの 404 と分ける"""
-        # lane は必須なので None も 400 (省略可なのは --from だけ)
+    def reconcile_lane(self, identifier, lane, machine='', expect=None, *, pane=None, expect_pane=None,
+                       expect_machine=None, expect_run=None, expect_request=None, expect_kind=None):
+        """reconciler が観測した値が現在も一致する場合だけ、指定された担当の欄をまとめて書く。"""
         for name, value, optional in (('lane', lane, False), ('--from', expect, True)):
             if value not in LANES and not (optional and value is None):
                 raise AppError(400, f'{name} は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
         machine = text(machine, 'machine', TASK_LIMITS['machine'], empty=True)
+        if pane is not None:
+            text(pane, 'pane', TASK_LIMITS['pane'], empty=True)
+            if any(value is None for value in (expect, expect_pane, expect_machine)):
+                raise AppError(400, '--pane には --from、--from-pane、--from-machine が必要です')
+        scope = (expect_run, expect_request, expect_kind)
+        if scope != (None, None, None) and None in scope:
+            raise AppError(400, '--from-run、--from-request、--from-kind は一緒に指定してください')
+        if expect_kind is not None and expect_kind not in (*TASK_KINDS, ''):
+            raise AppError(400, '--from-kind は ' + ' / '.join(TASK_KINDS) + ' または空文字を指定してください')
+        conditions = {'lane': expect, 'pane': expect_pane, 'machine': expect_machine,
+                      'run': expect_run, 'request': expect_request, 'kind': expect_kind}
+        for key in ('pane', 'machine', 'run', 'request'):
+            if conditions[key] is not None:
+                text(conditions[key], '--from-' + key, TASK_LIMITS[key], empty=True)
+        conditions = {key: value for key, value in conditions.items() if value is not None}
+        where = 'id=?' + ''.join(f' AND {key}=?' for key in conditions)
+        params = (identifier, *conditions.values())
+        assignment = {'lane': lane, 'machine': machine}
+        if pane is not None:
+            assignment['pane'] = pane
+        columns = ','.join(f'{key}=?' for key in assignment)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            # BEGIN IMMEDIATE で書き込み lock を取った後の UPDATE 1 文なので、条件の判定と書き込みの間に他の書き手は入れない
-            where, params = ('id=? AND lane=?', (identifier, expect)) if expect else ('id=?', (identifier,))
-            if not connection.execute(f'UPDATE tasks SET lane=?,machine=?,updated_at=? WHERE {where}', (lane, machine, utc_now(), *params)).rowcount:
+            if pane is not None:
+                # 再試行では現在の担当を確認し、同じ値なら活動時刻を進めず応答する。
+                row = connection.execute(f'SELECT * FROM tasks WHERE {where}', params).fetchone()
+                if row and all(row[key] == value for key, value in assignment.items()):
+                    return dict(row)
+            if not connection.execute(f'UPDATE tasks SET {columns},updated_at=? WHERE {where}',
+                                      (*assignment.values(), utc_now(), *params)).rowcount:
                 current = connection.execute('SELECT lane FROM tasks WHERE id=?', (identifier,)).fetchone()
                 if not current:
                     raise AppError(404, 'task が見つかりません')
-                raise LaneConflict(409, f'lane が違うため書きませんでした (今は {current["lane"]}、--from は {expect})')
+                if conditions.keys() == {'lane'}:
+                    raise LaneConflict(409, f'lane が違うため書きませんでした (今は {current["lane"]}、--from は {expect})')
+                raise LaneConflict(409, 'task が比較条件と一致しないため書きませんでした')
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def delete_task(self, identifier):
@@ -1193,7 +1217,11 @@ def run_task(store, args):
     if args.task_command == 'move':
         return store.update_task(args.id, {'lane': args.lane})
     if args.task_command == 'reconcile-lane':
-        return store.reconcile_lane(args.id, args.lane, args.machine, args.expect)
+        return store.reconcile_lane(
+            args.id, args.lane, args.machine, args.expect, pane=args.pane, expect_pane=args.expect_pane,
+            expect_machine=args.expect_machine, expect_run=args.expect_run,
+            expect_request=args.expect_request, expect_kind=args.expect_kind,
+        )
     if args.task_command == 'update':
         payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision, 'kind': args.kind, 'done_when': args.done_when}
         return store.update_task(args.id, {key: value for key, value in payload.items() if value is not None})
@@ -1611,6 +1639,10 @@ def main(argv=None):
         if name == 'reconcile-lane':
             sub.add_argument('--from', dest='expect', help='書く前の lane。今の lane が違えば何も書かず exit 3 (競合)。省くと lane を確かめずに書く')
             sub.add_argument('--machine', default='', help='機械の欄。停止の疑い (機械判定の日付) や Cue 回答済みの印。省くと空にする')
+            sub.add_argument('--pane', help='更新する pane。--from / --from-pane / --from-machine が必要。空文字で解除')
+            for key in ('pane', 'machine', 'run', 'request', 'kind'):
+                scope_help = '。--from-run / --from-request / --from-kind は一緒に指定' if key in ('run', 'request', 'kind') else ''
+                sub.add_argument('--from-' + key, dest='expect_' + key, help=f'書く前の {key}。空文字も比較する{scope_help}')
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')
@@ -1752,7 +1784,7 @@ def main(argv=None):
     except (AppError, sqlite3.Error, OSError) as error:
         message = str(error) if isinstance(error, AppError) else 'データの読み書きに失敗しました'
         print(json.dumps({'error': message}, ensure_ascii=False), file=sys.stderr)
-        # 競合 (reconcile-lane --from の lane 違い) だけ 3 にし、task 無しなどの 1 と呼び手が分けられるようにする (2 は argparse)
+        # 競合 (reconcile-lane の比較条件の不一致) だけ 3 にし、task 無しなどの 1 と呼び手が分けられるようにする (2 は argparse)
         return 3 if isinstance(error, LaneConflict) else 1
 
 

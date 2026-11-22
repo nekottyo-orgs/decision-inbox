@@ -20,7 +20,15 @@
 
 ```sh
 lean +leanprover/lean4:v4.36.0 proofs/ClaimLease.lean
+lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 実装テストでは、SQLite の独立した接続から競合して claim したときの勝者、期限ちょうどと再取得後の旧 token、古い停止報告、短い renew を照合する。関連ファイルの変更では、CI が上記と同じ証明と実装テストを実行する。
+
+
+## 担当を更新する条件
+
+[TaskAssignment.lean](TaskAssignment.lean) は、旧 lane・pane・machine と、指定があれば旧 run・request・kind が一致したときだけ担当を更新できることを検査する。一致後に同じ担当を指定すると、モデル上の revision も含めて行はそのままになる。担当が変わる場合も、所属と remaining は保持する。
+
+`Store.reconcile_lane` は `BEGIN IMMEDIATE` で SQLite の書き込みを直列化し、比較条件を `UPDATE` の `WHERE` に入れる。同値の確認も同じ transaction 内で行い、実装では `updated_at` を進めず既存の行を返す。実装テストでは 6 項目それぞれの不一致、空文字の比較、同じ行を観測した 2 つの CLI の競合を検査する。モデルの範囲は Cue 内の 1 行。Herdr の pane 起動・終了と一体の操作にはならない。
