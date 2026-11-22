@@ -9,7 +9,7 @@ description: Cue (decision-inbox) の CLI・TUI・HTTP API、ブラウザの実�
 
 ## 起動
 
-repo のルートで実行する。macOS または Linux の Python 3.9 以降と curses が必要。TUI 経路は Web のビルドを必要としない。Web の場合は [README の起動手順](../../../README.md#起動) に従い、Node.js で UI をビルドしてから `agent-browser` と Chrome / Chromium を用意する。
+repo のルートで実行する。macOS または Linux の Python 3.9 以降、curses、`locale` コマンド、利用可能な UTF-8 ロケールが必要。TUI 経路は Web のビルドを必要としない。Web の場合は [README の起動手順](../../../README.md#起動) に従い、Node.js で UI をビルドしてから `agent-browser` と Chrome / Chromium を用意する。
 
 ```sh
 run_evidence=$(mktemp -d /tmp/cue-proof.XXXXXXXX)

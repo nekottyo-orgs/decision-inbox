@@ -35,6 +35,20 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def utf8_locale(env):
+    try:
+        available = subprocess.check_output(['locale', '-a'], env={**env, 'LC_ALL': 'C'},
+                                            text=True, encoding='utf-8', timeout=5).splitlines()
+        for candidate in dict.fromkeys(['en_US.UTF-8', 'C.UTF-8', *available]):
+            charmap = subprocess.run(['locale', 'charmap'], env={**env, 'LC_ALL': candidate},
+                                     capture_output=True, text=True, encoding='utf-8', timeout=5)
+            if charmap.returncode == 0 and charmap.stdout.strip().lower().replace('-', '') == 'utf8':
+                return candidate
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Unavailable('UTF-8 ロケールを確認できません') from error
+    raise Unavailable('利用できる UTF-8 ロケールがありません')
+
+
 def journey(mode, evidence, state, record):
     def run(command, *, capture=True):
         record('command', argv=command)
@@ -84,7 +98,6 @@ def journey(mode, evidence, state, record):
         'TMPDIR': str(state),
         'HERDR_SOCKET_PATH': str(state / 'herdr.sock'),
         'TERM': 'xterm-256color',
-        'LANG': 'en_US.UTF-8',
         'PYTHONUTF8': '1',
         'PYTHONDONTWRITEBYTECODE': '1',
     }
@@ -115,6 +128,8 @@ def journey(mode, evidence, state, record):
                                          cwd=REPO, text=True).splitlines()
         if hashes != list(blobs.values()):
             raise Unavailable('実行対象に未コミットの変更があり、HEAD の内容と一致しません')
+        env['LANG'] = utf8_locale(env)
+        record('locale', lang=env['LANG'])
         with socket.socket() as can_bind:
             try:
                 can_bind.bind(('127.0.0.1', 0))
@@ -190,7 +205,10 @@ def journey(mode, evidence, state, record):
 
 
 def answer_in_tui(start, record, evidence, command):
-    master, slave = os.openpty()
+    try:
+        master, slave = os.openpty()
+    except OSError as error:
+        raise Unavailable(f'この環境では PTY を確保できません: {error}') from error
     try:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
         with (evidence / 'tui.ansi').open('wb') as transcript:
