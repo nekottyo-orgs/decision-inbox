@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import Store, main, watch_ready
+from app import SCHEMA, Store, main, watch_ready
 from test_app import request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,7 @@ class WatchTests(unittest.TestCase):
 
     def test_ready_excludes_unanswered_completed_and_active_leases_without_writing(self):
         self.store.add(request_payload())
+        pending = self.store.add(request_payload())['id']
         completed = self.answered()
         with patch('app.time.time', return_value=1000):
             claim = self.store.claim('done')
@@ -40,14 +41,41 @@ class WatchTests(unittest.TestCase):
             self.store.claim('active', 100)
             expired = self.answered()
             self.store.claim('expired', 5)
-        pending = self.answered()
+        self.store.answer(pending, {'choice': 'minimal'})
         before = self.db.read_bytes()
         readonly = Store(self.db, readonly=True)
-        with patch('app.time.time', return_value=1006):
+        with patch('app.time.time', return_value=1004):
+            self.assertEqual(readonly.ready(), [pending])
+        with patch('app.time.time', return_value=1005):
             self.assertEqual(readonly.ready(), [expired, pending])
         with self.assertRaises(sqlite3.OperationalError):
             readonly.add(request_payload())
         self.assertEqual(self.db.read_bytes(), before)
+
+    def test_opening_old_database_preserves_an_existing_answer_and_claim(self):
+        path = self.db.with_name('old.sqlite3')
+        identifier = 'a' * 32
+        recorded_at = '2026-01-01T00:00:00+00:00'
+        request = request_payload()
+        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(SCHEMA)
+            connection.execute('PRAGMA user_version=2')
+            connection.execute('''INSERT INTO decisions
+                (id,created_at,payload,choice,memo,decided_at,status,worker,token,lease_until)
+                VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                (identifier, recorded_at, json.dumps(request), 'minimal', '旧 DB の回答',
+                 recorded_at, 'processing', 'old-worker', 'old-token', 1005))
+
+        store = Store(path)
+        item, = store.list()
+        self.assertEqual((item['id'], item['title']), (identifier, request['title']))
+        answer = item['answer']
+        self.assertEqual((answer['choice'], answer['memo'], answer['decided_at']),
+                         ('minimal', '旧 DB の回答', recorded_at))
+        self.assertEqual((answer['status'], answer['lease_until']), ('processing', 1005))
+        with patch('app.time.time', return_value=1004):
+            self.assertEqual(store.ready(), [])
+            self.assertEqual(store.complete(identifier, 'old-token')['answer']['status'], 'completed')
 
     def test_watch_emits_only_newly_ready_ids_and_reappearing_ids(self):
         store = SimpleNamespace(ready=Mock(side_effect=[['a'], ['a'], [], ['a', 'b'], ['a', 'b']]))

@@ -415,6 +415,7 @@ class Store:
             connection.execute('''CREATE TABLE IF NOT EXISTS decision_changes (
                 id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
                 recorded_at TEXT NOT NULL, note TEXT NOT NULL, before TEXT)''')
+            connection.execute("CREATE INDEX IF NOT EXISTS decision_changes_withdrawn ON decision_changes(decision_id) WHERE event='withdraw'")
             # runs も同じく IF NOT EXISTS で足すだけで、user_version は上げない (理由は tasks と同じ)。
             # 開いた行 = closed_at が NULL。同じ run_id と role の開いた行は 1 つだけにする
             connection.execute('''CREATE TABLE IF NOT EXISTS runs (
