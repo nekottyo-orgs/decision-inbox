@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +33,10 @@ TASK_KINDS = ('decision', 'monitor', 'research', 'implement')
 SESSION_ROLES = ('frontdesk', 'worker', 'cue_worker')
 SESSION_CLIS = ('claude', 'codex')
 SESSION_CLOSE_REASONS = ('normal', 'replaced', 'crashed', 'closed')
+POST_STATES = ('unreceived', 'received')
+POST_CLASSIFICATIONS = ('expected', 'unexpected')
+# 人待ち理由で止まっている lane。投稿の分類 (想定内) は投稿時点のこの集合から導く (設計 Q13)
+WAITING_LANES = ('human_decision', 'human_action')
 # add の再送判定で比べる登録内容。result / remaining / decision_id は update で進むので比べない
 TASK_IDENTITY = ('title', 'request', 'pane', 'run')
 TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000, 'machine': 500, 'done_when': 1000}
@@ -449,6 +453,16 @@ class Store:
                 opened_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT NOT NULL DEFAULT '')''')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_native ON sessions(cli, native_session_id) WHERE closed_at IS NULL')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_slot ON sessions(run_id, role, pane, socket) WHERE closed_at IS NULL')
+            # posts も同じく IF NOT EXISTS で足すだけ (理由は tasks / runs と同じ)。依頼 thread への人の投稿を
+            # 配送試行として記録する。状態遷移は proofs/DeliveryAttempt.lean で形式化済み
+            connection.execute('''CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, body TEXT NOT NULL,
+                classification TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unreceived',
+                target_run TEXT NOT NULL DEFAULT '', target_pane TEXT NOT NULL DEFAULT '',
+                target_socket TEXT NOT NULL DEFAULT '', target_session TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL, received_at TEXT, received_by TEXT NOT NULL DEFAULT '')''')
+            connection.execute('CREATE INDEX IF NOT EXISTS posts_task ON posts(task_id, id)')
+            connection.execute("CREATE INDEX IF NOT EXISTS posts_unreceived ON posts(state) WHERE state='unreceived'")
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -984,6 +998,95 @@ class Store:
             rows = connection.execute('SELECT * FROM messages WHERE run_id=?' + ('' if state is None else ' AND state=?') + ' ORDER BY id', (run_id,) if state is None else (run_id, state))
             return {'messages': [dict(row) for row in rows]}
 
+    def affiliation(self):
+        """所属記録の観測用に runs と sessions の全行を返す (Board の所属マップと run タイムライン)。"""
+        with self.db() as connection:
+            runs = [dict(row) for row in connection.execute('SELECT * FROM runs ORDER BY id')]
+            sessions = [dict(row) for row in connection.execute('SELECT * FROM sessions ORDER BY id')]
+        return {'runs': runs, 'sessions': sessions}
+
+    def posts(self, task_id=None):
+        with self.db() as connection:
+            if task_id is None:
+                rows = connection.execute('SELECT * FROM posts ORDER BY id')
+            else:
+                rows = connection.execute('SELECT * FROM posts WHERE task_id=? ORDER BY id', (task_id,))
+            return {'posts': [dict(row) for row in rows]}
+
+    def unread(self):
+        """未読は新しい仕組みではなく既存状態の表示: 未受領の配送試行と未回答の判断待ちの件数 (設計 Q9)。"""
+        with self.db() as connection:
+            posts = connection.execute("SELECT COUNT(*) FROM posts WHERE state='unreceived'").fetchone()[0]
+        decisions = sum(1 for item in self.list() if item['answer'] is None)
+        return {'posts': posts, 'decisions': decisions}
+
+    def create_post(self, task_id, payload):
+        """依頼 thread への人の投稿を配送試行として記録する (設計 Q6 / Q12 / Q13)。
+
+        分類は投稿時点の lane が人待ちかどうかだけから導き、投稿者は選ばない。宛先は
+        所属記録上の現在の担当 worker (対象 run の開いた worker / cue_worker session の
+        うち最後に開いた行) を写す。担当不在なら宛先なしで、未受領のまま残る。
+        状態遷移の性質は proofs/DeliveryAttempt.lean で検査済み。
+        """
+        object_fields(payload, ('body',), ())
+        body = text(payload['body'], 'body', 4000)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            task = connection.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not task:
+                raise AppError(404, 'task が見つかりません')
+            classification = 'expected' if task['lane'] in WAITING_LANES else 'unexpected'
+            target = {'target_run': '', 'target_pane': '', 'target_socket': '', 'target_session': ''}
+            if task['run']:
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE run_id=? AND role IN ('worker','cue_worker') AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
+                    (task['run'],)).fetchone()
+                if session:
+                    target = {'target_run': session['run_id'], 'target_pane': session['pane'],
+                              'target_socket': session['socket'], 'target_session': session['native_session_id']}
+            cursor = connection.execute(
+                'INSERT INTO posts(task_id,body,classification,state,target_run,target_pane,target_socket,target_session,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                (task_id, body, classification, 'unreceived', target['target_run'], target['target_pane'],
+                 target['target_socket'], target['target_session'], utc_now()))
+            return dict(connection.execute('SELECT * FROM posts WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+    def receive_post(self, post_id, payload):
+        """配送試行の受領を記録する。完全 Pull 配送側が宛先 worker の受領を確認したときに呼ぶ接続点で、
+        worker inbox ファイルへの実体化は Cue の外にある。受領済みへの再受領は 409
+        (proofs/DeliveryAttempt.lean の receivedIsTerminal)。"""
+        object_fields(payload, (), ('received_by',))
+        received_by = text(payload.get('received_by', ''), 'received_by', 200, empty=True)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+            if not row:
+                raise AppError(404, '配送試行が見つかりません')
+            if row['state'] != 'unreceived':
+                raise AppError(409, 'この配送試行は受領済みです')
+            connection.execute("UPDATE posts SET state='received', received_at=?, received_by=? WHERE id=? AND state='unreceived'",
+                               (utc_now(), received_by, post_id))
+            return dict(connection.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone())
+
+    def thread(self, task_id):
+        """依頼 thread の材料を返す。task と、その run の所属記録 (sessions)、窓口が受けた
+        msg (本文は持たずメタデータと状態だけ)、この task への投稿 (配送試行) を分けて返し、
+        時系列への混合は表示側が行う (設計 Q7 / Q14)。判断は tasks() と同じ要約の形。"""
+        with self.db() as connection:
+            row = connection.execute('''SELECT tasks.*, decisions.payload AS decision_payload, decisions.choice AS decision_choice,
+                EXISTS(SELECT 1 FROM decision_changes WHERE decision_id=tasks.decision_id AND event='withdraw') AS decision_withdrawn
+                FROM tasks LEFT JOIN decisions ON decisions.id=tasks.decision_id WHERE tasks.id=?''', (task_id,)).fetchone()
+            if not row:
+                raise AppError(404, 'task が見つかりません')
+            task = dict(row)
+            payload, choice, withdrawn = task.pop('decision_payload'), task.pop('decision_choice'), task.pop('decision_withdrawn')
+            task['decision'] = {'title': json.loads(payload)['title'], 'answered': choice is not None, 'withdrawn': bool(withdrawn)} if payload else None
+            messages, sessions = [], []
+            if task['run']:
+                messages = [dict(item) for item in connection.execute('SELECT * FROM messages WHERE run_id=? ORDER BY id', (task['run'],))]
+                sessions = [dict(item) for item in connection.execute('SELECT * FROM sessions WHERE run_id=? ORDER BY id', (task['run'],))]
+            posts = [dict(item) for item in connection.execute('SELECT * FROM posts WHERE task_id=? ORDER BY id', (task_id,))]
+        return {'task': task, 'messages': messages, 'posts': posts, 'sessions': sessions}
+
     def tasks(self, lane=None):
         if lane is not None and lane not in LANES:
             raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
@@ -1118,11 +1221,24 @@ def seed_demo(store):
         ('導入ガイドの見せ方を選ぶ', 'サポートチーム', 'later', '詳しい手順をどこに置くか決めてください。', '問い合わせの多い手順は 4 ステップです。'),
         ('出力ファイルの既定形式を選ぶ', '分析チーム', 'normal', '既存の連携を踏まえて既定形式を決めてください。', '自動処理で利用するお客様がいます。')
     ]
+    added = []
     for index, (title, source, priority, reason, background) in enumerate(names):
         item = store.add({'title': title, 'source': source, 'priority': priority, 'reason': reason, 'background': background, 'urgency_reason': '修正方針が決まるまでレビューが停止中' if index == 0 else '', 'options': [{'id': 'minimal', 'title': '影響範囲を限定して進める', 'benefits': '確認範囲を絞れる', 'concerns': '追加作業が残る'}, {'id': 'full', 'title': '今回まとめて対応する', 'benefits': '残作業を減らせる', 'concerns': '公開が遅れる可能性'}], 'recommended': 'minimal', 'recommendation': '現在の作業への影響を限定するため。', 'links': [{'url': 'https://github.com/example/repo/pull/1', 'label': '対象の PR (デモ)', 'kind': 'pr'}, {'url': 'https://github.com/example/repo/issues/2', 'label': '関連 issue (デモ)', 'kind': 'issue'}] if index == 0 else [], 'image': {'url': '/assets/demo-flow.svg', 'alt': '必要な修正を確認し、公開後に共通化を進める流れ'} if index == 0 else None})
+        added.append(item)
         if index == 3:
             store.answer(item['id'], {'choice': 'minimal', 'memo': '既存の連携を優先'})
             store.claim('demo-worker', 300)
+    # Board (所属マップ・依頼 thread・配送試行) のデモ。1 件目の判断に依頼を紐付け、同じ run に窓口と worker の所属を載せる
+    store.open_run({'run_id': 'run-demo-1', 'role': 'frontdesk', 'pane': 'w1:p1', 'socket': '/tmp/demo.sock'})
+    store.open_session({'run_id': 'run-demo-1', 'role': 'frontdesk', 'pane': 'w1:p1', 'socket': '/tmp/demo.sock', 'cli': 'claude', 'native_session_id': 'uuid-demo-frontdesk'})
+    store.open_session({'run_id': 'run-demo-1', 'role': 'worker', 'req_id': 'demo-decision', 'pane': 'w1:p2', 'socket': '/tmp/demo.sock', 'cli': 'claude', 'native_session_id': 'uuid-demo-worker'})
+    task = store.add_task({'id': 'demo-decision', 'title': 'レビュー指摘への対応判断', 'kind': 'decision', 'done_when': '判断への回答が記録される', 'request': '窓口 run-demo-1', 'pane': 'w1:p2', 'run': 'run-demo-1', 'decision_id': added[0]['id']})
+    store.reconcile_lane(task['id'], 'human_decision')
+    store.import_message({'run_id': 'run-demo-1', 'msg': '1-1730000000000000-report-w1:p1-ab12.msg', 'state': 'held', 'wait': f"decision={added[0]['id']}", 'req': 'demo-decision'})
+    store.create_post('demo-decision', {'body': '判断待ちの件、確認しました。推奨どおり影響範囲を限定する方向でお願いします。'})
+    other = store.add_task({'id': 'demo-implement', 'title': '所属記録の読み取り API を実装する', 'kind': 'implement', 'done_when': 'https://github.com/example/repo/pull/42 が merge される', 'request': '窓口 run-demo-1', 'pane': 'w1:p2', 'run': 'run-demo-1'})
+    store.reconcile_lane(other['id'], 'worker')
+    store.create_post('demo-implement', {'body': '進み具合を教えてください。'})
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -1196,6 +1312,15 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/tasks':
                     # 書き込みは CLI に一本化しているので、HTTP は一覧の GET だけを出す
                     return self.json_response(200, task_lanes(store))
+                if path == '/api/board':
+                    board = store.affiliation()
+                    board['posts'] = store.posts()['posts']
+                    board['unread'] = store.unread()
+                    board['demo'] = self.server.demo
+                    return self.json_response(200, board)
+                match = re.fullmatch(r'/api/tasks/(.+)/thread', path)
+                if match:
+                    return self.json_response(200, store.thread(unquote(match[1])))
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})', path)
                 if match:
                     return self.json_response(200, store.get(match[1]))
@@ -1222,6 +1347,12 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.body()
                 if path == '/api/decisions':
                     return self.json_response(201, store.add(payload))
+                match = re.fullmatch(r'/api/tasks/(.+)/posts', path)
+                if match:
+                    return self.json_response(201, store.create_post(unquote(match[1]), payload))
+                match = re.fullmatch(r'/api/posts/([0-9]+)/receive', path)
+                if match:
+                    return self.json_response(200, store.receive_post(int(match[1]), payload))
                 if path == '/api/claim':
                     object_fields(payload, ('worker',), ('lease_seconds', 'key_prefix'))
                     if 'key_prefix' in payload and payload['key_prefix'] is None:
