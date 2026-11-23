@@ -14,6 +14,7 @@ inductive Phase where
   | stopped
   | rolledBack
   | lostOwnership
+  deriving DecidableEq
 
 def active : Phase → Active
   | .checkingLive | .applied => .candidate
@@ -24,13 +25,17 @@ def checked : Phase → Bool
   | .checked | .checkingLive | .applied | .rolledBack => true
   | _ => false
 
+def liveOutcome : Bool → Phase
+  | true => .applied
+  | false => .rolledBack
+
 -- The lock serializes attempts. The link update itself is an atomic rename.
 inductive Step : Phase → Phase → Prop where
   | preflightPass : Step .preparing .checked
   | preflightFail : Step .preparing .stopped
   | activate : Step .checked .checkingLive
-  | livePass : Step .checkingLive .applied
-  | liveFail : Step .checkingLive .rolledBack
+  | liveProbe (listenerAndWebMatch : Bool) :
+      Step .checkingLive (liveOutcome listenerAndWebMatch)
   | foreignBeforeActivation : Step .checked .lostOwnership
   | foreignWhileChecking : Step .checkingLive .lostOwnership
 
@@ -51,7 +56,10 @@ theorem failingPreflightKeepsPrevious {after : Phase}
 
 theorem failingLiveCheckRestoresPrevious :
     Step .checkingLive .rolledBack ∧ active .rolledBack = .previous :=
-  ⟨.liveFail, rfl⟩
+  ⟨.liveProbe false, rfl⟩
+
+theorem unmatchedListenerCannotApply : liveOutcome false ≠ .applied := by
+  decide
 
 theorem foreignIsNotOverwritten {after : Phase} (step : Step .lostOwnership after) : False := by
   cases step

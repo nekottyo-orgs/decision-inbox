@@ -200,40 +200,60 @@ def restart(args, current, expected, db):
     return previous_pid
 
 
-def verify_restarted(args, current, expected, db, release, previous_pid):
-    require_current(current, expected)
-    web_check(release, args.port)
-    pid = verify_service(args, current, db)
-    if pid is None or pid == previous_pid:
-        raise UpdateError('Cue LaunchAgent did not start a new process')
-    require_current(current, expected)
+def owns_listener(pid, port):
+    result = subprocess.run(
+        ['lsof', '-nP', '-a', '-p', str(pid), f'-iTCP:{port}', '-sTCP:LISTEN', '-Fn'],
+        capture_output=True, text=True, timeout=3,
+    )
+    fields = set(result.stdout.splitlines())
+    return (result.returncode == 0 and f'p{pid}' in fields
+            and {line for line in fields if line.startswith('n')} == {f'n127.0.0.1:{port}'})
 
 
-def web_check(release, port):
+def web_matches(expected, port):
+    try:
+        actual = {}
+        for url in ('/api/decisions', *expected):
+            connection = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+            try:
+                connection.request('GET', url)
+                response = connection.getresponse()
+                if response.status != 200:
+                    return False
+                actual[url] = response.read()
+            finally:
+                connection.close()
+        return (isinstance(json.loads(actual['/api/decisions']).get('decisions'), list)
+                and all(actual[url] == content for url, content in expected.items()))
+    except (OSError, http.client.HTTPException, ValueError, AttributeError):
+        return False
+
+
+def verify_web_process(args, current, expected_link, db, release, previous_pid=None):
     files = {'/': 'index.html', '/assets/app.js': 'assets/app.js', '/assets/app.css': 'assets/app.css'}
     expected = {url: (release / 'frontend/dist' / path).read_bytes()
                 for url, path in files.items()}
     until = time.monotonic() + 15
     while True:
-        try:
-            actual = {}
-            for url in ('/api/decisions', *files):
-                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
-                try:
-                    connection.request('GET', url)
-                    response = connection.getresponse()
-                    if response.status != 200:
-                        raise UpdateError(f'Cue Web returned HTTP {response.status}')
-                    actual[url] = response.read()
-                finally:
-                    connection.close()
-            if (isinstance(json.loads(actual['/api/decisions']).get('decisions'), list)
-                    and all(actual[url] == content for url, content in expected.items())):
+        require_current(current, expected_link)
+        pid = verify_service(args, current, db)
+        if pid is None or pid == previous_pid:
+            error = 'Cue LaunchAgent did not start a new process' if previous_pid else 'Cue LaunchAgent is not running'
+        elif not owns_listener(pid, args.port):
+            error = 'Cue LaunchAgent does not own the Web listener'
+        else:
+            require_current(current, expected_link)
+            matches = web_matches(expected, args.port)
+            require_current(current, expected_link)
+            if verify_service(args, current, db) != pid or not owns_listener(pid, args.port):
+                error = 'Cue Web process or listener changed during the check'
+            elif matches:
+                require_current(current, expected_link)
                 return
-        except (OSError, http.client.HTTPException, ValueError, AttributeError, UpdateError):
-            pass
+            else:
+                error = 'Cue Web did not serve the expected page, API and assets'
         if time.monotonic() >= until:
-            raise UpdateError('Cue Web did not serve the expected page, API and assets')
+            raise UpdateError(error)
         time.sleep(0.25)
 
 
@@ -256,7 +276,7 @@ def switch(current, target, previous, temporary):
 
 def activate(args, cli, current, previous_target, old, candidate, temporary, db):
     verify_plugin(old)
-    web_check(old, args.port)
+    verify_web_process(args, current, previous_target, db, old)
     print(f'Previous release: {old}\nCandidate release: {candidate}', flush=True)
     candidate_target = str(candidate)
     switched = False
@@ -268,7 +288,7 @@ def activate(args, cli, current, previous_target, old, candidate, temporary, db)
         require_current(current, candidate_target)
         relink(candidate)
         previous_pid = restart(args, current, candidate_target, db)
-        verify_restarted(args, current, candidate_target, db, candidate, previous_pid)
+        verify_web_process(args, current, candidate_target, db, candidate, previous_pid)
     except (Exception, KeyboardInterrupt):
         if not switched:
             raise
@@ -284,11 +304,13 @@ def activate(args, cli, current, previous_target, old, candidate, temporary, db)
             relink(old)
         finally:
             previous_pid = restart(args, current, previous_target, db)
-            verify_restarted(args, current, previous_target, db, old, previous_pid)
+            verify_web_process(args, current, previous_target, db, old, previous_pid)
         raise
 
 
 def update(args):
+    if not shutil.which('lsof'):
+        raise UpdateError('lsof is required to verify the Cue Web listener')
     root = args.root.expanduser().resolve(strict=True)
     current = root / 'current'
     releases = root / 'releases'
@@ -330,9 +352,7 @@ def update(args):
                 require_current(current, previous_target)
                 run('CLI could not start', cli, '--help')
                 verify_plugin(candidate)
-                web_check(candidate, args.port)
-                if verify_service(args, current, db) is None:
-                    raise UpdateError('The specified Cue LaunchAgent is not running')
+                verify_web_process(args, current, previous_target, db, candidate)
                 require_current(current, previous_target)
                 print(f'Already active: {args.tag} ({commit})')
                 return

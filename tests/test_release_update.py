@@ -106,6 +106,17 @@ if not os.getenv('CUE_TEST_RESTART_NOOP') or (root / 'cue/current').resolve().na
     pid = root / 'service-pid'
     pid.write_text(str(int(pid.read_text()) + 1))
 ''')
+        self.stub('lsof', '''
+pid = sys.argv[sys.argv.index('-p') + 1]
+if pid != (root / 'service-pid').read_text():
+    sys.exit(1)
+if os.getenv('CUE_TEST_UNBOUND_RESTART') and (root / 'cue/current').resolve().name != 'old':
+    sys.exit(1)
+port = os.environ['CUE_TEST_PORT']
+print(f'p{pid}')
+print('f3')
+print(f'n127.0.0.1:{port}')
+''')
         (self.temp / 'service-pid').write_text('1000')
         (self.temp / 'plugin').write_text(str(self.old / 'herdr-plugin'))
         self.make_archive()
@@ -265,6 +276,14 @@ if not os.getenv('CUE_TEST_RESTART_NOOP') or (root / 'cue/current').resolve().na
         result = self.update(self.start_web())
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('LaunchAgent did not start a new process', result.stderr)
+        self.assertIn('Restored previous current link', result.stderr)
+        self.assert_preserved()
+
+    def test_matching_web_from_another_process_is_not_success(self):
+        self.env['CUE_TEST_UNBOUND_RESTART'] = '1'
+        result = self.update(self.start_web())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Cue LaunchAgent does not own the Web listener', result.stderr)
         self.assertIn('Restored previous current link', result.stderr)
         self.assert_preserved()
 
