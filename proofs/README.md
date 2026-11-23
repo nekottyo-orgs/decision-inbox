@@ -25,8 +25,21 @@ lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
 lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
 lean +leanprover/lean4:v4.36.0 proofs/SessionRegistry.lean
 lean +leanprover/lean4:v4.36.0 proofs/ReleaseSwitch.lean
+lean +leanprover/lean4:v4.36.0 proofs/DeliveryAttempt.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+## 配送試行の投稿と受領
+
+[DeliveryAttempt.lean](DeliveryAttempt.lean) は、依頼 thread への人の投稿 (`posts` 表) について、投稿と受領の状態遷移を検査する。投稿は常に対象の依頼が人待ち理由で止まっているかという文脈だけから分類 (`expected` / `unexpected`、想定内 / 想定外) を導いて未受領で生まれ、投稿者は分類を選べない。受領は未受領からのみ起き、分類・宛先・投稿時刻を変えず、受領済みは終端で二度目の受領は拒否される。宛先が不在 (`target = none`) の投稿も未受領のまま残り、後から受領できることを `#guard` で検査する。
+
+| モデル | 実装 |
+| --- | --- |
+| `classify` | `Store.create_post` が投稿時点の task の lane (人待ちの lane か) から分類を導く |
+| `post` と `target` | `Store.create_post` が所属記録 (`sessions` 表) の現在の担当 worker を宛先に写し、担当不在なら宛先なしで挿入 |
+| `receive` | `Store.receive_post` が `BEGIN IMMEDIATE` 内で未受領の行だけを受領済みに更新し、受領済みなら 409 で拒否 |
+
+前提は、SQLite の `BEGIN IMMEDIATE` が書き込みを直列化すること。投稿の本文の検査、宛先の解決、HTTP の入力検査は `tests/test_board.py` で検査する。worker inbox ファイルへの実体化は Cue の外 (Pull 配送側) の接続点で、このモデルの対象外。
 
 実装テストでは、SQLite の独立した接続から競合して claim したときの勝者、読み取りロックによる commit 待ちでの失効、commit 失敗時の元の行、再取得後の旧 token、古い停止報告、短い renew を照合する。モデルの時刻は commit 直後の照合時点で、応答の転送時間は含まない。関連ファイルの変更では、CI が上記と同じ証明と実装テストを実行する。
 

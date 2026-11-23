@@ -59,6 +59,17 @@ withdraw は未回答の判断だけを対象にし、DB から行は消さな�
 - `GET /api/decisions` → `{"decisions":[依頼全体...],"demo":false}`
 - `GET /api/decisions/{id}` → 依頼全体
 - `GET /api/tasks` → `{"lanes":[...]}` (`task list --json` と同じ形)
+
+## Board (所属記録の観測と依頼 thread)
+
+Web の board 画面が使う読み取りと、依頼 thread への投稿 (配送試行) の経路。task の id には `/` を含みうるため、パスの残り全体を id として受ける。
+
+- `GET /api/board` → `{"runs":[runs の全行],"sessions":[sessions の全行],"posts":[posts の全行],"unread":{"posts":未受領の配送試行の件数,"decisions":未回答の判断待ちの件数},"demo":false}`。未読は既存状態の表示で、既読管理はしない
+- `GET /api/tasks/{id}/thread` → `{"task":依頼 (判断の要約付き、tasks の一覧と同じ形),"messages":[その run の messages],"posts":[その task への投稿],"sessions":[その run の sessions]}`。messages は本文を持たない (メタデータと状態だけ)。task が無ければ `404`
+- `POST /api/tasks/{id}/posts`、body `{"body":"投稿の本文"}` → `201` と投稿全体。投稿は配送試行として `posts` 表に記録する。分類 (`classification`) は投稿時点の task の lane が人待ち (人の判断待ち・人の操作待ち) なら `expected` (想定内)、それ以外は `unexpected` (想定外) と、文脈だけから導く (投稿者は選べない)。宛先 (`target_*`) は所属記録上の現在の担当 worker (対象 run の開いた worker / cue_worker session のうち最後に開いた行) を写し、担当不在なら空で、投稿は未受領 (`state: "unreceived"`) のまま残る。本文は 1〜4000 文字、未知の項目は `400`、task が無ければ `404`
+- `POST /api/posts/{id}/receive`、body `{}` または `{"received_by":"受領した session の識別子"}` → 受領後の投稿全体。完全 Pull 配送側が宛先 worker の受領を確認したときに呼ぶ接続点で、worker inbox ファイルへの実体化は Cue の外にある。受領済みへの再受領は `409`、投稿が無ければ `404`
+
+投稿全体は `{"id","task_id","body","classification","state","target_run","target_pane","target_socket","target_session","created_at","received_at","received_by"}`。状態遷移 (未受領からのみ受領でき、分類・宛先・投稿時刻は受領で変わらず、受領済みは終端) は `proofs/DeliveryAttempt.lean` で形式化済み。`posts` 表も足すだけで `PRAGMA user_version` は 2 のまま。
 - `POST /api/decisions/{id}/answer`、body `{"choice":"minimal","memo":"任意のメモ","revision":0}` → 保存後の依頼全体。任意の `revision` は表示中の依頼全体の値で、現在の revision と違えば `409` (表示後に内容が更新された)。取り下げ済みは `409`
 
 依頼全体は登録内容に `id/created_at/answer` を加えたもの。未判断の `answer` は null。判断済みは `{"choice":"minimal","memo":"...","decided_at":"UTC ISO 8601","status":"pending","reason":"","next_step":"","reported_at":null,"lease_until":null,"can_undo":true}`。status は `pending/processing/completed/blocked/failed`。`reason/next_step` は consumer の停止理由と次の操作で、依頼側の `reason` とは別。`reported_at` は停止報告の時刻で、停止していなければ null。`lease_until` は claim の lease 期限 (epoch 秒)。claim されていなければ null で、期限を過ぎた processing は再 claim できる。二重判断は `409`、入力は上書きしない。

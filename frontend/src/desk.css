@@ -171,3 +171,94 @@
   .task-lanes { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) { .task-card.changed { animation: none; border-color: var(--desk-accent); } }
+
+/* Board (所属記録の観測と依頼 thread)。見せ方は Vercel Board の inspector に寄せた専用パレットを .board の中に閉じる */
+.board {
+  --b-bg: #000000; --b-subtle: #0a0a0a; --b-hover: #141414; --b-sel: #1c1c1c;
+  --b-fg: #ededed; --b-fg2: #a1a1a1; --b-fg3: #6f6f6f;
+  --b-line: #232323; --b-line2: #3a3a3a;
+  --b-blue: #3291ff; --b-green: #0cce6b; --b-amber: #f5a623; --b-red: #ff6166;
+  display: grid; grid-template-columns: 232px minmax(0, 1fr); align-items: start;
+  border: 1px solid var(--b-line); border-radius: 10px; background: var(--b-bg); color: var(--b-fg);
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-size: 13.5px; line-height: 1.5; color-scheme: dark;
+}
+.board .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.board button { font: inherit; }
+.board-side { position: sticky; top: 0; max-height: 100vh; overflow-y: auto; display: flex; flex-direction: column; padding: 0 10px 10px; border-right: 1px solid var(--b-line); }
+.board-ws { display: flex; align-items: flex-start; gap: 8px; padding: 14px 6px 12px; }
+.board-ws-name { font-size: 14.5px; font-weight: 700; line-height: 1.3; }
+.board-ws-url { font-size: 11px; color: var(--b-fg2); }
+.board-live { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--b-fg2); }
+.board-live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--b-green); }
+.board-nav, .board-chan { appearance: none; display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px; padding: 4px 8px; border: none; border-radius: 5px; background: none; color: var(--b-fg2); font-size: 13.5px; text-align: left; cursor: pointer; }
+.board-nav:hover, .board-chan:hover { color: var(--b-fg); background: var(--b-hover); }
+.board-nav[aria-selected="true"], .board-chan.active { background: var(--b-sel); color: var(--b-fg); font-weight: 600; }
+.board-count { margin-left: auto; font-family: ui-monospace, monospace; font-size: 11px; color: var(--b-fg3); }
+.board-hot, .board-bdg { margin-left: auto; display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--b-fg); color: var(--b-bg); font-family: ui-monospace, monospace; font-size: 10.5px; font-weight: 700; }
+.board-side-label { padding: 18px 8px 6px; font-size: 12px; color: var(--b-fg3); }
+.board-hash { flex: none; font-family: ui-monospace, monospace; font-size: 12.5px; color: var(--b-fg3); }
+.board-cname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board-dot { flex: none; width: 7px; height: 7px; margin-left: auto; border-radius: 50%; background: var(--b-fg3); }
+.board-dot.run { background: var(--b-green); }
+.board-dot.wait { background: var(--b-amber); }
+.board-dot.done { background: var(--b-fg3); }
+.board-bdg { margin-left: 6px; }
+.board-side-foot { display: flex; align-items: center; gap: 8px; margin-top: auto; padding: 16px 6px 4px; color: var(--b-fg2); font-size: 12.5px; }
+.board-main { min-width: 0; padding: 18px 22px 22px; }
+.board-view-title { margin: 0 0 14px; font-size: 16px; font-weight: 700; }
+.board-view-title span { color: var(--b-fg2); font-size: 12.5px; font-weight: 400; }
+.board-feed { display: flex; flex-direction: column; }
+.board-frow { display: flex; gap: 10px; padding: 10px 8px; border-radius: 6px; }
+.board-frow:hover { background: var(--b-subtle); }
+.board-avatar { flex: none; display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--b-line2); border-radius: 6px; background: var(--b-sel); font-size: 11.5px; font-weight: 700; }
+.board-fbody { min-width: 0; flex: 1; }
+.board-fhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 7px; color: var(--b-fg2); font-size: 12.5px; }
+.board-actor { color: var(--b-fg); font-weight: 600; }
+.board-via { color: var(--b-fg2); font-weight: 400; }
+.board-chan { color: var(--b-fg); font-family: ui-monospace, monospace; font-size: 12px; }
+.board-ago { margin-left: auto; color: var(--b-fg3); font-family: ui-monospace, monospace; font-size: 11px; }
+.board-fline { margin-top: 2px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.board-fline.body { font-size: 14px; }
+.board-sub { color: var(--b-fg2); font-size: 12px; }
+.board-pfx { font-family: ui-monospace, monospace; font-size: 12px; color: var(--b-amber); }
+.board-pfx.done { color: var(--b-green); }
+.board-labels { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.board-lab { display: inline-block; padding: 0 6px; border: 1px solid var(--b-line); border-radius: 4px; color: var(--b-fg2); font-size: 10.5px; line-height: 1.8; }
+.board-blocked { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; padding: 7px 9px; border: 1px solid var(--b-line); border-left: 3px solid var(--b-amber); border-radius: 5px; background: #171106; color: #f3cf8a; font-size: 12.5px; }
+.board-btn { padding: 5px 12px; border: 1px solid var(--b-line2); border-radius: 6px; background: var(--b-fg); color: var(--b-bg); font-weight: 600; cursor: pointer; }
+.board-btn:disabled { opacity: .45; cursor: not-allowed; }
+.board-btn.small { padding: 2px 9px; font-size: 12px; }
+.board-kanban { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.board-col { min-width: 0; padding: 10px; border: 1px solid var(--b-line); border-radius: 8px; background: var(--b-subtle); }
+.board-col h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 12.5px; }
+.board-col .board-count { margin-left: auto; }
+.board-card { display: block; width: 100%; margin-bottom: 8px; padding: 9px 10px; border: 1px solid var(--b-line); border-radius: 6px; background: var(--b-bg); color: var(--b-fg); text-align: left; cursor: pointer; }
+.board-card:hover { background: var(--b-hover); }
+.board-card[aria-current="true"] { border-color: var(--b-line2); background: var(--b-sel); }
+.board-card-title { display: block; font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+.board-card-meta { display: block; margin-top: 3px; color: var(--b-fg2); font-size: 11.5px; overflow-wrap: anywhere; }
+.board-timeline { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--b-line); border-radius: 8px; background: var(--b-subtle); }
+.board-timeline h3 { margin: 0 0 8px; font-size: 13px; }
+.board-timeline ol { list-style: none; margin: 0; padding: 0; }
+.board-timeline li { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 6px 0; border-top: 1px solid var(--b-line); font-size: 12.5px; color: var(--b-fg2); }
+.board-timeline li:first-child { border-top: none; }
+.board-open { color: var(--b-green); }
+.board-closed { color: var(--b-fg3); }
+.board-thread-head h3 { margin: 0 0 6px; font-size: 15px; overflow-wrap: anywhere; }
+.board-thread-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.board-note { margin: 8px 0 4px; color: var(--b-fg3); font-size: 12px; }
+.board-marker { margin: 10px 0; padding: 4px 0; border-top: 1px dashed var(--b-line2); color: var(--b-fg3); font-family: ui-monospace, monospace; font-size: 11px; text-align: center; }
+.board-composer { margin-top: 14px; padding: 12px; border: 1px dashed var(--b-line2); border-radius: 8px; }
+.board-composer-label { display: block; margin-bottom: 8px; color: var(--b-fg2); font-size: 12px; }
+.board-composer textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--b-line); border-radius: 6px; background: var(--b-subtle); color: var(--b-fg); font: inherit; resize: vertical; }
+.board-composer-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; color: var(--b-fg3); font-size: 11.5px; }
+.board-post-error { margin: 8px 0 0; color: var(--b-red); font-size: 12.5px; }
+.board-empty { margin: 0; padding: 10px 6px; color: var(--b-fg3); font-size: 12.5px; }
+@media (max-width: 960px) { .board-kanban { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 720px) {
+  .board { grid-template-columns: minmax(0, 1fr); }
+  .board-side { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--b-line); }
+  .board-kanban { grid-template-columns: minmax(0, 1fr); }
+  .board-main { padding: 14px; }
+}
