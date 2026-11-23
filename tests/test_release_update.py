@@ -3,6 +3,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,8 @@ import tarfile
 import tempfile
 from threading import Thread
 import unittest
+
+from test_app import request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 UPDATER = ROOT / 'scripts/update-release.py'
@@ -79,11 +82,31 @@ else:
     print(json.dumps({'result': {'plugins': [plugin]}}))
 ''')
         self.stub('launchctl', r'''
+if sys.argv[1] == 'print':
+    script = ('/tmp/unrelated/app.py' if os.getenv('CUE_TEST_WRONG_SERVICE')
+              else str(root / 'cue/current/app.py'))
+    print('program = ' + sys.executable)
+    print('state = running')
+    print('pid = ' + (root / 'service-pid').read_text())
+    print('arguments = {')
+    for arg in (sys.executable, script, '--db', str(root / 'outside.sqlite3'),
+                'serve', '--port', os.environ.get('CUE_TEST_PORT', '16317')):
+        print('\t' + arg)
+    print('}')
+    sys.exit(0)
 with (root / 'restarts').open('a') as log:
     log.write(' '.join(sys.argv[1:]) + '\n')
+if os.getenv('CUE_TEST_FOREIGN_RESTART'):
+    current = root / 'cue/current'
+    current.unlink()
+    current.symlink_to('releases/foreign')
 if os.getenv('CUE_TEST_RESTART_FAIL') and (root / 'cue/current').resolve().name != 'old':
     sys.exit(2)
+if not os.getenv('CUE_TEST_RESTART_NOOP') or (root / 'cue/current').resolve().name == 'old':
+    pid = root / 'service-pid'
+    pid.write_text(str(int(pid.read_text()) + 1))
 ''')
+        (self.temp / 'service-pid').write_text('1000')
         (self.temp / 'plugin').write_text(str(self.old / 'herdr-plugin'))
         self.make_archive()
 
@@ -133,7 +156,7 @@ if os.getenv('CUE_TEST_RESTART_FAIL') and (root / 'cue/current').resolve().name 
         return subprocess.run([
             sys.executable, UPDATER, 'v0.0.1', '--root', self.root,
             '--cli', self.cli, '--db', self.db, '--service', 'com.example.cue', '--port', str(port),
-        ], env=self.env, text=True, capture_output=True, timeout=45)
+        ], env=dict(self.env, CUE_TEST_PORT=str(port)), text=True, capture_output=True, timeout=45)
 
     def assert_preserved(self):
         self.assertEqual(os.readlink(self.current), 'releases/old')
@@ -203,6 +226,56 @@ if os.getenv('CUE_TEST_RESTART_FAIL') and (root / 'cue/current').resolve().name 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Another release update', result.stderr)
         self.assert_preserved()
+
+
+    def test_candidate_must_show_existing_decisions(self):
+        request = self.temp / 'request.json'
+        request.write_text(json.dumps(request_payload()), encoding='utf-8')
+        subprocess.run([sys.executable, self.old / 'app.py', '--db', self.db, 'add',
+                        '--file', request], check=True, stdout=subprocess.DEVNULL)
+        self.baseline = self.db.read_bytes()
+        app = self.payload / 'app.py'
+        app.write_text(app.read_text().replace(
+            '    raise SystemExit(main())',
+            '    if sys.argv[-2:] == ["list", "--include-withdrawn"]:\n'
+            f"        print({json.dumps(dict(decisions=[], demo=False))!r})\n"
+            '        raise SystemExit(0)\n'
+            '    raise SystemExit(main())',
+        ))
+        self.make_archive()
+        result = self.update(self.start_web())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Candidate did not preserve', result.stderr)
+        self.assert_preserved()
+        self.assertFalse((self.temp / 'changes').exists())
+
+    def test_current_changed_during_restart_is_not_reported_successful(self):
+        foreign = self.root / 'releases/foreign'
+        import shutil
+        shutil.copytree(self.old, foreign)
+        self.env['CUE_TEST_FOREIGN_RESTART'] = '1'
+        result = self.update(self.start_web())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('current changed outside this update', result.stderr)
+        self.assertEqual(self.current.resolve(), foreign.resolve())
+        self.assertEqual(len((self.temp / 'restarts').read_text().splitlines()), 1)
+
+    def test_same_running_pid_after_restart_is_not_success(self):
+        self.env['CUE_TEST_RESTART_NOOP'] = '1'
+        result = self.update(self.start_web())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LaunchAgent did not start a new process', result.stderr)
+        self.assertIn('Restored previous current link', result.stderr)
+        self.assert_preserved()
+
+    def test_wrong_launch_agent_is_not_restarted(self):
+        self.env['CUE_TEST_WRONG_SERVICE'] = '1'
+        result = self.update(self.start_web())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LaunchAgent', result.stderr)
+        self.assert_preserved()
+        self.assertFalse((self.temp / 'changes').exists())
+        self.assertFalse((self.temp / 'restarts').exists())
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ namespace ReleaseSwitch
 inductive Active where
   | previous
   | candidate
+  | foreign
   deriving DecidableEq
 
 inductive Phase where
@@ -12,9 +13,11 @@ inductive Phase where
   | applied
   | stopped
   | rolledBack
+  | lostOwnership
 
 def active : Phase → Active
   | .checkingLive | .applied => .candidate
+  | .lostOwnership => .foreign
   | _ => .previous
 
 def checked : Phase → Bool
@@ -28,6 +31,8 @@ inductive Step : Phase → Phase → Prop where
   | activate : Step .checked .checkingLive
   | livePass : Step .checkingLive .applied
   | liveFail : Step .checkingLive .rolledBack
+  | foreignBeforeActivation : Step .checked .lostOwnership
+  | foreignWhileChecking : Step .checkingLive .lostOwnership
 
 inductive Reachable : Phase → Prop where
   | start : Reachable .preparing
@@ -47,5 +52,8 @@ theorem failingPreflightKeepsPrevious {after : Phase}
 theorem failingLiveCheckRestoresPrevious :
     Step .checkingLive .rolledBack ∧ active .rolledBack = .previous :=
   ⟨.liveFail, rfl⟩
+
+theorem foreignIsNotOverwritten {after : Phase} (step : Step .lostOwnership after) : False := by
+  cases step
 
 end ReleaseSwitch
