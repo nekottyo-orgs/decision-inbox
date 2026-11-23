@@ -92,7 +92,7 @@ function RecordedAnswer({ item, saving, onUndo, onRetry }) {
 export default function DecisionDesk({
   items, counts, selectedItem, view, priority, draft, loading, saving, demo, notice, error,
   detailRef, onViewChange, onPriorityChange, onSelect, onDraftChange, onSubmit, onDefer, onUndo, onRetry,
-  screen, onScreenChange, board, waitingTasks, taskError,
+  screen, onScreenChange, board, waitingTasks, taskError, boardView, boardUnread,
 }) {
   const item = selectedItem;
   const links = item?.links.filter(link => safeUrl(link.url)) || [];
@@ -106,6 +106,7 @@ export default function DecisionDesk({
       <nav className="desk-screens" aria-label="画面の切り替え">
         <button type="button" id="screen-decisions" aria-current={screen === 'decisions' ? 'page' : undefined} disabled={saving} onClick={() => onScreenChange('decisions')}>判断<span className="tab-count">{counts.pending}</span></button>
         <button type="button" id="screen-tasks" aria-current={screen === 'tasks' ? 'page' : undefined} disabled={saving} onClick={() => onScreenChange('tasks')}>task<span className="tab-count" title="人の判断待ちと人の操作待ちの件数">人待ち {waitingTasks}</span></button>
+        <button type="button" id="screen-board" aria-current={screen === 'board' ? 'page' : undefined} disabled={saving} onClick={() => onScreenChange('board')}>board<span className="tab-count" title="未受領の配送試行と未回答の判断待ちの件数">未読 {boardUnread ? boardUnread.posts + boardUnread.decisions : 0}</span></button>
       </nav>
       <span id="mode-label"><Badge label={demo ? 'ローカルデモ' : 'ローカル'} variant="neutral" /></span>
     </header>
@@ -113,7 +114,10 @@ export default function DecisionDesk({
       <p id="mode-notice" className="mode-notice">{demo ? 'デモ専用の一時データです。実際の依頼や処理キューとは分離されています。' : '判断はこの端末に保存されます。回答後の処理は、依頼元が引き受けます。'}</p>
       <div id="notice" className="desk-notice" role="status" aria-live="polite" aria-atomic="true">{notice}</div>
       <div id="error" className="desk-error" role="alert" hidden={!error}>{error}</div>
-      {screen === 'tasks' ? <>
+      {screen === 'board' ? <>
+        {boardView}
+        <footer className="desk-footer">所属記録・msg・配送試行はこの端末の DB の表示です。依頼 thread への投稿は配送試行として記録され、分類は文脈から自動で付きます。worker 操作 (claim / complete) はこの画面にありません。</footer>
+      </> : screen === 'tasks' ? <>
         <div id="task-error" className="desk-error" role="alert" hidden={!taskError}>{taskError}</div>
         {board}
         <footer className="desk-footer">task は CLI (task add / move / update) で更新します。この画面は読み取り専用で、5 秒ごとに最新の状態を取り込みます。</footer>

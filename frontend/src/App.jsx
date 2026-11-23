@@ -1,4 +1,5 @@
 import {useEffect, useLayoutEffect, useRef, useState} from 'react';
+import Board from './Board.jsx';
 import DecisionDesk from './DecisionDesk.jsx';
 import TaskBoard from './TaskBoard.jsx';
 
@@ -29,8 +30,10 @@ export default function App() {
     cases: [], view: 'pending', priority: 'all', selectedItem: null,
     draft: emptyDraft(), loading: true, saving: false, demo: false,
     notice: '', error: '', errorKind: '',
-    screen: new URLSearchParams(window.location.search).get('view') === 'tasks' ? 'tasks' : 'decisions',
+    screen: ['tasks', 'board'].includes(new URLSearchParams(window.location.search).get('view'))
+      ? new URLSearchParams(window.location.search).get('view') : 'decisions',
     lanes: [], taskChanges: {}, tasksLoading: true, taskError: '',
+    board: null, boardLoading: true, boardError: '',
   });
   const current = useRef(state);
   current.current = state;
@@ -123,6 +126,15 @@ export default function App() {
         if (active) setState(previous => ({...previous, tasksLoading: false,
           taskError: 'task を読み込めませんでした。表示中の内容は保持しています。自動で再試行します。'}));
       }
+      // board の失敗でも判断と task の表示を止めない
+      try {
+        const data = await api('/api/board');
+        if (!active) return;
+        setState(previous => ({...previous, board: data, boardLoading: false, boardError: ''}));
+      } catch {
+        if (active) setState(previous => ({...previous, boardLoading: false,
+          boardError: '所属記録を読み込めませんでした。表示中の内容は保持しています。自動で再試行します。'}));
+      }
     }
     refresh();
     const timer = setInterval(refresh, 5000);
@@ -140,7 +152,7 @@ export default function App() {
 
   function changeScreen(screen) {
     if (saving.current) return;
-    window.history.replaceState(null, '', screen === 'tasks' ? '/?view=tasks' : '/');
+    window.history.replaceState(null, '', screen === 'decisions' ? '/' : `/?view=${screen}`);
     setState(previous => ({...previous, screen, error: '', errorKind: ''}));
   }
 
@@ -262,5 +274,8 @@ export default function App() {
     screen={state.screen} onScreenChange={changeScreen} taskError={state.taskError}
     waitingTasks={state.lanes.filter(lane => ['human_decision', 'human_action'].includes(lane.id)).reduce((sum, lane) => sum + lane.tasks.length, 0)}
     board={<TaskBoard lanes={state.lanes} changes={state.taskChanges} loading={state.tasksLoading} onOpenDecision={openDecision} />}
+    boardUnread={state.board?.unread || null}
+    boardView={<Board board={state.board} lanes={state.lanes} decisions={state.cases}
+      loading={state.boardLoading} error={state.boardError} onOpenDecision={openDecision} />}
   />;
 }
