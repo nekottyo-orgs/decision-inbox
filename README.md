@@ -133,13 +133,19 @@ herdr plugin link ~/.local/share/cue/current/herdr-plugin
 
 ### 公開アーカイブから更新する
 
-GitHub Release の `decision-inbox.tar.gz` には CLI、TUI、Herdr plugin、ビルド済みの Web を含みます。展開先の直下に `app.py` があり、上の手順と同じ構成で使えます。更新の前に `decision-inbox.tar.gz.sha256` と照合してください。
+GitHub Release の `decision-inbox.tar.gz` には CLI、TUI、Herdr プラグイン、ビルド済み Web が入っています。既存の Mac 環境では、リポジトリのルートで公開タグと現在の起動設定を指定します。GitHub CLI、既存の CLI リンク、起動中の Herdr と launchd 管理の Web が必要です。複数の Herdr セッションがある場合は、Cue を使うセッションから実行します。
 
 ```sh
-shasum -a 256 -c decision-inbox.tar.gz.sha256
+python3 scripts/update-release.py v0.0.1 \
+  --db "/absolute/path/to/decisions.sqlite3" \
+  --service com.nekottyo.cue-serve --port 4317
 ```
 
-アーカイブは空の release ディレクトリに展開します。共有 DB・端末の設定は既存の場所に保持します。
+`--db`、`--service`、`--port` は現在稼働している設定の値に合わせます。別の場所に配置した場合は `--root` と `--cli` で既存の配置先と CLI リンクを指定します。
+
+更新コマンドはタグの SHA-256 を照合したアーカイブを別ディレクトリに展開し、`backups/` に SQLite バックアップを残します。バックアップの複製だけを開いて新旧の CLI と TUI の読み込みを確認します。その後 `current` を切り替え、Herdr のリンク先、Web のページ、API、配信アセットを照合します。表示まで確認するには、既存の Cue popup を閉じ、Herdr の通常操作で開き直してください。同じタグが有効なら、取得物と起動状態を確認して終了します。
+
+切り替え後に機械検査が失敗した場合は、旧 `current` の復元、Herdr の再リンク、Web の再起動を試みます。途中で強制終了した場合や復旧に失敗した場合は、出力に残る旧 release と DB バックアップを使って現状を確認します。旧 release が現在の DB の複製を開けることを確認してから `current` を旧ディレクトリに戻し、上の Herdr リンク操作を実行して既存の Web サービスを再起動します。DB バックアップは検査と手動復旧の証跡であり、共有 DB は自動で上書きしません。
 
 #### 公開の準備
 
