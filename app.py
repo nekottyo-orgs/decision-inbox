@@ -30,6 +30,9 @@ LANE_REFUSED = 'lane は reconciler が書く。手で打っても次の reconci
 TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'decision_id', 'kind', 'done_when')
 # 依頼の種類。判断 / 監視 / 調査 / 実装
 TASK_KINDS = ('decision', 'monitor', 'research', 'implement')
+SESSION_ROLES = ('frontdesk', 'worker', 'cue_worker')
+SESSION_CLIS = ('claude', 'codex')
+SESSION_CLOSE_REASONS = ('normal', 'replaced', 'crashed', 'closed')
 # add の再送判定で比べる登録内容。result / remaining / decision_id は update で進むので比べない
 TASK_IDENTITY = ('title', 'request', 'pane', 'run')
 TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000, 'machine': 500, 'done_when': 1000}
@@ -112,6 +115,17 @@ def text(value, name, maximum, empty=False):
     if not isinstance(value, str) or len(value) > maximum or (not empty and not value.strip()) or '\x00' in value or any(0xD800 <= ord(char) <= 0xDFFF for char in value):
         raise AppError(400, f'{name} の型または文字数が不正です')
     return value
+
+
+def parse_iso_timestamp(value, name):
+    text(value, name, 64)
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError()
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise AppError(400, f'{name} は timezone 付き ISO 8601 で指定してください') from None
 
 
 def url(value, image=False):
@@ -426,6 +440,15 @@ class Store:
             connection.execute('''CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, msg TEXT NOT NULL, tag TEXT NOT NULL, from_pane TEXT NOT NULL, req TEXT,
                 state TEXT NOT NULL, wait TEXT, received_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, msg))''')
+            # sessions も同じく IF NOT EXISTS で足すだけで、user_version は上げない (理由は tasks / runs と同じ)。
+            # 開いた行 = closed_at が NULL。開いた状態で (cli, native_session_id) と (run_id, role, pane, socket) をそれぞれ一意にする
+            connection.execute('''CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, role TEXT NOT NULL,
+                req_id TEXT NOT NULL DEFAULT '', pane TEXT NOT NULL, socket TEXT NOT NULL,
+                cli TEXT NOT NULL, native_session_id TEXT NOT NULL,
+                opened_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT NOT NULL DEFAULT '')''')
+            connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_native ON sessions(cli, native_session_id) WHERE closed_at IS NULL')
+            connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_slot ON sessions(run_id, role, pane, socket) WHERE closed_at IS NULL')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -789,6 +812,111 @@ class Store:
         with self.db() as connection:
             rows = connection.execute(f"SELECT * FROM runs WHERE {where}{'' if include_closed else ' AND closed_at IS NULL'} ORDER BY id", values)
             return {'runs': [dict(row) for row in rows]}
+
+    def open_session(self, payload):
+        object_fields(payload, ('run_id', 'role', 'pane', 'socket', 'cli', 'native_session_id'), ('req_id',))
+        run_id = text(payload['run_id'], 'run_id', 200)
+        role = text(payload['role'], 'role', 64)
+        if role not in SESSION_ROLES:
+            raise AppError(400, 'role は ' + ' / '.join(SESSION_ROLES) + ' のいずれかを指定してください')
+        req_id = text(payload.get('req_id', ''), 'req_id', 200, empty=True)
+        pane = text(payload['pane'], 'pane', 200)
+        socket = text(payload['socket'], 'socket', 200)
+        cli = text(payload['cli'], 'cli', 64)
+        if cli not in SESSION_CLIS:
+            raise AppError(400, 'cli は ' + ' / '.join(SESSION_CLIS) + ' のいずれかを指定してください')
+        native_session_id = text(payload['native_session_id'], 'native_session_id', 200)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if connection.execute('SELECT 1 FROM sessions WHERE cli=? AND native_session_id=? AND closed_at IS NULL', (cli, native_session_id)).fetchone():
+                raise AppError(409, '同じ cli と native_session_id の開いた session があります')
+            if connection.execute('SELECT 1 FROM sessions WHERE run_id=? AND role=? AND pane=? AND socket=? AND closed_at IS NULL', (run_id, role, pane, socket)).fetchone():
+                raise AppError(409, '同じ run_id・role・pane・socket の開いた session があります')
+            try:
+                cursor = connection.execute(
+                    'INSERT INTO sessions(run_id,role,req_id,pane,socket,cli,native_session_id,opened_at) VALUES(?,?,?,?,?,?,?,?)',
+                    (run_id, role, req_id, pane, socket, cli, native_session_id, utc_now()),
+                )
+            except sqlite3.IntegrityError:
+                raise AppError(409, '同じ条件の開いた session があります') from None
+            return dict(connection.execute('SELECT * FROM sessions WHERE id=?', (cursor.lastrowid,)).fetchone())
+
+    def close_session(self, *, cli=None, native_session_id=None, run_id=None, pane=None, socket=None, role=None, reason=None):
+        reason = text(reason, 'reason', 64)
+        if reason not in SESSION_CLOSE_REASONS:
+            raise AppError(400, 'reason は ' + ' / '.join(SESSION_CLOSE_REASONS) + ' のいずれかを指定してください')
+        has_native = cli is not None or native_session_id is not None
+        has_slot = any(value is not None for value in (run_id, pane, socket, role))
+        if has_native and has_slot:
+            raise AppError(400, '--session-id / --cli と --pane / --socket / --run-id は同時に指定できません')
+        if has_native:
+            if cli is None or native_session_id is None:
+                raise AppError(400, '--session-id と --cli は一緒に指定してください')
+            cli = text(cli, 'cli', 64)
+            if cli not in SESSION_CLIS:
+                raise AppError(400, 'cli は ' + ' / '.join(SESSION_CLIS) + ' のいずれかを指定してください')
+            native_session_id = text(native_session_id, 'native_session_id', 200)
+            where, params = 'cli=? AND native_session_id=?', (cli, native_session_id)
+        elif has_slot:
+            if pane is None or socket is None or run_id is None:
+                raise AppError(400, '--pane・--socket・--run-id は一緒に指定してください')
+            run_id = text(run_id, 'run_id', 200)
+            pane = text(pane, 'pane', 200)
+            socket = text(socket, 'socket', 200)
+            if role is not None:
+                role = text(role, 'role', 64)
+                if role not in SESSION_ROLES:
+                    raise AppError(400, 'role は ' + ' / '.join(SESSION_ROLES) + ' のいずれかを指定してください')
+                where, params = 'run_id=? AND role=? AND pane=? AND socket=?', (run_id, role, pane, socket)
+            else:
+                where, params = 'run_id=? AND pane=? AND socket=?', (run_id, pane, socket)
+        else:
+            raise AppError(400, '--session-id と --cli の組か、--pane・--socket・--run-id の組を指定してください')
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            rows = connection.execute(f'SELECT id FROM sessions WHERE {where} AND closed_at IS NULL', params).fetchall()
+            if not rows:
+                raise AppError(404, '開いた session が見つかりません')
+            if len(rows) > 1:
+                raise AppError(409, '複数の開いた session が一致します。--role か --session-id と --cli で絞り込んでください')
+            target_id = rows[0]['id']
+            connection.execute('UPDATE sessions SET closed_at=?, close_reason=? WHERE id=? AND closed_at IS NULL',
+                               (utc_now(), reason, target_id))
+            return dict(connection.execute('SELECT * FROM sessions WHERE id=?', (target_id,)).fetchone())
+
+    def sessions(self, *, run_id=None, cli=None, open_only=False, since=None, until=None):
+        clauses = []
+        params = []
+        if run_id is not None:
+            clauses.append('run_id=?')
+            params.append(text(run_id, 'run_id', 200))
+        if cli is not None:
+            cli = text(cli, 'cli', 64)
+            if cli not in SESSION_CLIS:
+                raise AppError(400, 'cli は ' + ' / '.join(SESSION_CLIS) + ' のいずれかを指定してください')
+            clauses.append('cli=?')
+            params.append(cli)
+        if open_only:
+            clauses.append('closed_at IS NULL')
+        since_dt = parse_iso_timestamp(since, 'since') if since is not None else None
+        until_dt = parse_iso_timestamp(until, 'until') if until is not None else None
+        if since_dt is not None and until_dt is not None and since_dt > until_dt:
+            raise AppError(400, 'since は until 以下を指定してください')
+        where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        with self.db() as connection:
+            rows = [dict(row) for row in connection.execute(f'SELECT * FROM sessions{where} ORDER BY id', params)]
+        if since_dt is not None or until_dt is not None:
+            filtered = []
+            for row in rows:
+                opened_dt = datetime.fromisoformat(row['opened_at']).astimezone(timezone.utc)
+                closed_dt = datetime.fromisoformat(row['closed_at']).astimezone(timezone.utc) if row['closed_at'] is not None else None
+                if since_dt is not None and closed_dt is not None and closed_dt < since_dt:
+                    continue
+                if until_dt is not None and opened_dt > until_dt:
+                    continue
+                filtered.append(row)
+            rows = filtered
+        return {'sessions': rows}
 
     def _message_fields(self, payload):
         object_fields(payload, ('run_id', 'msg', 'state'), ('wait', 'req'))
@@ -1662,6 +1790,38 @@ def main(argv=None):
         if name == 'open':
             sub.add_argument('--pane', required=True)
             sub.add_argument('--socket', required=True)
+    session = commands.add_parser('session', help='窓口・worker・Cue 専任のセッション所属を sessions 表に記録する')
+    session_commands = session.add_subparsers(dest='session_command', required=True)
+    for name in ('open', 'close', 'list'):
+        sub = session_commands.add_parser(
+            name,
+            formatter_class=epilog_format,
+            help={'open': 'session を開く。開いた重複があれば断る', 'close': '開いた session に closed_at と close_reason を入れる', 'list': 'session の一覧を id 順に出す'}[name],
+            epilog='出力は {"sessions": [session, ...]} (id 順)' if name == 'list' else None,
+        )
+        if name == 'open':
+            sub.add_argument('--run-id', required=True)
+            # choices にせず Store の検査に任せる (error は JSON で exit 1)
+            sub.add_argument('--role', required=True, help=' / '.join(SESSION_ROLES))
+            sub.add_argument('--cli', required=True, help=' / '.join(SESSION_CLIS))
+            sub.add_argument('--session-id', required=True, help='CLI 固有のセッション ID (UUID 等)')
+            sub.add_argument('--pane', required=True)
+            sub.add_argument('--socket', required=True)
+            sub.add_argument('--req', help='関連する依頼 id (task id)')
+        elif name == 'close':
+            sub.add_argument('--session-id', help='--cli と組で指定する')
+            sub.add_argument('--cli', help='--session-id と組で指定する (' + ' / '.join(SESSION_CLIS) + ')')
+            sub.add_argument('--pane', help='--socket・--run-id と組で指定する')
+            sub.add_argument('--socket', help='--pane・--run-id と組で指定する')
+            sub.add_argument('--run-id', help='--pane・--socket と組で指定する')
+            sub.add_argument('--role', help='--pane・--socket・--run-id で role を絞り込む (' + ' / '.join(SESSION_ROLES) + ')')
+            sub.add_argument('--reason', required=True, help=' / '.join(SESSION_CLOSE_REASONS))
+        else:
+            sub.add_argument('--run-id')
+            sub.add_argument('--cli', help=' / '.join(SESSION_CLIS))
+            sub.add_argument('--open-only', action='store_true', help='開いた行だけを出す')
+            sub.add_argument('--since', help='この時刻以降に開いていた行を出す (timezone 付き ISO 8601)')
+            sub.add_argument('--until', help='この時刻以前に開いた行を出す (timezone 付き ISO 8601)')
     msg = commands.add_parser('msg', help='窓口が受けた msg の状態を messages 表に記録する (本文はファイルが運ぶ)')
     msg_commands = msg.add_subparsers(dest='msg_command', required=True)
     for name in ('import', 'move', 'list', 'sync'):
@@ -1715,6 +1875,28 @@ def main(argv=None):
                 result = store.close_run(args.run_id, args.role)
             else:
                 result = store.runs(args.run_id, args.pane, args.socket, args.all)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        if args.command == 'session':
+            if args.session_command == 'open':
+                payload = {
+                    'run_id': args.run_id, 'role': args.role, 'pane': args.pane,
+                    'socket': args.socket, 'cli': args.cli, 'native_session_id': args.session_id,
+                }
+                if args.req is not None:
+                    payload['req_id'] = args.req
+                result = store.open_session(payload)
+            elif args.session_command == 'close':
+                result = store.close_session(
+                    cli=args.cli, native_session_id=args.session_id,
+                    run_id=args.run_id, pane=args.pane, socket=args.socket,
+                    role=args.role, reason=args.reason,
+                )
+            else:
+                result = store.sessions(
+                    run_id=args.run_id, cli=args.cli, open_only=args.open_only,
+                    since=args.since, until=args.until,
+                )
             print(json.dumps(result, ensure_ascii=False))
             return 0
         if args.command == 'msg':
