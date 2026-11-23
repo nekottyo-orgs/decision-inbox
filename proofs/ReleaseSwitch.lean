@@ -9,6 +9,7 @@ inductive Active where
 inductive Phase where
   | preparing
   | checked
+  | replacing
   | checkingLive
   | applied
   | stopped
@@ -16,65 +17,89 @@ inductive Phase where
   | lostOwnership
   deriving DecidableEq
 
-def active : Phase → Active
-  | .checkingLive | .applied => .candidate
-  | .lostOwnership => .foreign
-  | _ => .previous
+structure State where
+  phase : Phase
+  current : Active
+  deriving DecidableEq
 
 def checked : Phase → Bool
-  | .checked | .checkingLive | .applied | .rolledBack => true
+  | .checked | .replacing | .checkingLive | .applied | .rolledBack => true
   | _ => false
 
-def liveOutcome : Bool → Phase
-  | true => .applied
-  | false => .rolledBack
+def liveOutcome : Bool → State
+  | true => ⟨.applied, .candidate⟩
+  | false => ⟨.rolledBack, .previous⟩
 
-def interruptedOutcome : Active → Phase
-  | .previous => .stopped
-  | .candidate => .rolledBack
-  | .foreign => .lostOwnership
+def interruptedOutcome : Active → State
+  | .previous => ⟨.stopped, .previous⟩
+  | .candidate => ⟨.rolledBack, .previous⟩
+  | .foreign => ⟨.lostOwnership, .foreign⟩
 
--- The lock serializes attempts. The link update itself is an atomic rename.
-inductive Step : Phase → Phase → Prop where
-  | preflightPass : Step .preparing .checked
-  | preflightFail : Step .preparing .stopped
-  | activate : Step .checked .checkingLive
-  | interruptedBeforeReplace : Step .checked (interruptedOutcome .previous)
-  | interruptedAfterReplace : Step .checkingLive (interruptedOutcome .candidate)
+-- The lock serializes attempts by the updater. The atomic rename changes the link
+-- before control leaves the replacement boundary.
+inductive Step : State → State → Prop where
+  | preflightPass : Step ⟨.preparing, .previous⟩ ⟨.checked, .previous⟩
+  | preflightFail : Step ⟨.preparing, .previous⟩ ⟨.stopped, .previous⟩
+  | beginReplace : Step ⟨.checked, .previous⟩ ⟨.replacing, .previous⟩
+  | renameLink : Step ⟨.replacing, .previous⟩ ⟨.replacing, .candidate⟩
+  | finishReplace : Step ⟨.replacing, .candidate⟩ ⟨.checkingLive, .candidate⟩
+  | foreignDuringReplace (link : Active) : Step ⟨.replacing, link⟩ ⟨.replacing, .foreign⟩
+  | interruptAtReplace (link : Active) :
+      Step ⟨.replacing, link⟩ (interruptedOutcome link)
   | liveProbe (listenerAndWebMatch : Bool) :
-      Step .checkingLive (liveOutcome listenerAndWebMatch)
-  | foreignBeforeActivation : Step .checked .lostOwnership
-  | foreignWhileChecking : Step .checkingLive .lostOwnership
+      Step ⟨.checkingLive, .candidate⟩ (liveOutcome listenerAndWebMatch)
+  | foreignBeforeActivation : Step ⟨.checked, .previous⟩ ⟨.lostOwnership, .foreign⟩
+  | foreignWhileChecking : Step ⟨.checkingLive, .candidate⟩ ⟨.lostOwnership, .foreign⟩
 
-inductive Reachable : Phase → Prop where
-  | start : Reachable .preparing
+inductive Reachable : State → Prop where
+  | start : Reachable ⟨.preparing, .previous⟩
   | step : Reachable before → Step before after → Reachable after
 
-theorem activeCandidateWasChecked (phase : Phase) (_ : Reachable phase) :
-    active phase = .candidate → checked phase = true := by
-  cases phase <;> decide
+theorem activeCandidateWasChecked (state : State) (reachable : Reachable state) :
+    state.current = .candidate → checked state.phase = true := by
+  cases reachable with
+  | start => decide
+  | step _ transition =>
+      cases transition with
+      | preflightPass | preflightFail | beginReplace | renameLink | finishReplace
+      | foreignDuringReplace | foreignBeforeActivation | foreignWhileChecking => decide
+      | interruptAtReplace link => cases link <;> decide
+      | liveProbe matched => cases matched <;> decide
 
-theorem failingPreflightKeepsPrevious {after : Phase}
-    (step : Step .preparing after) (notChecked : checked after = false) :
-    active after = .previous := by
+theorem failingPreflightKeepsPrevious {after : State}
+    (step : Step ⟨.preparing, .previous⟩ after) (notChecked : checked after.phase = false) :
+    after.current = .previous := by
   cases step
   · contradiction
   · rfl
 
 theorem failingLiveCheckRestoresPrevious :
-    Step .checkingLive .rolledBack ∧ active .rolledBack = .previous :=
-  ⟨.liveProbe false, rfl⟩
+    Step ⟨.checkingLive, .candidate⟩ ⟨.rolledBack, .previous⟩ :=
+  .liveProbe false
 
-theorem interruptedReplaceUsesObservedLink :
-    active (interruptedOutcome .previous) = .previous ∧
-    active (interruptedOutcome .candidate) = .previous ∧
-    active (interruptedOutcome .foreign) = .foreign :=
-  ⟨rfl, rfl, rfl⟩
+theorem replacementBoundaryCanObserve (link : Active) : Reachable ⟨.replacing, link⟩ := by
+  have prepared : Reachable ⟨.replacing, .previous⟩ :=
+    .step (.step .start .preflightPass) .beginReplace
+  cases link with
+  | previous => exact prepared
+  | candidate => exact .step prepared .renameLink
+  | foreign => exact .step prepared (.foreignDuringReplace .previous)
 
-theorem unmatchedListenerCannotApply : liveOutcome false ≠ .applied := by
+theorem interruptedReplaceUsesObservedLink (link : Active) :
+    Reachable ⟨.replacing, link⟩ ∧
+    match link with
+    | .previous => Step ⟨.replacing, link⟩ ⟨.stopped, .previous⟩
+    | .candidate => Step ⟨.replacing, link⟩ ⟨.rolledBack, .previous⟩
+    | .foreign => Step ⟨.replacing, link⟩ ⟨.lostOwnership, .foreign⟩ := by
+  constructor
+  · exact replacementBoundaryCanObserve link
+  · cases link <;> exact .interruptAtReplace _
+
+theorem unmatchedListenerCannotApply : (liveOutcome false).phase ≠ .applied := by
   decide
 
-theorem foreignIsNotOverwritten {after : Phase} (step : Step .lostOwnership after) : False := by
+theorem foreignIsNotOverwritten {after : State} (step : Step ⟨.lostOwnership, .foreign⟩ after) :
+    False := by
   cases step
 
 end ReleaseSwitch
