@@ -29,11 +29,18 @@ def liveOutcome : Bool → Phase
   | true => .applied
   | false => .rolledBack
 
+def interruptedOutcome : Active → Phase
+  | .previous => .stopped
+  | .candidate => .rolledBack
+  | .foreign => .lostOwnership
+
 -- The lock serializes attempts. The link update itself is an atomic rename.
 inductive Step : Phase → Phase → Prop where
   | preflightPass : Step .preparing .checked
   | preflightFail : Step .preparing .stopped
   | activate : Step .checked .checkingLive
+  | interruptedBeforeReplace : Step .checked (interruptedOutcome .previous)
+  | interruptedAfterReplace : Step .checkingLive (interruptedOutcome .candidate)
   | liveProbe (listenerAndWebMatch : Bool) :
       Step .checkingLive (liveOutcome listenerAndWebMatch)
   | foreignBeforeActivation : Step .checked .lostOwnership
@@ -57,6 +64,12 @@ theorem failingPreflightKeepsPrevious {after : Phase}
 theorem failingLiveCheckRestoresPrevious :
     Step .checkingLive .rolledBack ∧ active .rolledBack = .previous :=
   ⟨.liveProbe false, rfl⟩
+
+theorem interruptedReplaceUsesObservedLink :
+    active (interruptedOutcome .previous) = .previous ∧
+    active (interruptedOutcome .candidate) = .previous ∧
+    active (interruptedOutcome .foreign) = .foreign :=
+  ⟨rfl, rfl, rfl⟩
 
 theorem unmatchedListenerCannotApply : liveOutcome false ≠ .applied := by
   decide

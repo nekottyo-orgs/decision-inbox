@@ -279,10 +279,8 @@ def activate(args, cli, current, previous_target, old, candidate, temporary, db)
     verify_web_process(args, current, previous_target, db, old)
     print(f'Previous release: {old}\nCandidate release: {candidate}', flush=True)
     candidate_target = str(candidate)
-    switched = False
     try:
         switch(current, candidate_target, previous_target, temporary)
-        switched = True
         require_current(current, candidate_target)
         run('CLI could not start', cli, '--help')
         require_current(current, candidate_target)
@@ -290,7 +288,8 @@ def activate(args, cli, current, previous_target, old, candidate, temporary, db)
         previous_pid = restart(args, current, candidate_target, db)
         verify_web_process(args, current, candidate_target, db, candidate, previous_pid)
     except (Exception, KeyboardInterrupt):
-        if not switched:
+        # atomic rename の直後に割り込まれても、置換結果は実際のリンクから判定する。
+        if current.is_symlink() and os.readlink(current) == previous_target:
             raise
         require_current(current, candidate_target)
         try:
@@ -388,7 +387,7 @@ def main():
         update(args)
     except (UpdateError, OSError, ValueError, TypeError, KeyError, AttributeError,
             tarfile.TarError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-        print(f'Cue update failed: {error or "interrupted"}', file=sys.stderr)
+        print(f'Cue update failed: {str(error) or "interrupted"}', file=sys.stderr)
         return 1
     return 0
 

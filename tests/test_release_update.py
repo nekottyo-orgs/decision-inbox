@@ -163,9 +163,9 @@ print(f'n127.0.0.1:{port}')
         self.addCleanup(server.shutdown)
         return server.server_port
 
-    def update(self, port=16317):
+    def update(self, port=16317, runner=()):
         return subprocess.run([
-            sys.executable, UPDATER, 'v0.0.1', '--root', self.root,
+            sys.executable, *runner, UPDATER, 'v0.0.1', '--root', self.root,
             '--cli', self.cli, '--db', self.db, '--service', 'com.example.cue', '--port', str(port),
         ], env=dict(self.env, CUE_TEST_PORT=str(port)), text=True, capture_output=True, timeout=45)
 
@@ -292,6 +292,49 @@ print(f'n127.0.0.1:{port}')
         result = self.update(self.start_web())
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('LaunchAgent', result.stderr)
+        self.assert_preserved()
+        self.assertFalse((self.temp / 'changes').exists())
+        self.assertFalse((self.temp / 'restarts').exists())
+
+
+    def update_at_replace(self, fault):
+        port = self.start_web()
+        return self.update(port, ('-c', """
+import os
+from pathlib import Path
+import runpy
+import signal
+import sys
+
+fault = sys.argv.pop(1)
+updater = sys.argv.pop(1)
+real_replace = os.replace
+
+def replace(source, destination, *args, **kwargs):
+    if Path(source).name == 'current-next' and Path(destination).name == 'current':
+        os.replace = real_replace
+        if fault == 'before':
+            raise OSError('injected rename failure')
+        real_replace(source, destination, *args, **kwargs)
+        signal.raise_signal(signal.SIGINT)
+        return
+    return real_replace(source, destination, *args, **kwargs)
+
+os.replace = replace
+runpy.run_path(updater, run_name='__main__')
+""", fault))
+
+    def test_interrupt_after_atomic_replace_restores_previous_current(self):
+        result = self.update_at_replace('after')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Restored previous current link', result.stderr)
+        self.assertIn('interrupted', result.stderr)
+        self.assert_preserved()
+
+    def test_failed_replace_keeps_previous_without_restarting(self):
+        result = self.update_at_replace('before')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('injected rename failure', result.stderr)
         self.assert_preserved()
         self.assertFalse((self.temp / 'changes').exists())
         self.assertFalse((self.temp / 'restarts').exists())
