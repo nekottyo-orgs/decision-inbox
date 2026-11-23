@@ -48,6 +48,7 @@ jobs:
           lean proofs/DecisionSnapshot.lean
           lean proofs/SessionRegistry.lean
           lean proofs/ReleaseSwitch.lean
+          lean proofs/DeliveryAttempt.lean
 
       - name: Test the implementation
         # PR では Release の build が同じ回帰テストを実行する。
