@@ -6,6 +6,7 @@ on:
       - 'app.py'
       - 'API.md'
       - 'proofs/**'
+      - 'scripts/update-release.py'
       - 'tests/**'
       - '.github/workflows/claim-verification.yml'
   push:
@@ -14,6 +15,7 @@ on:
       - 'app.py'
       - 'API.md'
       - 'proofs/**'
+      - 'scripts/update-release.py'
       - 'tests/**'
       - '.github/workflows/claim-verification.yml'
 
@@ -45,6 +47,7 @@ jobs:
           lean proofs/TaskAssignment.lean
           lean proofs/DecisionSnapshot.lean
           lean proofs/SessionRegistry.lean
+          lean proofs/ReleaseSwitch.lean
 
       - name: Test the implementation
         # PR では Release の build が同じ回帰テストを実行する。

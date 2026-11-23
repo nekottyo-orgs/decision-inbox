@@ -24,6 +24,7 @@ lean +leanprover/lean4:v4.36.0 proofs/ClaimLease.lean
 lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
 lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
 lean +leanprover/lean4:v4.36.0 proofs/SessionRegistry.lean
+lean +leanprover/lean4:v4.36.0 proofs/ReleaseSwitch.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -54,3 +55,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 前提は、SQLite の `BEGIN IMMEDIATE` が書き込みを直列化すること、部分一意索引 `WHERE closed_at IS NULL` が開いた行にだけ効くこと、および `INTEGER PRIMARY KEY` が一意な単調 ID を割り当てること。時刻は自然数で表す。文字列長・サロゲート・ISO 8601 の解析、`session list` の絞り込み (`--run-id` / `--cli` / `--open-only` / `--since` / `--until`)、SQLite の 2 接続競合、および `PRAGMA user_version = 2` を保った旧 release DB 互換は `tests/test_sessions.py` で検査する。
 
+
+## 公開 release の切り替え
+
+[ReleaseSwitch.lean](ReleaseSwitch.lean) は事前検証の成功後にだけ候補を有効にできること、事前検証の失敗で現行 release が残ること、切り替え後の検査に失敗した場合に復旧が成功すれば旧 release に戻ることを扱う。更新コマンドではファイルロックにより一度に一件だけ更新を進め、`current` の入れ替えに同一ファイルシステム内の atomic rename を使う。モデルは処理段階とリンク先を別々に持つ。同じ rename の境界で旧 release、候補、外部のリンク先を観測でき、割り込み時はその観測から復元の要否を決める。再起動した PID と Web の待ち受けが一致しない観測は成功への遷移に進めない。SHA-256、アーカイブの検証、SQLite の互換性、Web と Herdr の確認は更新コマンドを入口とする Python の回帰テストで扱う。プロセスの強制終了、他の手段による同時書き換え、外部サービスの恒久障害はモデルの対象外。別の参照先を観測したときは処理を停止し、復元を含む後続の書き換えは行わない。
