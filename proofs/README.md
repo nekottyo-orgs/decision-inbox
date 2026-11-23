@@ -23,6 +23,7 @@
 lean +leanprover/lean4:v4.36.0 proofs/ClaimLease.lean
 lean +leanprover/lean4:v4.36.0 proofs/TaskAssignment.lean
 lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
+lean +leanprover/lean4:v4.36.0 proofs/SessionRegistry.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -40,3 +41,16 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 [DecisionSnapshot.lean](DecisionSnapshot.lean) は、最初の読み取りから応答までに他の接続が何回確定しても、一覧 (履歴から先に読む) と詳細 (本文から先に読む) の本文・revision・履歴が最初の読み取り時点と一致することを検査する。revision は更新履歴の件数とする。
 
 `Store.list` と `Store.get` の `BEGIN` から、SQLite が最初の SELECT のスナップショットをトランザクション終了まで保持することを前提とする。モデルは判断 1 件の本文と更新履歴を扱う。JSON の項目、並び順、取り下げ、古い revision への回答拒否と、実際の 2 接続の動作は Python の回帰テストで検査する。
+
+## セッション所属の開閉と一意性
+
+[SessionRegistry.lean](SessionRegistry.lean) は、Claude・Codex の窓口・worker・Cue 専任 worker の所属記録 (`sessions` 表) について、`open` と `close` の状態遷移を検査する。開いた状態 (`closed_at IS NULL`) で `(cli, native_session_id)` と `(run_id, role, pane, socket)` がそれぞれ一意であること、重複する `open` が拒否されること、閉じた行が後続の `open`・`close` で書き換わらないこと、`close` が `id`・`run_id`・`role`・`req_id`・`pane`・`socket`・`cli`・`native_session_id`・`opened_at` を保持したまま終了時刻と理由だけを入れること、未登録・既閉鎖の `close` が拒否されることを証明し、`#guard` で一連の開閉を検査する。
+
+| モデル | 実装 |
+| --- | --- |
+| `openSession` と `WellFormed` | `Store.open_session` が `BEGIN IMMEDIATE` で書き込みを直列化し、重複を検査して挿入。SQLite の部分一意索引 `sessions_open_native (cli, native_session_id) WHERE closed_at IS NULL` と `sessions_open_slot (run_id, role, pane, socket) WHERE closed_at IS NULL` でも一意性を担保 |
+| `closeSession` (`byNative` / `bySlot`) | `Store.close_session` が `BEGIN IMMEDIATE` 内で `closed_at IS NULL` の一致行を引き、0 件なら 404、複数件 (`--pane` / `--socket` / `--run-id` で role が重複する場合) なら 409 で拒否し、1 件のときだけ `closed_at` と `close_reason` を更新 |
+| `Closure` (`closedAt`, `reason`) | 開いた行は `closed_at IS NULL` かつ `close_reason = ''`、`close` 時にのみ `closed_at` (ISO 8601) と `close_reason` (`normal` / `replaced` / `crashed` / `closed`) を同時設定 |
+
+前提は、SQLite の `BEGIN IMMEDIATE` が書き込みを直列化すること、部分一意索引 `WHERE closed_at IS NULL` が開いた行にだけ効くこと、および `INTEGER PRIMARY KEY` が一意な単調 ID を割り当てること。時刻は自然数で表す。文字列長・サロゲート・ISO 8601 の解析、`session list` の絞り込み (`--run-id` / `--cli` / `--open-only` / `--since` / `--until`)、SQLite の 2 接続競合、および `PRAGMA user_version = 2` を保った旧 release DB 互換は `tests/test_sessions.py` で検査する。
+
