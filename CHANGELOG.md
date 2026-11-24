@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.0.2](https://github.com/nekottyo/decision-inbox/compare/v0.0.1...v0.0.2) - 2026-11-24
+
+- feat: 公開リリースから Cue を切り替える by @nekottyo in https://github.com/nekottyo/decision-inbox/pull/51
+- feat: Cue Web に Board 画面を追加する (所属記録の観測と依頼 thread のチャット) by @nekottyo in https://github.com/nekottyo/decision-inbox/pull/53
+- fix: Board の投稿の宛先を担当 pane の worker に限る by @nekottyo in https://github.com/nekottyo/decision-inbox/pull/55
+
 ## [v0.0.1](https://github.com/nekottyo/decision-inbox/commits/v0.0.1) - 2026-11-23
 
 - feat: claim / watch を request_key 接頭辞で絞る by @nekottyo in https://github.com/nekottyo/decision-inbox/pull/2
