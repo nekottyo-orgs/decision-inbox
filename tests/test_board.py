@@ -40,6 +40,47 @@ class BoardStoreTests(unittest.TestCase):
         self.assertEqual(post['target_session'], 'uuid-worker-1')
         self.assertIsNone(post['received_at'])
 
+    def test_投稿の宛先は担当_pane_の_worker_で後に開いた別_worker_ではない(self):
+        # issue #54 の再現: 同じ run で担当外の worker が後に開いても、宛先は担当 pane の worker
+        seed_task(self.store, {'id': 't1', 'title': '判断の依頼', 'kind': 'research', 'lane': 'human_decision',
+                               'run': 'run-1', 'pane': 'w1:p2'})
+        self.open_worker(pane='w1:p2', session='uuid-worker-1')
+        self.open_worker(pane='w1:p3', session='uuid-worker-2')
+        post = self.store.create_post('t1', {'body': '確認しました'})
+        self.assertEqual(post['target_pane'], 'w1:p2')
+        self.assertEqual(post['target_session'], 'uuid-worker-1')
+
+    def test_投稿は担当_pane_が空なら同じ_run_に_worker_がいても宛先なし(self):
+        seed_task(self.store, {'id': 't1', 'title': '実装の依頼', 'kind': 'research', 'lane': 'worker', 'run': 'run-1'})
+        self.open_worker(pane='w1:p2', session='uuid-worker-1')
+        post = self.store.create_post('t1', {'body': '進み具合を教えてください'})
+        self.assertEqual(post['state'], 'unreceived')
+        self.assertEqual(post['target_run'], '')
+        self.assertEqual(post['target_pane'], '')
+        self.assertEqual(post['target_session'], '')
+
+    def test_投稿は担当_pane_に開いた_session_がなければ宛先なし(self):
+        seed_task(self.store, {'id': 't1', 'title': '実装の依頼', 'kind': 'research', 'lane': 'worker',
+                               'run': 'run-1', 'pane': 'w1:p9'})
+        self.open_worker(pane='w1:p2', session='uuid-worker-1')
+        post = self.store.create_post('t1', {'body': '連絡'})
+        self.assertEqual(post['target_session'], '')
+        # 担当 pane の session が閉じている場合も宛先なし
+        seed_task(self.store, {'id': 't2', 'title': '別の依頼', 'kind': 'research', 'lane': 'worker',
+                               'run': 'run-1', 'pane': 'w1:p2'})
+        self.store.close_session(cli='claude', native_session_id='uuid-worker-1', reason='normal')
+        post = self.store.create_post('t2', {'body': '連絡'})
+        self.assertEqual(post['target_session'], '')
+
+    def test_投稿は担当_pane_の_session_が一意でなければ宛先なし(self):
+        seed_task(self.store, {'id': 't1', 'title': '実装の依頼', 'kind': 'research', 'lane': 'worker',
+                               'run': 'run-1', 'pane': 'w1:p2'})
+        self.open_worker(pane='w1:p2', session='uuid-worker-1')
+        self.store.open_session({'run_id': 'run-1', 'role': 'cue_worker', 'pane': 'w1:p2', 'socket': '/tmp/other.sock',
+                                 'cli': 'claude', 'native_session_id': 'uuid-cue-1'})
+        post = self.store.create_post('t1', {'body': '連絡'})
+        self.assertEqual(post['target_session'], '')
+
     def test_投稿は作業中の_lane_では想定外で担当不在なら宛先なしで残る(self):
         seed_task(self.store, {'id': 't1', 'title': '実装の依頼', 'kind': 'research', 'lane': 'worker', 'run': 'run-1'})
         post = self.store.create_post('t1', {'body': '進み具合を教えてください'})
