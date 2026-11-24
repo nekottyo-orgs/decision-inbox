@@ -1024,9 +1024,11 @@ class Store:
         """依頼 thread への人の投稿を配送試行として記録する (設計 Q6 / Q12 / Q13)。
 
         分類は投稿時点の lane が人待ちかどうかだけから導き、投稿者は選ばない。宛先は
-        所属記録上の現在の担当 worker (対象 run の開いた worker / cue_worker session の
-        うち最後に開いた行) を写す。担当不在なら宛先なしで、未受領のまま残る。
-        状態遷移の性質は proofs/DeliveryAttempt.lean で検査済み。
+        依頼の担当 pane (tasks.pane) を引き、同じ run の所属記録でその pane に開いている
+        worker / cue_worker session が一意に定まる場合だけ、その写しを記録する。
+        担当 pane が空・該当なし・複数ある場合は宛先なしで、未受領のまま残る。
+        状態遷移の性質は proofs/DeliveryAttempt.lean で検査済み (宛先の導出規則は
+        モデルの外。モデルは宛先を与えられるものとして扱う)。
         """
         object_fields(payload, ('body',), ())
         body = text(payload['body'], 'body', 4000)
@@ -1037,11 +1039,12 @@ class Store:
                 raise AppError(404, 'task が見つかりません')
             classification = 'expected' if task['lane'] in WAITING_LANES else 'unexpected'
             target = {'target_run': '', 'target_pane': '', 'target_socket': '', 'target_session': ''}
-            if task['run']:
-                session = connection.execute(
-                    "SELECT * FROM sessions WHERE run_id=? AND role IN ('worker','cue_worker') AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
-                    (task['run'],)).fetchone()
-                if session:
+            if task['run'] and task['pane']:
+                sessions = connection.execute(
+                    "SELECT * FROM sessions WHERE run_id=? AND pane=? AND role IN ('worker','cue_worker') AND closed_at IS NULL ORDER BY id",
+                    (task['run'], task['pane'])).fetchall()
+                if len(sessions) == 1:
+                    session = sessions[0]
                     target = {'target_run': session['run_id'], 'target_pane': session['pane'],
                               'target_socket': session['socket'], 'target_session': session['native_session_id']}
             cursor = connection.execute(
