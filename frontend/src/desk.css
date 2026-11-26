@@ -247,6 +247,11 @@
 .board-closed { color: var(--b-fg3); }
 .board-thread-head h3 { margin: 0 0 6px; font-size: 15px; overflow-wrap: anywhere; }
 .board-thread-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.board-detail { margin: 10px 0 0; display: grid; gap: 4px; font-size: 13px; }
+.board-detail-row { display: grid; grid-template-columns: 7em 1fr; gap: 8px; }
+.board-detail dt { color: var(--b-fg3); }
+.board-detail dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.board-file { font-size: 11px; color: var(--b-fg3); }
 .board-note { margin: 8px 0 4px; color: var(--b-fg3); font-size: 12px; }
 .board-marker { margin: 10px 0; padding: 4px 0; border-top: 1px dashed var(--b-line2); color: var(--b-fg3); font-family: ui-monospace, monospace; font-size: 11px; text-align: center; }
 .board-composer { margin-top: 14px; padding: 12px; border: 1px dashed var(--b-line2); border-radius: 8px; }
