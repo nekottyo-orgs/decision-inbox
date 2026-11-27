@@ -1,14 +1,10 @@
 name: Claim verification
 
+# branch protection で `gate` を必須チェックにするため、pull_request の path filter は外す。
+# path filter 付きだと対象外の PR で workflow 自体が起動せず、必須チェックが「存在しない」
+# 状態になってマージできなくなる。全 PR で起動し、対象ファイルの有無は `paths` job で判定する。
 on:
   pull_request:
-    paths:
-      - 'app.py'
-      - 'API.md'
-      - 'proofs/**'
-      - 'scripts/update-release.py'
-      - 'tests/**'
-      - '.github/workflows/claim-verification.yml'
   push:
     branches: [main]
     paths:
@@ -23,7 +19,46 @@ permissions:
   contents: read
 
 jobs:
+  # 変更ファイルが従来の path filter に当たるかを判定する。
+  # checkout は verify と同じ pin に揃え、base ブランチとの差分を取れるよう全履歴を取得する。
+  paths:
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.check.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the changed paths
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          # push（main へのマージ）は従来どおり常に対象として扱う。
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # pull_request では base ブランチを明示的に取得し、PR の差分だけを見る。
+          # 取得に失敗した場合は判定不能なので fail closed にする（gate も失敗する）。
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          base="refs/remotes/origin/${BASE_REF}"
+
+          if git diff --name-only "${base}...HEAD" | grep -Eq '^(app\.py|API\.md|scripts/update-release\.py|\.github/workflows/claim-verification\.yml|proofs/|tests/)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
   verify:
+    needs: paths
+    if: needs.paths.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,3 +89,28 @@ jobs:
         # PR では Release の build が同じ回帰テストを実行する。
         if: github.event_name == 'push'
         run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+  # branch protection で必須化する単一の集約チェック。
+  # verify が対象外 PR で skipped になっても、paths と verify が失敗していなければ成功とする。
+  # これにより「path filter の対象外だと必須チェックが存在しない」問題を解消する。
+  gate:
+    needs: [paths, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the required jobs
+        env:
+          PATHS_RESULT: ${{ needs.paths.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          for result in "$PATHS_RESULT" "$VERIFY_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *)
+                echo "required job did not succeed: $result" >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "gate passed (paths=$PATHS_RESULT, verify=$VERIFY_RESULT)"
