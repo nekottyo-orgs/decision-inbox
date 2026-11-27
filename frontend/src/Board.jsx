@@ -28,6 +28,16 @@ function Labels({task}) {
   </span>;
 }
 
+// 空の欄は出さない。値は外部入力を含むのでテキストのまま出す (white-space は CSS 側)
+const DETAIL_FIELDS = [['request', '依頼'], ['pane', '担当'], ['result', '結果'], ['remaining', '残り'], ['done_when', '完了の条件'], ['machine', '機械判定']];
+function TaskDetail({task}) {
+  const rows = DETAIL_FIELDS.filter(([key]) => task[key]);
+  if (!rows.length) return null;
+  return <dl className="board-detail" aria-label="依頼の内容">
+    {rows.map(([key, label]) => <div key={key} className="board-detail-row"><dt>{label}</dt><dd className={key === 'pane' ? 'mono' : ''}>{task[key]}</dd></div>)}
+  </dl>;
+}
+
 function FeedRow({head, children}) {
   return <div className="board-frow">
     <span className="board-avatar">{head.initial}</span>
@@ -210,9 +220,10 @@ function Thread({taskId, lanes, onOpenDecision}) {
   }
   for (const message of thread.messages) {
     items.push({at: message.received_at, key: `msg-${message.id}`, node: <FeedRow head={{
-      initial: '窓', actor: message.from_pane, via: message.run_id, action: 'received', when: timeText(message.received_at)}}>
-      <div className="board-fline"><span className="board-pfx">[{message.state}]</span> <span className="mono">{message.msg}</span></div>
+      initial: '窓', actor: message.from_pane, via: message.run_id, action: `${message.tag} を受領`, when: timeText(message.received_at)}}>
+      <div className="board-fline"><span className="board-lab">{message.tag}</span> <span className={`board-pfx ${message.state === 'done' ? 'done' : ''}`}>[{message.state}]</span></div>
       {message.wait && <div className="board-fline board-sub">待ち: {message.wait}</div>}
+      <div className="board-fline board-sub mono board-file">{message.msg}</div>
     </FeedRow>});
   }
   for (const post of thread.posts) {
@@ -237,7 +248,8 @@ function Thread({taskId, lanes, onOpenDecision}) {
         {task.decision_id && task.decision && !task.decision.withdrawn &&
           <button type="button" className="board-btn small" onClick={() => onOpenDecision(task.decision_id)}>判断を開く</button>}
       </div>
-      <p className="board-note">msg の本文は DB に持たないため、ここに出るのはファイル名と状態だけです。人の投稿は配送試行として記録され、分類は文脈から自動で付きます。</p>
+      <TaskDetail task={task} />
+      <p className="board-note">msg の本文は DB に持たないため、ここには出ません。人の投稿は配送試行として記録され、分類は文脈から自動で付きます。</p>
     </header>
     <div className="board-feed">
       {items.map(item => item.marker
