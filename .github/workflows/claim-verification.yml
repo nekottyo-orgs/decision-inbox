@@ -3,8 +3,10 @@ name: Claim verification
 # branch protection で `gate` を必須チェックにするため、path filter は使わない。
 # path filter 付きだと対象外の PR で workflow 自体が起動せず、必須チェックが「存在しない」
 # 状態になってマージできなくなる。全 PR で起動し、対象ファイルの有無は `paths` job で判定する。
-# main への push はさらに「commit 単位で全検証が通っている」ことを保証するため、
-# path filter を付けずに全 commit で verify を実行する（対象外ファイルだけの commit でも走る）。
+# main への push は、push のたびにその時点の main（tip commit）全体を対象に verify を実行するため、
+# path filter を付けずに常時実行する（対象外ファイルだけの push でも走る）。
+# この repo のマージは squash merge で 1 マージ = 1 commit = 1 push なので、main の各状態は検証済みになる。
+# 複数の commit をまとめて push した場合、途中の commit は個別には検証されず、tip のみが対象になる。
 on:
   pull_request:
   push:
@@ -15,7 +17,8 @@ permissions:
 
 jobs:
   # 変更ファイルが verify の対象に当たるかを判定する（pull_request のみ）。
-  # push では path filter を使わず verify を常時実行するため、この job は常に relevant=true を返す。
+  # push では path filter を使わず、その push の tip に対して verify を常時実行するため、
+  # この job は常に relevant=true を返す。
   # checkout は verify と同じ pin に揃え、base ブランチとの差分を取れるよう全履歴を取得する。
   paths:
     runs-on: ubuntu-latest
@@ -35,8 +38,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # push（main へのマージ）は path filter を付けず全 commit で verify を実行するため、
-          # 常に対象として扱う。
+          # push（main へのマージ）は path filter を付けず、その時点の main（tip）に対して
+          # verify を実行するため、常に対象として扱う。
           if [ "$EVENT_NAME" = "push" ]; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
             exit 0
