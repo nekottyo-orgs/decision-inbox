@@ -249,7 +249,7 @@ function Thread({taskId, lanes, onOpenDecision}) {
           <button type="button" className="board-btn small" onClick={() => onOpenDecision(task.decision_id)}>判断を開く</button>}
       </div>
       <TaskDetail task={task} />
-      <p className="board-note">msg の本文は DB に持たないため、ここに出るのは種類 (tag)・送り元・時刻・状態とファイル名だけです。人の投稿は配送試行として記録され、分類は文脈から自動で付きます。</p>
+      <p className="board-note">msg の本文は DB に持たないため、ここには出ません。人の投稿は配送試行として記録され、分類は文脈から自動で付きます。</p>
     </header>
     <div className="board-feed">
       {items.map(item => item.marker
