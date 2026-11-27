@@ -50,7 +50,19 @@ jobs:
           git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           base="refs/remotes/origin/${BASE_REF}"
 
-          if git diff --name-only "${base}...HEAD" | grep -Eq '^(app\.py|API\.md|scripts/update-release\.py|\.github/workflows/claim-verification\.yml|proofs/|tests/)'; then
+          # 差分の取得と判定を分ける。取得失敗と「対象パスなし」を同じ経路にすると
+          # verify が skip されて gate が通ってしまう（fail open）ため、取得失敗は step を失敗させる。
+          # core.quotepath=false により非 ASCII パスが引用されず、そのまま照合できる。
+          if ! changed="$(git -c core.quotepath=false diff --name-only "${base}...HEAD")"; then
+            echo "failed to compute the diff against ${base}" >&2
+            exit 1
+          fi
+
+          # 判定は取り込んだ文字列に対して行う。pipeline の `grep -q` は最初の一致で終了し、
+          # 上流の git diff が SIGPIPE で失敗して pipefail により全体が失敗する（変更ファイルが
+          # 多い PR ほど一致していても relevant=false になる）ため使わない。
+          # 単独ファイル名は行全体の完全一致、ディレクトリは prefix で判定する。
+          if grep -Eq '^(app\.py|API\.md|scripts/update-release\.py|\.github/workflows/claim-verification\.yml)$|^(proofs/|tests/)' <<< "$changed"; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else
             echo "relevant=false" >> "$GITHUB_OUTPUT"
