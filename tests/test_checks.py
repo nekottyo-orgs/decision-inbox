@@ -1784,6 +1784,65 @@ sys.exit(2)
             time.sleep(0.02)
         self.assertFalse(_pid_alive(b_pid))
 
+        # (c) Popen 直後の drain thread 起動タイミング (1 本目 / 2 本目) での KeyboardInterrupt でも子グループが停止されること
+        import threading as _threading
+        orig_thread_start = _threading.Thread.start
+        for interrupt_on_call in (1, 2):
+            drain_pid_file = self.root / f'int_drain_child_{interrupt_on_call}.pid'
+            self.addCleanup(_cleanup_pid_file, drain_pid_file)
+            drain_script = (
+                '#!/usr/bin/env python3\n'
+                'import subprocess, sys, time\n'
+                'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+                f'open({str(drain_pid_file)!r}, "w", encoding="utf-8").write(str(child.pid))\n'
+                'time.sleep(60)\n'
+            )
+            self.commit_config(
+                '[[checks]]\nname = "int_drain"\ninterval = 60\ncommand = "scripts/int_drain.py"\ntimeout = 30\nskill = "s1"\n',
+                {'scripts/int_drain.py': drain_script},
+            )
+            drain_calls = [0]
+            drain_lock_held = []
+
+            def interrupting_thread_start(thread_self, *args, **kwargs):
+                if getattr(thread_self, '_target', None) is sys.modules['app']._drain_pipe:
+                    drain_calls[0] += 1
+                    if drain_calls[0] == interrupt_on_call:
+                        dl = time.monotonic() + 5.0
+                        while not drain_pid_file.exists() and time.monotonic() < dl:
+                            time.sleep(0.02)
+                        fd = os.open(lock_file, os.O_RDWR)
+                        try:
+                            try:
+                                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                drain_lock_held.append(False)
+                            except OSError:
+                                drain_lock_held.append(True)
+                        finally:
+                            os.close(fd)
+                        raise KeyboardInterrupt()
+                return orig_thread_start(thread_self, *args, **kwargs)
+
+            with mock.patch.object(_threading.Thread, 'start', interrupting_thread_start):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_check_tick(
+                        self.db, self.config,
+                        now_fn=lambda: 1700001000.0 + interrupt_on_call * 100.0,
+                        kill_grace=0.2,
+                        deliver_fn=lambda c, t: True,
+                    )
+            self.assertEqual(drain_lock_held, [True], f'lock must be held on drain thread #{interrupt_on_call} interrupt')
+            d_pid = int(drain_pid_file.read_text(encoding='utf-8').strip())
+            dl = time.monotonic() + 2.0
+            while _pid_alive(d_pid) and time.monotonic() < dl:
+                time.sleep(0.02)
+            self.assertFalse(_pid_alive(d_pid), f'grandchild survived drain thread #{interrupt_on_call} interrupt')
+            fd = os.open(lock_file, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
     def test_normal_exit_observed_after_wait_until_classified_as_deadline_miss(self):
         done_marker = self.root / 'fast_done.flag'
         script_path = self.repo / 'scripts/fast_emit.py'

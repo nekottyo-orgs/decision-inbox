@@ -2512,6 +2512,22 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     if cmd_mono_start >= tick_deadline:
         return None, b'', b'', False, True
     timeout_at = cmd_mono_start + chk['timeout']
+    wait_until = min(timeout_at, tick_deadline)
+
+    def _classify_deadline_miss():
+        # 先に到来した (支配的な) deadline で分類する。
+        # 同時 (timeout_at == tick_deadline) は優先順位 failed_timeout > aborted に従い failed_timeout。
+        if timeout_at <= tick_deadline:
+            return True, False
+        return False, True
+
+    out_state = {'chunks': [], 'eof': False, 'error': False}
+    err_state = {'chunks': [], 'eof': False, 'error': False}
+    out_thread = None
+    err_thread = None
+    timed_out = False
+    aborted = False
+    capture_incomplete = False
     try:
         process = subprocess.Popen(
             chk['argv'],
@@ -2525,26 +2541,12 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     except (OSError, ValueError) as error:
         return None, b'', str(error).encode('utf-8', errors='replace'), False, False
 
-    out_state = {'chunks': [], 'eof': False, 'error': False}
-    err_state = {'chunks': [], 'eof': False, 'error': False}
-    out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_state), daemon=True)
-    err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_state), daemon=True)
-    out_thread.start()
-    err_thread.start()
-
-    wait_until = min(timeout_at, tick_deadline)
-
-    def _classify_deadline_miss():
-        # 先に到来した (支配的な) deadline で分類する。
-        # 同時 (timeout_at == tick_deadline) は優先順位 failed_timeout > aborted に従い failed_timeout。
-        if timeout_at <= tick_deadline:
-            return True, False
-        return False, True
-
-    timed_out = False
-    aborted = False
-    capture_incomplete = False
     try:
+        out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_state), daemon=True)
+        err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_state), daemon=True)
+        out_thread.start()
+        err_thread.start()
+
         wait_budget = max(0.0, wait_until - mono_fn())
         try:
             process.wait(timeout=wait_budget)
@@ -2583,9 +2585,12 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
                 thread.join(timeout=0.5)
     except BaseException:
         _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
-        for thread in (out_thread, err_thread):
-            if thread.is_alive():
+        for thread, stream in ((out_thread, process.stdout), (err_thread, process.stderr)):
+            if thread is not None and thread.is_alive():
                 thread.join(timeout=0.5)
+            if (thread is None or thread.ident is None) and stream is not None:
+                with suppress(OSError, ValueError):
+                    stream.close()
         raise
 
     raw_stdout = b''.join(list(out_state['chunks']))
