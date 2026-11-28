@@ -2769,6 +2769,111 @@ sys.exit(2)
         finally:
             zombie.wait(timeout=5)
 
+    def test_wake_delivery_failure_counted_even_when_bookkeeping_hits_db_contention(self):
+        import threading
+
+        self.commit_config(
+            '[[checks]]\nname = "ev"\ninterval = 60\ncommand = "scripts/emit.py"\ntimeout = 10\nskill = "s1"\n',
+            {
+                'scripts/emit.py': (
+                    '#!/usr/bin/env python3\nimport json\n'
+                    'print(json.dumps({"key": "k1", "title": "t1", "body": "b1"}))\n'
+                ),
+            },
+        )
+        # DB 初期化後にクリーン状態へ戻す
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+
+        def reset_for_case():
+            with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute('DELETE FROM check_tasks')
+                conn.execute('DELETE FROM tasks')
+                conn.execute('DELETE FROM check_runs')
+                conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+
+        def run_case(*, delivery_ok, tick_now):
+            reset_for_case()
+            acquired = threading.Event()
+            release = threading.Event()
+            holder = [None]
+
+            def cleanup():
+                release.set()
+                if holder[0] is not None:
+                    holder[0].join(timeout=3.0)
+
+            self.addCleanup(cleanup)
+
+            def hold_writer():
+                conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    acquired.set()
+                    release.wait(timeout=5.0)
+                finally:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.execute('ROLLBACK')
+                    conn.close()
+
+            orig_wake = run_wake_pass
+            wake_calls = [0]
+
+            def deliver_then_lock_bookkeeping(cand, _timeout):
+                t = threading.Thread(target=hold_writer, daemon=True)
+                holder[0] = t
+                t.start()
+                self.assertTrue(acquired.wait(timeout=3.0))
+                return delivery_ok
+
+            def wrapped_wake(*args, **kwargs):
+                wake_calls[0] += 1
+                try:
+                    return orig_wake(*args, **kwargs)
+                finally:
+                    # end wake 終了後、Step (9) finalization 前に writer を解放する
+                    if wake_calls[0] == 2:
+                        cleanup()
+
+            err_buf = io.StringIO()
+            try:
+                with mock.patch('app.run_wake_pass', side_effect=wrapped_wake), \
+                        contextlib.redirect_stderr(err_buf):
+                    body, rc = run_check_tick(
+                        self.db, self.config,
+                        now_fn=lambda: tick_now,
+                        tick_budget=20.0,
+                        wake_pass_budget=0.15,
+                        wake_item_timeout=0.05,
+                        deliver_fn=deliver_then_lock_bookkeeping,
+                    )
+            finally:
+                cleanup()
+            return body, rc, err_buf.getvalue()
+
+        # (a) 配送失敗 + bookkeeping DB 競合 -> wake_failed=1 として保存されタスクは未通知のまま残る
+        body_fail, rc_fail, err_fail = run_case(delivery_ok=False, tick_now=1700000100.0)
+        self.assertEqual((rc_fail, body_fail['status']), (0, 'ok'))
+        self.assertEqual(body_fail['wake_failed'], 1)
+        self.assertEqual(body_fail['unnotified_tasks'], 1)
+        self.assertIn('wake_failed=1', err_fail)
+        self.assertIn('truncated=True', err_fail)
+        tick_fail = self.query_one('SELECT wake_failed, unnotified_tasks FROM check_ticks WHERE id=?', (body_fail['tick_id'],))
+        self.assertEqual((tick_fail['wake_failed'], tick_fail['unnotified_tasks']), (1, 1))
+        ct_fail = self.query_one('SELECT needs_wake, notified_at, last_wake_attempt_at FROM check_tasks')
+        self.assertEqual((ct_fail['needs_wake'], ct_fail['notified_at'], ct_fail['last_wake_attempt_at']), (1, None, None))
+
+        # (b) 配送成功 + bookkeeping DB 競合 -> wake_failed は増やさず (0)、タスクは未通知のまま残る
+        body_ok, rc_ok, err_ok = run_case(delivery_ok=True, tick_now=1700000200.0)
+        self.assertEqual((rc_ok, body_ok['status']), (0, 'ok'))
+        self.assertEqual(body_ok['wake_failed'], 0)
+        self.assertEqual(body_ok['unnotified_tasks'], 1)
+        self.assertIn('wake_failed=0', err_ok)
+        self.assertIn('truncated=True', err_ok)
+        tick_ok = self.query_one('SELECT wake_failed, unnotified_tasks FROM check_ticks WHERE id=?', (body_ok['tick_id'],))
+        self.assertEqual((tick_ok['wake_failed'], tick_ok['unnotified_tasks']), (0, 1))
+        ct_ok = self.query_one('SELECT needs_wake, notified_at, last_wake_attempt_at FROM check_tasks')
+        self.assertEqual((ct_ok['needs_wake'], ct_ok['notified_at'], ct_ok['last_wake_attempt_at']), (1, None, None))
+
 
 if __name__ == '__main__':
     unittest.main()

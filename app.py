@@ -2793,6 +2793,7 @@ def run_wake_pass(
     cb_limit=CHECK_WAKE_CB_LIMIT, deliver_fn=None,
     busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
     stop_on_db_contention=False,
+    failed_ids_out=None,
 ):
     """1 回の wake パスを実行する。
     (1) I/O ループ前に回収 (claim 済み・終了済みの needs_wake=0) を無条件に一括 UPDATE。
@@ -2870,6 +2871,13 @@ def run_wake_pass(
             ok, _reason = _deliver_wake_run_inbox(
                 candidate, run_inbox_bin=inbox_bin, run_id_box=run_id_box, timeout=item_timeout, mono_fn=mono_fn,
             )
+        if ok:
+            consecutive_failures = 0
+        else:
+            failed_ids.add(candidate['task_id'])
+            if failed_ids_out is not None:
+                failed_ids_out.add(candidate['task_id'])
+            consecutive_failures += 1
         try:
             with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
                 connection.execute('BEGIN IMMEDIATE')
@@ -2878,14 +2886,11 @@ def run_wake_pass(
                         'UPDATE check_tasks SET needs_wake=0, notified_at=?, last_wake_attempt_at=? WHERE task_id=?',
                         (attempt_iso, attempt_iso, candidate['task_id']),
                     )
-                    consecutive_failures = 0
                 else:
                     connection.execute(
                         'UPDATE check_tasks SET last_wake_attempt_at=? WHERE task_id=?',
                         (attempt_iso, candidate['task_id']),
                     )
-                    failed_ids.add(candidate['task_id'])
-                    consecutive_failures += 1
         except sqlite3.Error as db_error:
             if stop_on_db_contention and _is_sqlite_retryable_contention(db_error):
                 return failed_ids, True, attempted
