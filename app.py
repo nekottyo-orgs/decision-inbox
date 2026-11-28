@@ -3180,6 +3180,8 @@ def _check_readonly_db(db_path):
     try:
         yield connection
     finally:
+        with suppress(sqlite3.Error):
+            connection.rollback()
         connection.close()
 
 
@@ -3189,7 +3191,10 @@ def _table_exists(connection, name):
 
 def check_list_data(db_path):
     with _check_readonly_db(db_path) as connection:
-        if connection is None or not _table_exists(connection, 'checks'):
+        if connection is None:
+            return {'checks': []}
+        connection.execute('BEGIN')
+        if not _table_exists(connection, 'checks'):
             return {'checks': []}
         rows = connection.execute('SELECT * FROM checks ORDER BY enabled DESC, toml_order ASC, name ASC').fetchall()
         items = []
@@ -3229,6 +3234,7 @@ def check_status_data(db_path, *, limit=20, now_fn=None):
         'last_ok_tick_at': None,
         'recent_ticks': [],
         'running_leftover_count': 0,
+        'running_in_progress_count': 0,
         'unnotified_tasks': 0,
         'last_completed_wake_failed': None,
         'checks_deferred_24h': {'total': 0, 'ticks': 0},
@@ -3239,6 +3245,8 @@ def check_status_data(db_path, *, limit=20, now_fn=None):
     with _check_readonly_db(db_path) as connection:
         if connection is None:
             return empty
+        # 最初の table probe の前に read transaction を開始し、全クエリを単一スナップショットから読む
+        connection.execute('BEGIN')
         if _table_exists(connection, 'check_ticks'):
             ok_row = connection.execute(
                 "SELECT COALESCE(finished_at, started_at) AS ts FROM check_ticks WHERE status='ok' ORDER BY id DESC LIMIT 1"
@@ -3254,12 +3262,20 @@ def check_status_data(db_path, *, limit=20, now_fn=None):
             ]
             ticks.reverse()
             empty['recent_ticks'] = ticks
-            empty['running_leftover_count'] = connection.execute(
-                "SELECT COUNT(*) FROM check_ticks WHERE status='running'"
-            ).fetchone()[0]
+            # flock で直列化された後続の非 skipped tick が存在する場合のみ、それ以前の running 行を異常終了の残留と確定できる。
+            # 最新の非 skipped tick が running の場合は正常に実行中であり得るため異常終了と断定しない。
+            latest_holder = connection.execute(
+                "SELECT id, status FROM check_ticks WHERE status != 'skipped' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest_holder is not None:
+                empty['running_leftover_count'] = connection.execute(
+                    "SELECT COUNT(*) FROM check_ticks WHERE status='running' AND id < ?",
+                    (latest_holder['id'],),
+                ).fetchone()[0]
+                empty['running_in_progress_count'] = 1 if latest_holder['status'] == 'running' else 0
 
             completed_row = connection.execute(
-                "SELECT wake_failed FROM check_ticks WHERE status IN ('ok', 'aborted', 'config_error') ORDER BY id DESC LIMIT 1"
+                "SELECT wake_failed FROM check_ticks WHERE status IN ('ok', 'aborted', 'config_error', 'failed') ORDER BY id DESC LIMIT 1"
             ).fetchone()
             empty['last_completed_wake_failed'] = completed_row['wake_failed'] if completed_row else None
 
@@ -3314,6 +3330,8 @@ def format_check_status(data):
     ]
     if data['running_leftover_count'] > 0:
         lines.append(f"WARNING: running 残留 tick が {data['running_leftover_count']} 件あります (異常終了の痕跡)")
+    if data.get('running_in_progress_count', 0) > 0:
+        lines.append('running_in_progress: 1 (最新 tick が status=running です。実行中の可能性があります)')
     if data['recent_ticks']:
         lines.append('recent_ticks:')
         for tick in data['recent_ticks']:

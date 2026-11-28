@@ -2029,6 +2029,131 @@ sys.exit(2)
         self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
         self.assertIn('failed to commit check run', err_buf.getvalue())
 
+    def test_status_does_not_report_active_running_tick_as_abnormal_exit(self):
+        started_flag = self.root / 'active_tick.started'
+        release_flag = self.root / 'active_tick.release'
+        pgid_file = self.root / 'active_tick.pgid'
+        self.commit_config(
+            '[[checks]]\nname = "hold"\ninterval = 300\ncommand = "scripts/hold.py"\ntimeout = 20\nskill = "s1"\n',
+            {
+                'scripts/hold.py': (
+                    '#!/usr/bin/env python3\nimport os, pathlib, time\n'
+                    f'tmp = pathlib.Path({str(pgid_file)!r} + ".tmp")\n'
+                    'tmp.write_text(str(os.getpgrp()), encoding="utf-8")\n'
+                    f'tmp.replace({str(pgid_file)!r})\n'
+                    f'pathlib.Path({str(started_flag)!r}).write_text("ok", encoding="utf-8")\n'
+                    f'while not pathlib.Path({str(release_flag)!r}).exists():\n'
+                    '    time.sleep(0.05)\n'
+                ),
+            },
+        )
+        env = isolated_env(self.root)
+        env['CUE_RUN_INBOX_BIN'] = str(self.run_inbox)
+        env['CUE_CHECK_NOW'] = '1700000000'
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'check', 'tick', '--config', str(self.config)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
+        )
+        try:
+            dl = time.monotonic() + 10.0
+            while not started_flag.exists() and time.monotonic() < dl:
+                time.sleep(0.05)
+            self.assertTrue(started_flag.exists(), 'active tick did not start check')
+
+            # 実行中の tick に対して別 tick が skipped を書いても、実行中 tick を異常終了と報告しないこと
+            sk = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': '1700000010'})
+            self.assertEqual(sk.returncode, 0, sk.stderr)
+            self.assertEqual(json.loads(sk.stdout)['status'], 'skipped')
+
+            st_json = json.loads(self.cli('check', 'status', '--json').stdout)
+            self.assertEqual(st_json['running_leftover_count'], 0)
+            self.assertEqual(st_json['running_in_progress_count'], 1)
+            st_text = self.cli('check', 'status').stdout
+            self.assertNotIn('WARNING', st_text)
+            self.assertNotIn('異常終了', st_text)
+
+            # 正常完了させる
+            release_flag.write_text('go', encoding='utf-8')
+            out, err = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(json.loads(out)['status'], 'ok')
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    proc.wait(timeout=2)
+            if pgid_file.exists():
+                with contextlib.suppress(ValueError, ProcessLookupError, OSError):
+                    os.killpg(int(pgid_file.read_text(encoding='utf-8').strip()), signal.SIGKILL)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+        after_json = json.loads(self.cli('check', 'status', '--json').stdout)
+        self.assertEqual(after_json['running_leftover_count'], 0)
+        self.assertEqual(after_json['running_in_progress_count'], 0)
+        self.assertIsNotNone(after_json['last_ok_tick_at'])
+
+    def test_status_reads_all_queries_from_single_db_snapshot(self):
+        # WAL DB を初期化し、status='running' の tick のみが存在する状態を作る
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+        ts0 = datetime.fromtimestamp(1700000100.0, timezone.utc).isoformat(timespec='microseconds')
+        ts1 = datetime.fromtimestamp(1700000105.0, timezone.utc).isoformat(timespec='microseconds')
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_ticks')
+            cur = conn.execute(
+                "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, NULL, 'running', 0, 0, NULL)",
+                (ts0,),
+            )
+            running_tick_id = cur.lastrowid
+
+        orig_ro_db = sys.modules['app']._check_readonly_db
+        committed_mid_read = [False]
+
+        class SnapshotProbingConn:
+            def __init__(self, inner, db_path):
+                self._inner = inner
+                self._db_path = db_path
+
+            def execute(self, sql, *args, **kwargs):
+                result = self._inner.execute(sql, *args, **kwargs)
+                # last_ok_tick_at を読んだ直後・recent_ticks を読む前に別接続で running -> ok を commit する
+                if "WHERE status='ok'" in sql and not committed_mid_read[0]:
+                    committed_mid_read[0] = True
+                    with contextlib.closing(sqlite3.connect(self._db_path)) as writer, writer:
+                        writer.execute(
+                            "UPDATE check_ticks SET status='ok', finished_at=?, checks_deferred=0 WHERE id=?",
+                            (ts1, running_tick_id),
+                        )
+                return result
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        @contextlib.contextmanager
+        def wrapped_ro_db(db_path):
+            with orig_ro_db(db_path) as conn:
+                yield SnapshotProbingConn(conn, db_path) if conn is not None else None
+
+        with mock.patch('app._check_readonly_db', side_effect=wrapped_ro_db):
+            snap = check_status_data(self.db, now_fn=lambda: 1700000110.0)
+
+        self.assertTrue(committed_mid_read[0])
+        # 同じスナップショットから読んでいるため last_ok_tick_at=None と recent_ticks=[running] が整合する
+        self.assertIsNone(snap['last_ok_tick_at'])
+        self.assertEqual([t['status'] for t in snap['recent_ticks']], ['running'])
+
+        # 次の check_status_data 呼び出しでは新しいスナップショットで両方 ok として整合する
+        snap_after = check_status_data(self.db, now_fn=lambda: 1700000110.0)
+        self.assertEqual(snap_after['last_ok_tick_at'], ts1)
+        self.assertEqual([t['status'] for t in snap_after['recent_ticks']], ['ok'])
+
 
 if __name__ == '__main__':
     unittest.main()
