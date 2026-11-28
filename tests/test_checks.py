@@ -1796,10 +1796,11 @@ sys.exit(2)
         )
 
         # wait_budget == 0.0 で process.wait() が既に終了した子を TimeoutExpired なしで回収する状況を再現
-        def run_case(timeout_sec, tick_deadline_offset):
+        def run_case(timeout_sec, tick_deadline_offset, *, observed_offset=None):
             if done_marker.exists():
                 done_marker.unlink()
             calls = {'n': 0}
+            obs = (min(timeout_sec, tick_deadline_offset) + 0.5) if observed_offset is None else observed_offset
 
             def mono_fn():
                 calls['n'] += 1
@@ -1811,7 +1812,7 @@ sys.exit(2)
                     while not done_marker.exists() and time.monotonic() < dl:
                         time.sleep(0.01)
                     time.sleep(0.05)
-                return 1000.0 + min(timeout_sec, tick_deadline_offset) + 0.5
+                return 1000.0 + obs
 
             wait_raised_timeout = []
             orig_wait = subprocess.Popen.wait
@@ -1838,6 +1839,40 @@ sys.exit(2)
         ec_b, _out_b, _err_b, to_b, ab_b = run_case(5.0, 10.0)
         self.assertIsNone(ec_b)
         self.assertEqual((to_b, ab_b), (True, False))
+
+        # (c) 親の観測が相手側 deadline を越えるほど遅れても、先に到来した (支配的な) deadline で分類する
+        # tick_deadline=+5, timeout=+10 だが観測が +11 まで遅れた場合 -> 支配的なのは tick_deadline なので aborted
+        ec_c, _out_c, _err_c, to_c, ab_c = run_case(10.0, 5.0, observed_offset=11.0)
+        self.assertIsNone(ec_c)
+        self.assertEqual((to_c, ab_c), (False, True))
+
+        # (d) timeout=+5, tick_deadline=+10 で観測が +11 まで遅れた場合 -> 支配的なのは command timeout なので failed_timeout
+        ec_d, _out_d, _err_d, to_d, ab_d = run_case(5.0, 10.0, observed_offset=11.0)
+        self.assertIsNone(ec_d)
+        self.assertEqual((to_d, ab_d), (True, False))
+
+        # (e) 両 deadline が同時 (timeout=+5, tick_deadline=+5) で観測が +11 でも優先順位に従い failed_timeout
+        ec_e, _out_e, _err_e, to_e, ab_e = run_case(5.0, 5.0, observed_offset=11.0)
+        self.assertIsNone(ec_e)
+        self.assertEqual((to_e, ab_e), (True, False))
+
+        # (f) TimeoutExpired 経路でも tick_deadline < timeout なら観測が timeout 超過後でも aborted
+        sleep_script = self.repo / 'scripts/sleep_slow.py'
+        _write_exec(sleep_script, '#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n')
+        te_calls = {'n': 0}
+
+        def late_timeout_mono():
+            te_calls['n'] += 1
+            if te_calls['n'] == 1:
+                return 1000.0  # cmd_mono_start
+            if te_calls['n'] == 2:
+                return 1004.95  # wait_budget = 0.05s (< tick_deadline=1005.0)
+            return 1015.0  # 相手側 command timeout (1010.0) を大きく超過した観測時刻
+
+        chk_slow = {'name': 'slow', 'argv': [str(sleep_script)], 'timeout': 10.0, 'env': {}, 'clock_anomaly': False, 'skill': 's1', 'fault_threshold': 3}
+        ec_f, _out_f, _err_f, to_f, ab_f = run_check_command(chk_slow, self.repo, 1005.0, mono_fn=late_timeout_mono, kill_grace=0.1)
+        self.assertIsNone(ec_f)
+        self.assertEqual((to_f, ab_f), (False, True))
 
     def test_end_wake_and_pruning_charged_against_tick_deadline_with_finalize_reserve(self):
         self.commit_config(

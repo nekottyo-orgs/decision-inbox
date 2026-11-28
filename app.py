@@ -2534,9 +2534,10 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
 
     wait_until = min(timeout_at, tick_deadline)
 
-    def _classify_deadline_miss(observed_mono):
-        # 優先順位: failed_timeout > aborted。経過時間が timeout に達していれば tick 上限と同時でも failed_timeout
-        if (observed_mono - cmd_mono_start) >= chk['timeout'] or timeout_at <= tick_deadline:
+    def _classify_deadline_miss():
+        # 先に到来した (支配的な) deadline で分類する。
+        # 同時 (timeout_at == tick_deadline) は優先順位 failed_timeout > aborted に従い failed_timeout。
+        if timeout_at <= tick_deadline:
             return True, False
         return False, True
 
@@ -2548,13 +2549,13 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
         try:
             process.wait(timeout=wait_budget)
         except subprocess.TimeoutExpired:
-            timed_out, aborted = _classify_deadline_miss(mono_fn())
+            timed_out, aborted = _classify_deadline_miss()
             _terminate_process_group(process, kill_grace)
         else:
             now_m = mono_fn()
             if now_m >= wait_until:
                 # wait_until 以降に観測された完了は TimeoutExpired と同じく deadline miss とし exit code を捨てる
-                timed_out, aborted = _classify_deadline_miss(now_m)
+                timed_out, aborted = _classify_deadline_miss()
                 _terminate_process_group(process, kill_grace)
             else:
                 # stdout / stderr の EOF 回収にも同じ wait_until を適用する
@@ -2566,14 +2567,14 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
                 now_m = mono_fn()
                 if out_thread.is_alive() or err_thread.is_alive():
                     # pipe が deadline までに EOF へ到達しなかった: グループを停止し不完全出力を parse させない
-                    timed_out, aborted = _classify_deadline_miss(max(now_m, wait_until))
+                    timed_out, aborted = _classify_deadline_miss()
                     _terminate_process_group(process, kill_grace)
                 elif not out_state['eof'] or not err_state['eof']:
                     # EOF に到達しない読み取り異常: 空出力を ok_silent と誤認させない
                     capture_incomplete = True
                     _terminate_process_group(process, kill_grace)
                 elif now_m >= wait_until:
-                    timed_out, aborted = _classify_deadline_miss(now_m)
+                    timed_out, aborted = _classify_deadline_miss()
                     _terminate_process_group(process, kill_grace)
 
         # グループ停止後の drain thread 終了を短く上限付きで待ち、抜粋を可能な限り回収する
