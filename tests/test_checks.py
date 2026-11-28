@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import (
@@ -22,6 +23,7 @@ from app import (
     check_lock_path,
     check_status_data,
     parse_check_jsonl,
+    run_check_command,
     run_check_tick,
     run_wake_pass,
 )
@@ -42,6 +44,16 @@ def _write_exec(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding='utf-8')
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
 
 
 class FakeClock:
@@ -212,6 +224,69 @@ sys.exit(2)
         finally:
             os.close(fd)
 
+    def test_symlink_db_path_shares_lockfile_with_real_path(self):
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 30\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        # 初回 tick で実体 DB と lockfile を作成
+        first = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': '1700000000'})
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        # (a) ファイル symlink と (b) ディレクトリ symlink の両方で lockfile が実体パスと一致すること
+        link_db = self.root / 'link.sqlite3'
+        link_db.symlink_to(self.db)
+        real_dir = self.root / 'real_dir'
+        real_dir.mkdir()
+        real_db2 = real_dir / 'cue2.sqlite3'
+        link_dir = self.root / 'link_dir'
+        link_dir.symlink_to(real_dir)
+        link_db2 = link_dir / 'cue2.sqlite3'
+
+        self.assertEqual(check_lock_path(link_db), check_lock_path(self.db))
+        self.assertEqual(check_lock_path(link_db2), check_lock_path(real_db2))
+
+        # 実体パス側で flock 保持中、symlink 経由の 2 本目 tick は skipped になる
+        real_lock = check_lock_path(self.db)
+        fd = os.open(real_lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res_sym, rc_sym = run_check_tick(
+                link_db, self.config,
+                now_fn=lambda: 1700000500.0,
+                deliver_fn=lambda c, t: True,
+            )
+            self.assertEqual(rc_sym, 0)
+            self.assertEqual(res_sym['status'], 'skipped')
+        finally:
+            os.close(fd)
+
+        # symlink 側に別の lockfile が作られていないこと、skip が実体 DB に記録されていること
+        self.assertFalse((self.root / 'link.sqlite3.check.lock').exists())
+        ticks = self.query_all('SELECT status FROM check_ticks ORDER BY id')
+        self.assertEqual([t['status'] for t in ticks], ['ok', 'skipped'])
+
+        # 逆方向: ディレクトリ symlink 経由で flock 保持中、実体パス経由の tick も skipped になる
+        res_init, rc_init = run_check_tick(
+            link_db2, self.config,
+            now_fn=lambda: 1700000000.0,
+            deliver_fn=lambda c, t: True,
+        )
+        self.assertEqual((rc_init, res_init['status']), (0, 'ok'))
+        lock2 = check_lock_path(link_db2)
+        fd2 = os.open(lock2, os.O_RDWR)
+        try:
+            fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res_real, rc_real = run_check_tick(
+                real_db2, self.config,
+                now_fn=lambda: 1700000500.0,
+                deliver_fn=lambda c, t: True,
+            )
+            self.assertEqual(rc_real, 0)
+            self.assertEqual(res_real['status'], 'skipped')
+        finally:
+            os.close(fd2)
+
     # --- 3. kill -9 後の running 残留と次 tick の継続 ---
 
     def test_kill_9_leaves_running_tick_and_next_tick_recovers(self):
@@ -308,7 +383,7 @@ sys.exit(2)
         names = [r['name'] for r in self.query_all('SELECT name FROM checks')]
         self.assertEqual(names, ['c1'])
 
-        # 各不正 TOML パターン (timeout > 180, interval <= 0, duplicate name, empty skill, fault_threshold < 1, .. 脱出)
+        # 各不正 TOML パターン (timeout > 180, interval <= 0, duplicate name, empty skill, fault_threshold < 1, .. 脱出, env キー不正)
         bad_tomls = [
             '[[checks]]\nname = "a"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 181\nskill = "s"\n',
             '[[checks]]\nname = "a"\ninterval = 0\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n',
@@ -317,6 +392,8 @@ sys.exit(2)
             '[[checks]]\nname = "a"\ninterval = 300\ncommand = "../outside.sh"\ntimeout = 10\nskill = "s"\n',
             '[[checks]]\nname = "dup"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n'
             '[[checks]]\nname = "dup"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n',
+            '[[checks]]\nname = "a"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n[checks.env]\n"BAD=KEY" = "1"\n',
+            '[[checks]]\nname = "a"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n[checks.env]\n"" = "1"\n',
             'not valid toml === [',
         ]
         for idx, bad in enumerate(bad_tomls):
@@ -324,6 +401,44 @@ sys.exit(2)
             r = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': str(1700001200 + idx * 10)})
             self.assertEqual(r.returncode, 1, f'case {idx} should fail')
             self.assertEqual(json.loads(r.stdout)['status'], 'config_error', f'case {idx}')
+
+    def test_popen_value_error_is_recorded_as_check_failure_not_running_crash(self):
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 30\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        # 1. run_check_command 直接呼び出しで不正 env (Popen ValueError) が例外死せず失敗として返ること
+        chk = {
+            'name': 'c1',
+            'argv': [str(self.repo / 'scripts/ok.sh')],
+            'timeout': 10.0,
+            'env': {'BAD=KEY': '1'},
+        }
+        rc, out, err, timed_out, aborted = run_check_command(chk, self.repo, time.monotonic() + 30.0)
+        self.assertIsNone(rc)
+        self.assertEqual((out, timed_out, aborted), (b'', False, False))
+        self.assertTrue(len(err) > 0)
+
+        # 2. tick 内で check 起動時の Popen が ValueError を投げても running 残留せず failed_exit として記録されること
+        real_popen = subprocess.Popen
+
+        def popen_failing_on_check(argv, *args, **kwargs):
+            if argv and str(argv[0]).endswith('scripts/ok.sh'):
+                raise ValueError('illegal environment variable name')
+            return real_popen(argv, *args, **kwargs)
+
+        with mock.patch('app.subprocess.Popen', side_effect=popen_failing_on_check):
+            res, exit_code = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000000.0,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((exit_code, res['status']), (0, 'ok'))
+        run = self.query_one('SELECT outcome, exit_code, stderr_excerpt FROM check_runs')
+        self.assertEqual(run['outcome'], 'failed_exit')
+        self.assertIsNone(run['exit_code'])
+        self.assertIn('illegal environment variable name', run['stderr_excerpt'])
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
 
     def test_config_error_still_runs_start_wake_before_failing(self):
         self.commit_config(
@@ -461,17 +576,15 @@ sys.exit(2)
         self.assertEqual((before_c1['last_outcome'], before_c1['fault_count']), ('failed_exit', 1))
 
         # tick_budget = 0.6s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し tick 上限で aborted。c2 は未着手で checks_deferred=1
-        r1 = self.cli(
-            'check', 'tick', '--config', str(self.config),
-            env_extra={
-                'CUE_CHECK_NOW': '1700001000',
-                'MODE': 'sleep',
-                'CUE_CHECK_TICK_BUDGET_SEC': '0.6',
-                'CUE_CHECK_KILL_GRACE_SEC': '0.2',
-            },
-        )
-        self.assertEqual(r1.returncode, 0, r1.stderr)
-        b1 = json.loads(r1.stdout)
+        with mock.patch.dict(os.environ, {'MODE': 'sleep'}):
+            b1, rc1 = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700001000.0,
+                tick_budget=0.6,
+                kill_grace=0.2,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual(rc1, 0)
         self.assertEqual(b1['status'], 'aborted')
         self.assertEqual(b1['checks_deferred'], 1)
 
@@ -487,12 +600,13 @@ sys.exit(2)
             '[[checks]]\nname = "c2"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
             {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
         )
-        res = self.cli(
-            'check', 'tick', '--config', str(self.config),
-            env_extra={'CUE_CHECK_NOW': '1700000000', 'CUE_CHECK_TICK_BUDGET_SEC': '0'},
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=lambda: 1700000000.0,
+            tick_budget=0.0,
+            deliver_fn=lambda c, t: True,
         )
-        self.assertEqual(res.returncode, 0, res.stderr)
-        body = json.loads(res.stdout)
+        self.assertEqual(rc, 0)
         self.assertEqual(body['status'], 'aborted')
         self.assertEqual(body['checks_deferred'], 2)
         self.assertEqual(self.query_all('SELECT * FROM check_runs'), [])
@@ -505,16 +619,88 @@ sys.exit(2)
             {'scripts/fast.sh': '#!/bin/sh\nexit 0\n'},
         )
         # tick_budget = 5s: c1 (timeout 1) 実行 -> c2_heavy (timeout 50 > remaining) 見送り -> c3_light (timeout 1) 実行!
-        res = self.cli(
-            'check', 'tick', '--config', str(self.config),
-            env_extra={'CUE_CHECK_NOW': '1700000000', 'CUE_CHECK_TICK_BUDGET_SEC': '5'},
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=lambda: 1700000000.0,
+            tick_budget=5.0,
+            deliver_fn=lambda c, t: True,
         )
-        self.assertEqual(res.returncode, 0, res.stderr)
-        body = json.loads(res.stdout)
+        self.assertEqual(rc, 0)
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['checks_deferred'], 1)
         ran = [r['check_name'] for r in self.query_all('SELECT check_name FROM check_runs ORDER BY id')]
         self.assertEqual(ran, ['c1', 'c3_light'])
+
+    def test_checks_deferred_sums_guard_skip_and_post_abort_unstarted(self):
+        self.commit_config(
+            '[[checks]]\nname = "c1_fast"\ninterval = 60\ncommand = "scripts/fast.sh"\ntimeout = 1\nskill = "s1"\n'
+            '[[checks]]\nname = "c2_guard_skip"\ninterval = 60\ncommand = "scripts/fast.sh"\ntimeout = 50\nskill = "s1"\n'
+            '[[checks]]\nname = "c3_aborted"\ninterval = 60\ncommand = "scripts/slow.sh"\ntimeout = 1\nskill = "s1"\n'
+            '[[checks]]\nname = "c4_unstarted"\ninterval = 60\ncommand = "scripts/fast.sh"\ntimeout = 1\nskill = "s1"\n'
+            '[[checks]]\nname = "c5_unstarted"\ninterval = 60\ncommand = "scripts/fast.sh"\ntimeout = 1\nskill = "s1"\n',
+            {
+                'scripts/fast.sh': '#!/bin/sh\nexit 0\n',
+                'scripts/slow.sh': '#!/bin/sh\nsleep 5\n',
+            },
+        )
+        # c1_fast 完了後に c2_guard_skip が着手前ガードで見送り (+1)、
+        # c3_aborted はガード通過後に残り時間が縮んで tick 上限で aborted、
+        # 残りの c4_unstarted / c5_unstarted (+2) と合算されて checks_deferred == 3 になること
+        extra_mono = [0.0]
+        bumped = [False]
+
+        def mono_fn():
+            return time.monotonic() + extra_mono[0]
+
+        def now_fn():
+            if not bumped[0] and self.db.exists():
+                with contextlib.closing(sqlite3.connect(self.db)) as conn:
+                    has_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='check_runs'"
+                    ).fetchone()
+                    if has_table and conn.execute("SELECT 1 FROM check_runs WHERE check_name='c1_fast'").fetchone():
+                        bumped[0] = True
+                        extra_mono[0] = 1.6
+            return 1700000000.0
+
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=now_fn,
+            mono_fn=mono_fn,
+            tick_budget=2.0,
+            kill_grace=0.1,
+            deliver_fn=lambda c, t: True,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(body['status'], 'aborted')
+        self.assertEqual(body['checks_deferred'], 3)
+        runs = [(r['check_name'], r['outcome']) for r in self.query_all('SELECT check_name, outcome FROM check_runs ORDER BY id')]
+        self.assertEqual(runs, [('c1_fast', 'ok_silent'), ('c3_aborted', 'aborted')])
+        tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT 1')
+        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 3))
+
+    def test_cli_ignores_fixed_budget_override_env_vars(self):
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        # 設計上固定の上限を環境変数で 0 に書き換えようとしても本番 CLI は無視し、通常通り実行される
+        res = self.cli(
+            'check', 'tick', '--config', str(self.config),
+            env_extra={
+                'CUE_CHECK_NOW': '1700000000',
+                'CUE_CHECK_TICK_BUDGET_SEC': '0',
+                'CUE_CHECK_WAKE_BUDGET_SEC': '0',
+                'CUE_CHECK_WAKE_ITEM_TIMEOUT_SEC': '999',
+                'CUE_CHECK_KILL_GRACE_SEC': '0',
+            },
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        body = json.loads(res.stdout)
+        self.assertEqual(body['status'], 'ok')
+        self.assertEqual(body['checks_deferred'], 0)
+        runs = self.query_all('SELECT check_name, outcome FROM check_runs')
+        self.assertEqual(runs, [{'check_name': 'c1', 'outcome': 'ok_silent'}])
 
     def test_timeout_priority_and_process_group_sigterm_then_sigkill(self):
         child_pid_file = self.root / 'child.pid'
@@ -530,17 +716,67 @@ sys.exit(2)
                 ),
             },
         )
-        res = self.cli(
-            'check', 'tick', '--config', str(self.config),
-            env_extra={'CUE_CHECK_NOW': '1700000000', 'CUE_CHECK_KILL_GRACE_SEC': '0.2'},
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=lambda: 1700000000.0,
+            kill_grace=0.2,
+            deliver_fn=lambda c, t: True,
         )
-        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual((rc, body['status']), (0, 'ok'))
         run = self.query_one('SELECT outcome, exit_code FROM check_runs')
         self.assertEqual(run['outcome'], 'failed_timeout')
         self.assertIsNone(run['exit_code'])
         # 孫プロセスも SIGKILL で確実に消えていること
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
+        self.addCleanup(lambda: os.kill(child_pid, signal.SIGKILL) if _pid_alive(child_pid) else None)
         time.sleep(0.1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+
+    def test_timeout_sigkills_term_ignoring_child_after_leader_exits_on_term(self):
+        child_pid_file = self.root / 'child_orphan.pid'
+        child_ready_flag = self.root / 'child_ready.flag'
+        leader_exited_flag = self.root / 'leader_exited.flag'
+        child_code = (
+            'import signal, time; '
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+            f'open({str(child_ready_flag)!r}, "w", encoding="utf-8").write("ready"); '
+            'time.sleep(60)'
+        )
+        leader_script = (
+            '#!/usr/bin/env python3\n'
+            'import os, signal, subprocess, sys, time\n'
+            'child = subprocess.Popen(\n'
+            f'    [sys.executable, "-c", {child_code!r}],\n'
+            '    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
+            ')\n'
+            f'open({str(child_pid_file)!r}, "w", encoding="utf-8").write(str(child.pid))\n'
+            'def on_term(_signum, _frame):\n'
+            f'    open({str(leader_exited_flag)!r}, "w", encoding="utf-8").write("term")\n'
+            '    os._exit(0)\n'
+            'signal.signal(signal.SIGTERM, on_term)\n'
+            'time.sleep(60)\n'
+        )
+        self.commit_config(
+            '[[checks]]\nname = "leader_exits"\ninterval = 60\ncommand = "scripts/leader_exits.py"\ntimeout = 1.0\nskill = "s1"\n',
+            {'scripts/leader_exits.py': leader_script},
+        )
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=lambda: 1700000000.0,
+            kill_grace=0.2,
+            deliver_fn=lambda c, t: True,
+        )
+        self.assertEqual((rc, body['status']), (0, 'ok'))
+        run = self.query_one('SELECT outcome, exit_code FROM check_runs')
+        self.assertEqual(run['outcome'], 'failed_timeout')
+        self.assertIsNone(run['exit_code'])
+        # 子が SIGTERM 無視を設定済みであり、リーダーが SIGTERM で即終了したこと (既存テストと区別)
+        self.assertTrue(child_ready_flag.exists())
+        self.assertTrue(leader_exited_flag.exists())
+        # TERM を無視した子プロセスも猶予後の SIGKILL で残っていないこと
+        child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
+        self.addCleanup(lambda: os.kill(child_pid, signal.SIGKILL) if _pid_alive(child_pid) else None)
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
 
@@ -867,6 +1103,53 @@ sys.exit(2)
         self.assertEqual(attempts, ['t_aaa_ev'])  # 開始時の 1 回だけ (終了時 wake では再試行しない)
         self.assertEqual(res['wake_failed'], 1)
         self.assertIn('warning:', err_buf.getvalue())
+
+    def test_wake_order_coalesce_moves_retried_task_behind_newer_unattempted(self):
+        # DB を初期化
+        self.commit_config(
+            '[[checks]]\nname = "noop"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+
+        iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec='microseconds')
+        # created_at は t_retried_fault (T+5) < t_retried_ev (T+10) < t_fresh_newer (T+20) < t_newest (T+40) だが、
+        # 再試行済み (last_wake_attempt_at = T+30) の 2 件は COALESCE(last_wake_attempt_at, created_at) に従い
+        # より新しい未試行タスク t_fresh_newer (T+20) より後ろ、t_newest (T+40) より前に並ぶ。
+        # created_at のみで並べる誤実装や NULLS FIRST/LAST の誤実装では一致しない入力。
+        rows = [
+            ('t_retried_fault', 'fault', CHECK_FAULT_SKILL, iso(1700000005), iso(1700000030)),
+            ('t_retried_ev', 'event', 's', iso(1700000010), iso(1700000030)),
+            ('t_fresh_newer', 'event', 's', iso(1700000020), None),
+            ('t_newest', 'event', 's', iso(1700000040), None),
+        ]
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            for tid, kind, skill, created_iso, attempt_iso in rows:
+                conn.execute(
+                    "INSERT INTO tasks(id, title, lane, created_at, updated_at, kind, done_when) VALUES(?, ?, 'todo', ?, ?, 'monitor', 'w')",
+                    (tid, tid, created_iso, created_iso),
+                )
+                conn.execute(
+                    "INSERT INTO check_tasks(task_id, check_name, kind, dedup_key, skill, needs_wake, last_wake_attempt_at, created_at) "
+                    "VALUES(?, 'noop', ?, '', ?, 1, ?, ?)",
+                    (tid, kind, skill, attempt_iso, created_iso),
+                )
+
+        clock = FakeClock(wall=1700000100.0, mono=100.0)
+        order = []
+
+        def record_deliver(cand, _timeout):
+            order.append(cand['task_id'])
+            return True
+
+        failed, truncated, attempted = run_wake_pass(
+            self.db,
+            now_iso_fn=lambda: iso(clock.now()),
+            mono_fn=clock.monotonic,
+            deliver_fn=record_deliver,
+        )
+        self.assertEqual((failed, truncated, attempted), (set(), False, 4))
+        self.assertEqual(order, ['t_fresh_newer', 't_retried_fault', 't_retried_ev', 't_newest'])
 
     # --- 11. 30 日 prune と CLI list / status 表示 ---
 
