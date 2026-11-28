@@ -33,6 +33,7 @@ TASK_KINDS = ('decision', 'monitor', 'research', 'implement')
 SESSION_ROLES = ('frontdesk', 'worker', 'cue_worker')
 SESSION_CLIS = ('claude', 'codex')
 SESSION_CLOSE_REASONS = ('normal', 'replaced', 'crashed', 'closed')
+SESSION_METRICS = ('turn_count', 'input_tokens', 'elapsed_seconds')
 POST_STATES = ('unreceived', 'received')
 POST_CLASSIFICATIONS = ('expected', 'unexpected')
 # 人待ち理由で止まっている lane。投稿の分類 (想定内) は投稿時点のこの集合から導く (設計 Q13)
@@ -123,6 +124,8 @@ def text(value, name, maximum, empty=False):
 
 def parse_iso_timestamp(value, name):
     text(value, name, 64)
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
     try:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None:
@@ -451,6 +454,10 @@ class Store:
                 req_id TEXT NOT NULL DEFAULT '', pane TEXT NOT NULL, socket TEXT NOT NULL,
                 cli TEXT NOT NULL, native_session_id TEXT NOT NULL,
                 opened_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT NOT NULL DEFAULT '')''')
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(sessions)')}
+            for column in SESSION_METRICS:
+                if column not in columns:
+                    connection.execute(f'ALTER TABLE sessions ADD COLUMN {column} INTEGER')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_native ON sessions(cli, native_session_id) WHERE closed_at IS NULL')
             connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS sessions_open_slot ON sessions(run_id, role, pane, socket) WHERE closed_at IS NULL')
             # posts も同じく IF NOT EXISTS で足すだけ (理由は tasks / runs と同じ)。依頼 thread への人の投稿を
@@ -898,6 +905,33 @@ class Store:
                                (utc_now(), reason, target_id))
             return dict(connection.execute('SELECT * FROM sessions WHERE id=?', (target_id,)).fetchone())
 
+    def sample_session(self, session_id, observed_at, *, turn_count=None, input_tokens=None):
+        if type(session_id) is not int or not 1 <= session_id < 2**63:
+            raise AppError(400, 'id は正の SQLite 整数を指定してください')
+        if turn_count is None and input_tokens is None:
+            raise AppError(400, 'turn_count または input_tokens を指定してください')
+        for name, value in (('turn_count', turn_count), ('input_tokens', input_tokens)):
+            if value is not None and (type(value) is not int or not 0 <= value < 2**63):
+                raise AppError(400, f'{name} は非負の SQLite 整数を指定してください')
+        observed = parse_iso_timestamp(observed_at, 'observed_at')
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            session = connection.execute('SELECT opened_at, closed_at FROM sessions WHERE id=?', (session_id,)).fetchone()
+            if session is None:
+                raise AppError(404, 'session が見つかりません')
+            if session['closed_at'] is not None and observed > parse_iso_timestamp(session['closed_at'], 'closed_at'):
+                raise AppError(409, 'observed_at が session の終了時刻より後です')
+            if observed > parse_iso_timestamp(utc_now(), 'now'):
+                raise AppError(400, 'observed_at が現在時刻より後です')
+            age = observed - parse_iso_timestamp(session['opened_at'], 'opened_at')
+            elapsed = max(0, age.days * 86400 + age.seconds)
+            connection.execute('''UPDATE sessions SET
+                turn_count=COALESCE(MAX(turn_count, :turns), turn_count, :turns),
+                input_tokens=COALESCE(MAX(input_tokens, :tokens), input_tokens, :tokens),
+                elapsed_seconds=MAX(COALESCE(elapsed_seconds, 0), :elapsed)
+                WHERE id=:id''', {'turns': turn_count, 'tokens': input_tokens, 'elapsed': elapsed, 'id': session_id})
+            return dict(connection.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone())
+
     def sessions(self, *, run_id=None, cli=None, open_only=False, since=None, until=None):
         clauses = []
         params = []
@@ -918,7 +952,8 @@ class Store:
             raise AppError(400, 'since は until 以下を指定してください')
         where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
         with self.db() as connection:
-            rows = [dict(row) for row in connection.execute(f'SELECT * FROM sessions{where} ORDER BY id', params)]
+            rows = [dict.fromkeys(SESSION_METRICS) | dict(row)
+                    for row in connection.execute(f'SELECT * FROM sessions{where} ORDER BY id', params)]
         if since_dt is not None or until_dt is not None:
             filtered = []
             for row in rows:
@@ -1924,13 +1959,13 @@ def main(argv=None):
         if name == 'open':
             sub.add_argument('--pane', required=True)
             sub.add_argument('--socket', required=True)
-    session = commands.add_parser('session', help='窓口・worker・Cue 専任のセッション所属を sessions 表に記録する')
+    session = commands.add_parser('session', help='セッションの所属と累積計測を sessions 表に記録する')
     session_commands = session.add_subparsers(dest='session_command', required=True)
-    for name in ('open', 'close', 'list'):
+    for name in ('open', 'close', 'sample', 'list'):
         sub = session_commands.add_parser(
             name,
             formatter_class=epilog_format,
-            help={'open': 'session を開く。開いた重複があれば断る', 'close': '開いた session に closed_at と close_reason を入れる', 'list': 'session の一覧を id 順に出す'}[name],
+            help={'open': 'session を開く。開いた重複があれば断る', 'close': '開いた session に closed_at と close_reason を入れる', 'sample': 'session ごとの累積計測を記録する', 'list': '累積計測を含む session の一覧を id 順に出す'}[name],
             epilog='出力は {"sessions": [session, ...]} (id 順)' if name == 'list' else None,
         )
         if name == 'open':
@@ -1950,6 +1985,11 @@ def main(argv=None):
             sub.add_argument('--run-id', help='--pane・--socket と組で指定する')
             sub.add_argument('--role', help='--pane・--socket・--run-id で role を絞り込む (' + ' / '.join(SESSION_ROLES) + ')')
             sub.add_argument('--reason', required=True, help=' / '.join(SESSION_CLOSE_REASONS))
+        elif name == 'sample':
+            sub.add_argument('--id', required=True, type=int, help='session list の行 ID')
+            sub.add_argument('--observed-at', required=True, help='観測時刻 (timezone 付き ISO 8601)')
+            sub.add_argument('--turn-count', type=int, help='累積 turn 数 (--input-tokens と少なくとも一方を指定)')
+            sub.add_argument('--input-tokens', type=int, help='累積入力 token 数 (--turn-count と少なくとも一方を指定)')
         else:
             sub.add_argument('--run-id')
             sub.add_argument('--cli', help=' / '.join(SESSION_CLIS))
@@ -2025,6 +2065,10 @@ def main(argv=None):
                     cli=args.cli, native_session_id=args.session_id,
                     run_id=args.run_id, pane=args.pane, socket=args.socket,
                     role=args.role, reason=args.reason,
+                )
+            elif args.session_command == 'sample':
+                result = store.sample_session(
+                    args.id, args.observed_at, turn_count=args.turn_count, input_tokens=args.input_tokens,
                 )
             else:
                 result = store.sessions(

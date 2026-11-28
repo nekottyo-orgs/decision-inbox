@@ -46,6 +46,9 @@ structure Session where
   nativeSessionId : String
   openedAt : Nat
   closure : Option Closure
+  turnCount : Option Nat := none
+  inputTokens : Option Nat := none
+  elapsedSeconds : Option Nat := none
   deriving DecidableEq
 
 structure OpenRequest where
@@ -360,6 +363,55 @@ theorem duplicateCloseRejected {reg reg' : Registry} {target : CloseTarget}
       exact Bool.eq_false_iff.mpr hM
   · contradiction
 
+def sampleValue (previous incoming : Option Nat) : Option Nat :=
+  match previous, incoming with
+  | none, _ => incoming
+  | _, none => previous
+  | some a, some b => some (max a b)
+
+def sampleRow (id observedAt now : Nat) (turnCount inputTokens : Option Nat) (s : Session) : Session :=
+  if s.id = id ∧ observedAt ≤ now ∧ s.closure.all (fun c => decide (observedAt ≤ c.closedAt)) ∧
+      (turnCount.isSome || inputTokens.isSome) then
+    { s with
+      turnCount := sampleValue s.turnCount turnCount
+      inputTokens := sampleValue s.inputTokens inputTokens
+      elapsedSeconds := sampleValue s.elapsedSeconds (some (observedAt - s.openedAt)) }
+  else s
+
+theorem sampleOtherRowUnchanged {s : Session} {id observedAt now : Nat} {turnCount inputTokens : Option Nat}
+    (h : s.id ≠ id) : sampleRow id observedAt now turnCount inputTokens s = s := by
+  simp [sampleRow, h]
+
+theorem sampleAfterCloseRejected {s : Session} {closure : Closure} {id observedAt now : Nat}
+    {turnCount inputTokens : Option Nat} (hClosed : s.closure = some closure)
+    (hLate : closure.closedAt < observedAt) :
+    sampleRow id observedAt now turnCount inputTokens s = s := by
+  simp [sampleRow, hClosed, Nat.not_le_of_lt hLate]
+
+theorem sampleFutureRejected {s : Session} {id observedAt now : Nat} {turnCount inputTokens : Option Nat}
+    (hFuture : now < observedAt) : sampleRow id observedAt now turnCount inputTokens s = s := by
+  simp [sampleRow, Nat.not_le_of_lt hFuture]
+
+theorem samplePreservesMembership (s : Session) (id observedAt now : Nat) (turnCount inputTokens : Option Nat) :
+    let updated := sampleRow id observedAt now turnCount inputTokens s
+    { updated with turnCount := s.turnCount, inputTokens := s.inputTokens, elapsedSeconds := s.elapsedSeconds } = s := by
+  unfold sampleRow
+  split <;> rfl
+
+private theorem sampleValueMonotone (previous incoming : Option Nat) :
+    (previous.getD 0) ≤ ((sampleValue previous incoming).getD 0) := by
+  cases previous <;> cases incoming <;> simp [sampleValue, Nat.le_max_left]
+
+theorem sampleMonotone (s : Session) (id observedAt now : Nat) (turnCount inputTokens : Option Nat) :
+    let updated := sampleRow id observedAt now turnCount inputTokens s
+    s.turnCount.getD 0 ≤ updated.turnCount.getD 0 ∧
+    s.inputTokens.getD 0 ≤ updated.inputTokens.getD 0 ∧
+    s.elapsedSeconds.getD 0 ≤ updated.elapsedSeconds.getD 0 := by
+  unfold sampleRow
+  split
+  · exact ⟨sampleValueMonotone _ _, sampleValueMonotone _ _, sampleValueMonotone _ _⟩
+  · simp
+
 #guard (do
   let req1 : OpenRequest := {
     runId := "run-1", role := .frontdesk, reqId := "",
@@ -394,6 +446,12 @@ theorem duplicateCloseRejected {reg reg' : Registry} {target : CloseTarget}
   let (c2, r5) ← closeSession r4 (.bySlot "run-1" "w1:p2" "/tmp/w.sock") 130 .normal
   guard (c2.id == s2.id && c2.closure == some ⟨130, .normal⟩)
   guard (closeSession r5 (.bySlot "run-1" "w1:p2" "/tmp/w.sock") 131 .crashed == none)
+  guard (sampleRow s1.id 120 119 (some 100) none s1 == s1)
+  guard (sampleRow c1.id 121 122 (some 100) none c1 == c1)
+  let measured := sampleRow c1.id 120 120 (some 4) none c1
+  guard (measured.turnCount == some 4 && measured.inputTokens == none && measured.elapsedSeconds == some 20)
+  guard (sampleRow c1.id 119 120 (some 2) none measured == measured)
+  guard (sampleRow c1.id 120 121 (some 4) none measured == measured)
   some r5.sessions.length) == some 3
 
 end SessionRegistry
