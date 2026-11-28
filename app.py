@@ -742,7 +742,8 @@ class Store:
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def reconcile_lane(self, identifier, lane, machine='', expect=None, *, pane=None, expect_pane=None,
-                       expect_machine=None, expect_run=None, expect_request=None, expect_kind=None):
+                       expect_machine=None, expect_run=None, expect_request=None, expect_kind=None,
+                       expect_remaining=None, expect_decision_id=None, expect_updated_at=None):
         """reconciler が観測した値が現在も一致する場合だけ、指定された担当の欄をまとめて書く。"""
         for name, value, optional in (('lane', lane, False), ('--from', expect, True)):
             if value not in LANES and not (optional and value is None):
@@ -763,7 +764,20 @@ class Store:
             if conditions[key] is not None:
                 text(conditions[key], '--from-' + key, TASK_LIMITS[key], empty=True)
         conditions = {key: value for key, value in conditions.items() if value is not None}
-        where = 'id=?' + ''.join(f' AND {key}=?' for key in conditions)
+        snapshot = (expect_remaining, expect_decision_id, expect_updated_at)
+        if snapshot != (None, None, None):
+            if None in snapshot:
+                raise AppError(400, '--from-remaining、--from-decision-id、--from-updated-at は一緒に指定してください')
+            conditions.update(validate_task({'remaining': expect_remaining, 'decision_id': expect_decision_id}))
+            conditions['updated_at'] = text(expect_updated_at, '--from-updated-at', 64)
+        where = 'id=?' + ''.join(f' AND {key} IS ?' for key in conditions)
+        if expect_remaining is not None and lane == 'done':
+            # 紐付いた判断の状態は task の更新時刻と独立して変わる。
+            where += ''' AND (decision_id IS NULL OR EXISTS (
+                SELECT 1 FROM decisions WHERE id=tasks.decision_id AND (status='completed' OR EXISTS (
+                    SELECT 1 FROM decision_changes WHERE decision_id=tasks.decision_id AND event='withdraw'
+                ))
+            ))'''
         params = (identifier, *conditions.values())
         assignment = {'lane': lane, 'machine': machine}
         if pane is not None:
@@ -1519,6 +1533,8 @@ def run_task(store, args):
             args.id, args.lane, args.machine, args.expect, pane=args.pane, expect_pane=args.expect_pane,
             expect_machine=args.expect_machine, expect_run=args.expect_run,
             expect_request=args.expect_request, expect_kind=args.expect_kind,
+            expect_remaining=args.expect_remaining, expect_decision_id=args.expect_decision_id,
+            expect_updated_at=args.expect_updated_at,
         )
     if args.task_command == 'update':
         payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision, 'kind': args.kind, 'done_when': args.done_when}
@@ -1941,6 +1957,10 @@ def main(argv=None):
             for key in ('pane', 'machine', 'run', 'request', 'kind'):
                 scope_help = '。--from-run / --from-request / --from-kind は一緒に指定' if key in ('run', 'request', 'kind') else ''
                 sub.add_argument('--from-' + key, dest='expect_' + key, help=f'書く前の {key}。空文字も比較する{scope_help}')
+            snapshot_help = '。--from-remaining / --from-decision-id / --from-updated-at は一緒に指定'
+            sub.add_argument('--from-remaining', dest='expect_remaining', help='書く前の remaining。空文字も比較する' + snapshot_help)
+            sub.add_argument('--from-decision-id', dest='expect_decision_id', help='書く前の decision_id。空文字は関連付けなし' + snapshot_help)
+            sub.add_argument('--from-updated-at', dest='expect_updated_at', help='書く前の updated_at' + snapshot_help)
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')

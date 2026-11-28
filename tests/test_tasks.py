@@ -393,6 +393,67 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(winner['pane'], winner['machine'])
         self.assertEqual(Store(self.db).tasks()[0], {**winner, 'decision': None})
 
+    def test_完了時に観測した残件と判断_ID_と更新時刻を照合する(self):
+        store = Store(self.db)
+        decision = store.add(request_payload())
+        added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題', '--remaining', 'なし')
+        original = json.loads(added.stdout)
+        edited = store.update_task('t1', {'result': '新しい調査結果'})
+
+        def settle(remaining='なし', decision_id='', updated_at=edited['updated_at']):
+            return self.cli('reconcile-lane', '--id', 't1', '--lane', 'done', '--from', 'todo',
+                            '--from-remaining', remaining, '--from-decision-id', decision_id,
+                            '--from-updated-at', updated_at)
+
+        for condition in ({'remaining': '残りあり'}, {'decision_id': decision['id']},
+                          {'updated_at': original['updated_at']}):
+            with self.subTest(condition=condition):
+                conflict = settle(**condition)
+                self.assertEqual(conflict.returncode, 3, conflict.stderr)
+                self.assertEqual(store.tasks()[0], {**edited, 'decision': None})
+
+        partial = self.cli('reconcile-lane', '--id', 't1', '--lane', 'done', '--from-remaining', 'なし')
+        self.assertEqual(partial.returncode, 1, partial.stderr)
+        self.assertEqual(store.tasks()[0]['lane'], 'todo')
+        applied = settle()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(applied.stdout)['lane'], 'done')
+
+    def test_紐付いた判断の現在の状態を見て完了を許可する(self):
+        store = Store(self.db)
+        decision = store.add(request_payload())
+        answered = store.answer(decision['id'], {'choice': 'minimal'})
+        added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題', '--remaining', 'なし',
+                         '--decision', decision['id'])
+        observed = json.loads(added.stdout)
+
+        def settle(task=observed):
+            return self.cli('reconcile-lane', '--id', task['id'], '--lane', 'done', '--from', 'todo',
+                            '--from-remaining', 'なし', '--from-decision-id', task['decision_id'],
+                            '--from-updated-at', task['updated_at'])
+
+        pending = settle()
+        self.assertEqual(pending.returncode, 3, pending.stderr)
+        store.undo(decision['id'], {'decided_at': answered['answer']['decided_at']})
+        undone = settle()
+        self.assertEqual(undone.returncode, 3, undone.stderr)
+        self.assertEqual(store.tasks()[0]['lane'], 'todo')
+        store.withdraw(decision['id'], {'note': '判断済みの別依頼に集約'})
+        applied = settle()
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(applied.stdout)['lane'], 'done')
+
+        completed = store.add(request_payload())
+        store.answer(completed['id'], {'choice': 'minimal'})
+        task = store.add_task({**TASK_DEFAULTS, 'id': 't2', 'title': '題', 'remaining': 'なし',
+                               'decision_id': completed['id']})
+        claim = store.claim('worker')
+        self.assertEqual(settle(task).returncode, 3)
+        store.complete(completed['id'], claim['token'])
+        closed = settle(task)
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(json.loads(closed.stdout)['lane'], 'done')
+
     def test_move_と_add_の_lane_を断り_lane_は変わらない(self):
         self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題')
         for arguments in (('move', '--id', 't1', '--lane', 'done'), ('add', '--id', 't2', '--title', 'a', '--lane', 'worker')):
