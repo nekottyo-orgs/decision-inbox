@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.0.3](https://github.com/nekottyo-orgs/decision-inbox/compare/v0.0.2...v0.0.3) - 2026-11-28
+
+- feat: Board の依頼 thread に task の中身と msg の tag を出す by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/56
+- ci: PR 全件で動く集約 gate チェックを追加する by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/59
+- ci: main の push では path filter を外し verify を常時実行する by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/60
+- feat: セッションの累積計測を台帳に保存する by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/62
+- fix: task の完了を残件と判断の照合で保護する by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/64
+
 ## [v0.0.2](https://github.com/nekottyo/decision-inbox/compare/v0.0.1...v0.0.2) - 2026-11-24
 
 - feat: 公開リリースから Cue を切り替える by @nekottyo in https://github.com/nekottyo/decision-inbox/pull/51
