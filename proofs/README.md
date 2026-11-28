@@ -26,6 +26,7 @@ lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
 lean +leanprover/lean4:v4.36.0 proofs/SessionRegistry.lean
 lean +leanprover/lean4:v4.36.0 proofs/ReleaseSwitch.lean
 lean +leanprover/lean4:v4.36.0 proofs/DeliveryAttempt.lean
+lean +leanprover/lean4:v4.36.0 proofs/CheckRunner.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -73,3 +74,22 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ## 公開 release の切り替え
 
 [ReleaseSwitch.lean](ReleaseSwitch.lean) は事前検証の成功後にだけ候補を有効にできること、事前検証の失敗で現行 release が残ること、切り替え後の検査に失敗した場合に復旧が成功すれば旧 release に戻ることを扱う。更新コマンドではファイルロックにより一度に一件だけ更新を進め、`current` の入れ替えに同一ファイルシステム内の atomic rename を使う。モデルは処理段階とリンク先を別々に持つ。同じ rename の境界で旧 release、候補、外部のリンク先を観測でき、割り込み時はその観測から復元の要否を決める。再起動した PID と Web の待ち受けが一致しない観測は成功への遷移に進めない。SHA-256、アーカイブの検証、SQLite の互換性、Web と Herdr の確認は更新コマンドを入口とする Python の回帰テストで扱う。プロセスの強制終了、他の手段による同時書き換え、外部サービスの恒久障害はモデルの対象外。別の参照先を観測したときは処理を停止し、復元を含む後続の書き換えは行わない。
+
+## check runner の due 判定・重複抑制・故障 counter
+
+[CheckRunner.lean](CheckRunner.lean) と [CheckRunner.als](CheckRunner.als) は、`app.py check tick` が扱う due 判定・`(check, kind, dedup_key)` 単位の重複抑制・故障 counter と故障タスクの状態遷移・起票上限 (20 件) を検査する。
+
+- **due 判定**: 履歴なし・時刻巻き戻り (`last_started` または `last_actual_started_at` が `tick_started` より未来) は即 due。通常時は成功系 (`ok_silent` / `fired` / `suppressed` / `mixed`) の後は `last_started`、失敗系 (`failed_exit` / `failed_timeout` / `failed_output`) の後は `last_actual_started_at` を基準とし、`tick_started + grace >= base + interval` (`grace = min(30, interval / 10)`) で判定する。失敗系では `actual_started_at >= tick_started` より実開始時刻同士の間隔も `interval - grace` を下回らないことを証明する
+- **outcome 優先順位と aborted**: 優先順位は `failed_timeout > aborted > failed_exit > failed_output > 正常系`。`aborted` は非決定的に発生し得る遷移として扱い、`checks` の実行状態カラム (`last_started` / `last_actual_started_at` / `last_outcome` / `fault_count`) を一切変更しないため、`last_outcome` が `aborted` になることは決してない
+- **故障 counter と名前空間分離**: 成功系で `fault_count` を 0 に戻す。失敗系は未完了の故障タスク (`kind=fault`, `dedup_key=""`) がある間は `fault_count` を 0 のまま維持して二重起票せず、無いときは `fault_count + 1` が `fault_threshold` 以上で故障タスクを 1 件起票して `fault_count` を 0 に戻す。`kind=event` と `kind=fault` は別名前空間であり、空文字の `dedup_key` でも互いに抑制し合わない。TOML 同期で `command` 変更または無効化が起きたときは `fault_count` を 0 に戻し、`env` / `timeout` のみの変更では保持する
+- **起票上限と Liveness**: 1 回の実行で新規起票するタスクは上限 (20 件) 以下で、`suppressed` なイベントは上限枠を消費しない。Liveness として、前処理時間が 60 秒未満に収まる tick が繰り返し発生し非 `aborted` な失敗が連続するという公平性仮定の下で、`fault_threshold` 回目の失敗で必ず故障タスクが起票されることを証明する (前処理時間の上限自体は公理にしない)
+
+| モデル | 実装 |
+| --- | --- |
+| `grace` / `isClockAnomaly` / `dueBase` / `isDue` | `check_is_due` が `tick_started` 固定で due 判定・巻き戻り検知を実施 |
+| `classifyOutcome` | `run_check_command` と `commit_check_run` が `failed_timeout > aborted > failed_exit > failed_output > 正常系` で決定 |
+| `hasIncomplete` / `processEvents` | `commit_check_run` が `BEGIN IMMEDIATE` 内で `(check_name, kind, dedup_key)` 単位の未完了タスク (`tasks.lane != 'done'`) を照合し、上限 20 件で新規起票・`suppressed`・`events_deferred` を確定 |
+| `applyOutcome` | `commit_check_run` が 1 つの `BEGIN IMMEDIATE` 内で `check_runs` / `check_run_events` / `tasks` / `check_tasks` / `checks` を更新 (`aborted` は `check_runs` のみ) |
+| `syncFaultCount` | `sync_checks_mirror` が `command` 変更または無効化時に `fault_count = 0` へリセット |
+
+前提は、flock により tick が直列化されること、SQLite の `BEGIN IMMEDIATE` が 1 check 実行の確定を原子的に直列化すること。flock の競合・skip 記録、git checkout 検査、TOML 検証、JSONL 64KiB/スキーマ検証、プロセスグループ SIGTERM/SIGKILL、run-inbox への wake (20 秒上限・CB・回収)、30 日 prune、`PRAGMA user_version = 2` 互換は `tests/test_checks.py` で検査する。
