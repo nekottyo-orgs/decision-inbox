@@ -2330,26 +2330,40 @@ sys.exit(2)
         commit_attempts = [0]
         holder_thread = [None]
 
+        def _cleanup_holder_a():
+            release_lock.set()
+            if holder_thread[0] is not None:
+                holder_thread[0].join(timeout=3.0)
+
+        self.addCleanup(_cleanup_holder_a)
+
         def commit_with_transient_lock(*args, **kwargs):
             commit_attempts[0] += 1
             if commit_attempts[0] == 1:
-                t = threading.Thread(target=hold_writer, args=(0.25,), daemon=True)
+                t = threading.Thread(target=hold_writer, args=(10.0,), daemon=True)
                 holder_thread[0] = t
                 t.start()
                 self.assertTrue(lock_acquired.wait(timeout=3.0))
+                try:
+                    return orig_commit(*args, **kwargs)
+                except sqlite3.Error as db_error:
+                    if sys.modules['app']._is_sqlite_retryable_contention(db_error):
+                        release_lock.set()
+                        t.join(timeout=3.0)
+                    raise
             return orig_commit(*args, **kwargs)
 
-        with mock.patch('app.commit_check_run', side_effect=commit_with_transient_lock):
-            res_ok, rc_ok = run_check_tick(
-                self.db, self.config,
-                now_fn=lambda: 1700000100.0,
-                tick_budget=15.0,
-                commit_busy_timeout_ms=80,
-                deliver_fn=lambda c, t: True,
-            )
-        if holder_thread[0] is not None:
-            release_lock.set()
-            holder_thread[0].join(timeout=3.0)
+        try:
+            with mock.patch('app.commit_check_run', side_effect=commit_with_transient_lock):
+                res_ok, rc_ok = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000100.0,
+                    tick_budget=15.0,
+                    commit_busy_timeout_ms=80,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            _cleanup_holder_a()
 
         self.assertEqual((rc_ok, res_ok['status']), (0, 'ok'))
         self.assertGreaterEqual(commit_attempts[0], 2, 'commit should have retried after busy timeout')
