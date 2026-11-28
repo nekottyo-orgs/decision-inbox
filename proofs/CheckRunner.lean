@@ -475,6 +475,12 @@ theorem fault_detection_at_threshold (chk : String) (threshold : Nat) (hth : 1 �
   let init : CheckState := ⟨none, none, none, 0⟩
   -- 履歴なしは即 due
   guard (isDue 1000 300 init == true)
+  -- grace 境界: interval=3 -> grace=0、interval=65 -> grace=6
+  guard (grace 3 == 0)
+  guard (grace 65 == 6)
+  let (s65, _) := applyOutcome "c65" 3 1000 1000 100 .okSilent init []
+  guard (isDue 1058 65 s65 == false)
+  guard (isDue 1059 65 s65 == true)
   -- 成功実行 (tick=1000, actual=1050): 基準は last_started=1000, grace=min(30,30)=30
   let (s1, ft1) := applyOutcome "c1" 3 1000 1050 1 .okSilent init []
   guard (ft1 == none)
