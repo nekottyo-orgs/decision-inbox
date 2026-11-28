@@ -760,13 +760,22 @@ sys.exit(2)
             {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
         )
         clock = FakeClock(wall=1700000000.0, mono=1000.0)
-        body, rc = run_check_tick(
-            self.db, self.config,
-            now_fn=clock.now,
-            mono_fn=clock.monotonic,
-            tick_budget=0.0,
-            deliver_fn=lambda c, t: True,
-        )
+        orig_sync = sys.modules['app'].sync_checks_mirror
+
+        def exhaust_budget_before_step6(*args, **kwargs):
+            res = orig_sync(*args, **kwargs)
+            # mirror 同期までは予算内で完了し、step (6) 開始時点で残り時間 0 に到達させる
+            clock.advance(10.0)
+            return res
+
+        with mock.patch('app.sync_checks_mirror', side_effect=exhaust_budget_before_step6):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=clock.now,
+                mono_fn=clock.monotonic,
+                tick_budget=10.0,
+                deliver_fn=lambda c, t: True,
+            )
         self.assertEqual(rc, 0)
         self.assertEqual(body['status'], 'aborted')
         self.assertEqual(body['checks_deferred'], 2)
@@ -2663,6 +2672,7 @@ sys.exit(2)
         sleep_calls_e = []
         in_commit_retry_e = [False]
         orig_sleep = time.sleep
+        orig_monotonic = time.monotonic
 
         def cmd_leaving_100ms_e(*args, **kwargs):
             res = orig_run_cmd(*args, **kwargs)
@@ -2685,6 +2695,11 @@ sys.exit(2)
             finally:
                 in_commit_retry_e[0] = False
 
+        def controlled_monotonic_e():
+            if in_commit_retry_e[0]:
+                return clock_e.monotonic()
+            return orig_monotonic()
+
         def advance_to_deadline_during_backoff(sec):
             if in_commit_retry_e[0]:
                 sleep_calls_e.append(sec)
@@ -2697,6 +2712,7 @@ sys.exit(2)
         with mock.patch('app.run_check_command', side_effect=cmd_leaving_100ms_e), \
                 mock.patch('app._commit_check_run_with_retry', side_effect=track_commit_retry_e), \
                 mock.patch('app.commit_check_run', side_effect=commit_busy_once_then_would_succeed), \
+                mock.patch('app.time.monotonic', side_effect=controlled_monotonic_e), \
                 mock.patch('app.time.sleep', side_effect=advance_to_deadline_during_backoff), \
                 contextlib.redirect_stderr(err_buf_e):
             res_e, rc_e = run_check_tick(
@@ -3496,11 +3512,25 @@ sys.exit(2)
         def popen_wait_ready(argv, *args, **kwargs):
             proc = orig_popen(argv, *args, **kwargs)
             if any('ign.py' in str(part) for part in argv):
-                dl = time.monotonic() + 5.0
-                while not ready_flag.exists() and time.monotonic() < dl:
-                    time.sleep(0.01)
-                self.assertTrue(ready_flag.exists(), 'c1_ign did not become ready in time')
-                real_origin[0] = time.monotonic()
+                try:
+                    dl = time.monotonic() + 5.0
+                    while not ready_flag.exists() and time.monotonic() < dl:
+                        time.sleep(0.01)
+                    self.assertTrue(ready_flag.exists(), 'c1_ign did not become ready in time')
+                    real_origin[0] = time.monotonic()
+                except BaseException:
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    if proc.poll() is None:
+                        with contextlib.suppress(OSError):
+                            proc.kill()
+                    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                        proc.wait(timeout=2.0)
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream is not None:
+                            with contextlib.suppress(OSError, ValueError):
+                                stream.close()
+                    raise
             return proc
 
         def spy_commit(*args, **kwargs):
@@ -3522,6 +3552,7 @@ sys.exit(2)
         self.assertEqual((rc, body['status']), (0, 'aborted'))
         self.assertEqual(body['checks_deferred'], 1)
         self.assertEqual(len(commit_mono_at), 1)
+        self.assertLess(commit_mono_at[0], 236.0, 'cleanup must finish within commit_start_deadline (236s)')
         self.assertLess(commit_mono_at[0], 238.0, 'aborted run commit must start before end_work_deadline')
         self.assertLess(mono_fn(), 240.0, 'tick must finish within nominal tick_deadline')
 
@@ -3536,6 +3567,376 @@ sys.exit(2)
         self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 1))
         ign_pid = int(pid_file.read_text(encoding='utf-8').strip())
         self.assertFalse(_pid_alive(ign_pid))
+
+    def test_terminate_process_group_enforces_absolute_deadline_under_delays(self):
+        # 1. 定時開始 (229.5s, deadline=236.0s, grace=5.0, kill_wait=1.0, tail=0.5) は設定どおりの猶予を維持
+        # 2. 開始遅延 (+233.5s) でも各フェーズの待ち上限が絶対期限 236.0s を超えない
+        # 3. term_start 取得直後の遅延でも後から取った時刻に grace を足さず、term_deadline - now で上限される
+        # 4. 既に deadline 超過 (+236.5s) のときは待ち時間 0 で即時 SIGKILL へ進む
+        def run_fake_term(clock_seq, *, deadline, grace=5.0, kill_wait=1.0, tail=0.5, real_seq=None):
+            idx = [0]
+            real_idx = [0]
+            cur = [clock_seq[0]]
+            signals_sent = []
+            wait_calls = []
+
+            def seq_mono():
+                i = idx[0]
+                idx[0] += 1
+                val = clock_seq[i] if i < len(clock_seq) else clock_seq[-1]
+                cur[0] = val
+                return val
+
+            def seq_real():
+                if real_seq is None:
+                    return cur[0]
+                i = real_idx[0]
+                real_idx[0] += 1
+                return real_seq[i] if i < len(real_seq) else real_seq[-1]
+
+            class StubProc:
+                pid = 888888
+                returncode = None
+
+                def poll(self):
+                    return None
+
+                def wait(self, timeout=None):
+                    wait_calls.append(timeout)
+                    raise subprocess.TimeoutExpired(cmd=['stub'], timeout=timeout)
+
+            err_buf = io.StringIO()
+            with mock.patch('app.os.killpg', side_effect=lambda pg, sig: signals_sent.append(sig)), \
+                    mock.patch('app._pgid_alive', return_value=False), \
+                    mock.patch('app.time.monotonic', side_effect=seq_real), \
+                    contextlib.redirect_stderr(err_buf):
+                _terminate_process_group(
+                    StubProc(), grace, kill_wait_sec=kill_wait,
+                    deadline=deadline, tail_reserve_sec=tail, mono_fn=seq_mono,
+                )
+            return signals_sent, wait_calls
+
+        # (a) 定時開始 229.5s: TERM wait は 5.0s、SIGKILL wait は 1.0s
+        sigs_a, waits_a = run_fake_term(
+            [229.5, 229.5, 234.5, 234.5],
+            deadline=236.0,
+        )
+        self.assertEqual(sigs_a, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(len(waits_a), 2)
+        self.assertAlmostEqual(waits_a[0], 5.0, places=3)
+        self.assertAlmostEqual(waits_a[1], 1.0, places=3)
+
+        # (b) 開始遅延 233.5s (残り 2.5s): 比率縮小 + 絶対期限 236.0s 内に収まる
+        sigs_b, waits_b = run_fake_term(
+            [233.5, 233.5, 235.423, 235.423],
+            deadline=236.0,
+        )
+        self.assertEqual(sigs_b, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(len(waits_b), 2)
+        self.assertLessEqual(233.5 + waits_b[0], 236.0)
+        self.assertAlmostEqual(waits_b[0], 5.0 * (2.5 / 6.5), places=3)
+        self.assertLessEqual(235.423 + waits_b[1], 236.0)
+        self.assertAlmostEqual(waits_b[1], 1.0 * (2.5 / 6.5), places=3)
+
+        # (c) term_start (229.5s) と term_real_deadline / loop 先頭の間に 2.0s の遅延が挟まっても、
+        #     term_deadline (234.5s) が後ろへ延びず wait timeout は 3.0s (234.5 - 231.5) になること
+        sigs_c, waits_c = run_fake_term(
+            [229.5, 231.5, 235.8, 235.8],
+            real_seq=[231.5, 231.5, 235.8, 235.8],
+            deadline=236.0,
+        )
+        self.assertEqual(sigs_c, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(len(waits_c), 2)
+        self.assertAlmostEqual(waits_c[0], 3.0, places=3)
+        # SIGKILL 開始が 235.8s まで遅れても kill_wait は 236.0 - 235.8 = 0.2s に上限される
+        self.assertAlmostEqual(waits_c[1], 0.2, places=3)
+
+        # (d) 既に deadline 超過 (236.5s): wait() を呼ばず即時 SIGTERM -> SIGKILL で抜ける
+        sigs_d, waits_d = run_fake_term([236.5, 236.5, 236.5, 236.5], deadline=236.0)
+        self.assertEqual(sigs_d, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(waits_d, [])
+
+    def test_delayed_cleanup_helper_start_still_finishes_by_cleanup_deadline_and_commits_aborted_run(self):
+        # _terminate_process_group 開始前に 4.0s 遅延して +233.5s から cleanup が始まっても、
+        # 絶対期限 cleanup_deadline (236.0s = commit_start_deadline) までに cleanup が終わり、
+        # aborted run が end_work_deadline (238.0s) 前に確実に commit されること。
+        ready_flag = self.root / 'delayed_ign.ready'
+        pid_file = self.root / 'delayed_ign.pid'
+        self.addCleanup(_cleanup_pid_file, pid_file)
+        script = (
+            '#!/usr/bin/env python3\n'
+            'import os, pathlib, signal, sys, time\n'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+            f'pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")\n'
+            'print("delayed abort stdout", flush=True)\n'
+            f'pathlib.Path({str(ready_flag)!r}).write_text("ready", encoding="utf-8")\n'
+            'time.sleep(60)\n'
+        )
+        self.commit_config(
+            '[[checks]]\nname = "c1_delay"\ninterval = 60\ncommand = "scripts/ign.py"\ntimeout = 60\nskill = "s1"\n',
+            {'scripts/ign.py': script},
+        )
+
+        phase = ['setup']
+        real_origin = [None]
+        delay_injected = [False]
+        delay_base_real = [None]
+        orig_run = run_check_command
+        orig_popen = subprocess.Popen
+        orig_terminate = _terminate_process_group
+        orig_commit = commit_check_run
+        commit_mono_at = []
+
+        def mono_fn():
+            if phase[0] == 'setup':
+                return 0.0
+            if delay_injected[0]:
+                # _terminate_process_group 開始時に +233.5s (4.0s 遅延) へ進めた後、実時間で進む
+                return 233.5 + (time.monotonic() - delay_base_real[0])
+            if real_origin[0] is None:
+                return 229.0
+            return 229.45 + (time.monotonic() - real_origin[0])
+
+        def start_check_phase(chk, *args, **kwargs):
+            phase[0] = 'check'
+            return orig_run(chk, *args, **kwargs)
+
+        def popen_wait_ready(argv, *args, **kwargs):
+            proc = orig_popen(argv, *args, **kwargs)
+            if any('ign.py' in str(part) for part in argv):
+                try:
+                    dl = time.monotonic() + 5.0
+                    while not ready_flag.exists() and time.monotonic() < dl:
+                        time.sleep(0.01)
+                    self.assertTrue(ready_flag.exists(), 'c1_delay did not become ready in time')
+                    real_origin[0] = time.monotonic()
+                except BaseException:
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    if proc.poll() is None:
+                        with contextlib.suppress(OSError):
+                            proc.kill()
+                    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                        proc.wait(timeout=2.0)
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream is not None:
+                            with contextlib.suppress(OSError, ValueError):
+                                stream.close()
+                    raise
+            return proc
+
+        def delayed_terminate(*args, **kwargs):
+            # helper 開始直前に +233.5s まで遅延が発生した状況を再現
+            delay_base_real[0] = time.monotonic()
+            delay_injected[0] = True
+            return orig_terminate(*args, **kwargs)
+
+        def spy_commit(*args, **kwargs):
+            commit_mono_at.append(mono_fn())
+            return orig_commit(*args, **kwargs)
+
+        with mock.patch('app.run_check_command', side_effect=start_check_phase), \
+                mock.patch('app.subprocess.Popen', side_effect=popen_wait_ready), \
+                mock.patch('app._terminate_process_group', side_effect=delayed_terminate), \
+                mock.patch('app.commit_check_run', side_effect=spy_commit):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000000.0,
+                mono_fn=mono_fn,
+                deliver_fn=lambda c, t: True,
+            )
+
+        self.assertEqual((rc, body['status']), (0, 'aborted'))
+        self.assertEqual(len(commit_mono_at), 1)
+        self.assertLessEqual(
+            commit_mono_at[0], 236.0,
+            'delayed cleanup must still finish by cleanup_deadline (236s) so full commit window remains',
+        )
+        self.assertLess(commit_mono_at[0], 238.0)
+        run_row = self.query_one("SELECT outcome, exit_code, stdout_excerpt FROM check_runs WHERE check_name='c1_delay'")
+        self.assertIsNotNone(run_row)
+        self.assertEqual((run_row['outcome'], run_row['exit_code']), ('aborted', None))
+        self.assertIn('delayed abort stdout', run_row['stdout_excerpt'])
+        ign_pid = int(pid_file.read_text(encoding='utf-8').strip())
+        self.assertFalse(_pid_alive(ign_pid))
+
+    def test_mirror_sync_busy_timeout_is_capped_by_remaining_work_budget_and_skips_when_exhausted(self):
+        # 1. 検証が +237s で終わった場合、mirror の busy_timeout_ms は 5000ms ではなく
+        #    end_work_deadline (238s) までの残り 1000ms に cap されること (余裕があるときは 5000ms のまま)。
+        # 2. 実 SQLite 書き込みロック競合下でも mirror 待ちが残り作業時間で打ち切られ、
+        #    finalize_reserve 内にロック解放されれば running を残さず failed へ最終更新できること。
+        # 3. end_work_deadline を既に超過している場合は mirror 書き込みを開始せず、
+        #    構造化された finalization (status='aborted', checks_deferred=None) で終了すること。
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        orig_validate = sys.modules['app'].load_and_validate_checks_config
+        orig_sync = sys.modules['app'].sync_checks_mirror
+
+        # (a) 正常経路 (余裕あり): busy_timeout_ms は既定の 5000ms のまま
+        seen_busy_normal = []
+        clock_norm = FakeClock(wall=1700000000.0, mono=0.0)
+
+        def spy_sync_norm(*args, **kwargs):
+            seen_busy_normal.append(kwargs.get('busy_timeout_ms'))
+            return orig_sync(*args, **kwargs)
+
+        with mock.patch('app.sync_checks_mirror', side_effect=spy_sync_norm):
+            body_n, rc_n = run_check_tick(
+                self.db, self.config,
+                now_fn=clock_norm.now,
+                mono_fn=clock_norm.monotonic,
+                tick_budget=240.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=5000,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc_n, body_n['status']), (0, 'ok'))
+        self.assertEqual(seen_busy_normal, [5000])
+
+        # (b) 検証が +237.0s で終了 -> end_work_deadline (238.0s) まで残り 1.0s なので busy_timeout_ms=1000
+        seen_busy_tight = []
+        clock_tight = FakeClock(wall=1700000100.0, mono=0.0)
+
+        def validate_ending_at_237(*args, **kwargs):
+            res = orig_validate(*args, **kwargs)
+            clock_tight.advance(237.0)
+            return res
+
+        def spy_sync_tight(*args, **kwargs):
+            seen_busy_tight.append(kwargs.get('busy_timeout_ms'))
+            return orig_sync(*args, **kwargs)
+
+        with mock.patch('app.load_and_validate_checks_config', side_effect=validate_ending_at_237), \
+                mock.patch('app.sync_checks_mirror', side_effect=spy_sync_tight):
+            body_t, rc_t = run_check_tick(
+                self.db, self.config,
+                now_fn=clock_tight.now,
+                mono_fn=clock_tight.monotonic,
+                tick_budget=240.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=5000,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual(seen_busy_tight, [1000])
+        self.assertEqual((rc_t, body_t['status']), (0, 'aborted'))
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+
+        # (c) 実 SQLite ロック競合: commit_busy_timeout_ms=5000 でも残り作業時間 80ms で cap され、
+        #     mirror 失敗後に writer が解放すれば finalize_reserve 内で status='failed' へ確定できること
+        import threading
+        lock_acq = threading.Event()
+        lock_rel = threading.Event()
+        holder = []
+
+        def _hold_writer():
+            conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                lock_acq.set()
+                lock_rel.wait(timeout=5.0)
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                conn.close()
+
+        def _cleanup_holder():
+            lock_rel.set()
+            for t in holder:
+                t.join(timeout=3.0)
+
+        self.addCleanup(_cleanup_holder)
+        anchor_c = [None]
+        seen_busy_c = []
+
+        def mono_c():
+            if anchor_c[0] is None:
+                return 0.0
+            # tick_budget=2.5, finalize_reserve=0.5 -> end_work_deadline=2.0。
+            # 検証終了時に 1.92 (残り 80ms) から実時間で進める
+            return 1.92 + (time.monotonic() - anchor_c[0])
+
+        def validate_then_lock(*args, **kwargs):
+            res = orig_validate(*args, **kwargs)
+            t = threading.Thread(target=_hold_writer, daemon=True)
+            holder.append(t)
+            t.start()
+            self.assertTrue(lock_acq.wait(timeout=3.0))
+            anchor_c[0] = time.monotonic()
+            return res
+
+        def sync_then_release_for_finalize(*args, **kwargs):
+            seen_busy_c.append(kwargs.get('busy_timeout_ms'))
+            try:
+                return orig_sync(*args, **kwargs)
+            finally:
+                _cleanup_holder()
+
+        err_c = io.StringIO()
+        started_c = time.monotonic()
+        try:
+            with mock.patch('app.load_and_validate_checks_config', side_effect=validate_then_lock), \
+                    mock.patch('app.sync_checks_mirror', side_effect=sync_then_release_for_finalize), \
+                    contextlib.redirect_stderr(err_c):
+                body_c, rc_c = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000200.0,
+                    mono_fn=mono_c,
+                    tick_budget=2.5,
+                    finalize_reserve=0.5,
+                    commit_busy_timeout_ms=5000,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            _cleanup_holder()
+        elapsed_c = time.monotonic() - started_c
+        self.assertEqual((rc_c, body_c['status']), (1, 'failed'))
+        self.assertIsNone(body_c['checks_deferred'])
+        self.assertEqual(len(seen_busy_c), 1)
+        self.assertLessEqual(seen_busy_c[0], 80)
+        self.assertLess(elapsed_c, 1.0, 'mirror wait must not spend full 5000ms busy timeout')
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        tick_c = self.query_one('SELECT status, finished_at FROM check_ticks WHERE id=?', (body_c['tick_id'],))
+        self.assertEqual(tick_c['status'], 'failed')
+        self.assertIsNotNone(tick_c['finished_at'])
+
+        # (d) 検証終了時点で end_work_deadline (238.0s) を超過 (+238.5s):
+        #     mirror 書き込みを一切開始せず、select_due_checks / run_check_command も呼ばずに
+        #     status='aborted' (checks_deferred=None) で終了処理すること
+        clock_over = FakeClock(wall=1700000300.0, mono=0.0)
+        sync_called_over = []
+        select_called_over = []
+        run_called_over = []
+
+        def validate_past_end_work(*args, **kwargs):
+            res = orig_validate(*args, **kwargs)
+            clock_over.advance(238.5)
+            return res
+
+        with mock.patch('app.load_and_validate_checks_config', side_effect=validate_past_end_work), \
+                mock.patch('app.sync_checks_mirror', side_effect=lambda *a, **kw: sync_called_over.append(True)), \
+                mock.patch('app.select_due_checks', side_effect=lambda *a, **kw: select_called_over.append(True)), \
+                mock.patch('app.run_check_command', side_effect=lambda *a, **kw: run_called_over.append(True)):
+            body_o, rc_o = run_check_tick(
+                self.db, self.config,
+                now_fn=clock_over.now,
+                mono_fn=clock_over.monotonic,
+                tick_budget=240.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=5000,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc_o, body_o['status']), (0, 'aborted'))
+        self.assertIsNone(body_o['checks_deferred'])
+        self.assertEqual(sync_called_over, [], 'mirror write must not start when no work budget remains')
+        self.assertEqual(select_called_over, [])
+        self.assertEqual(run_called_over, [])
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        tick_o = self.query_one('SELECT status, finished_at, checks_deferred FROM check_ticks WHERE id=?', (body_o['tick_id'],))
+        self.assertEqual(tick_o['status'], 'aborted')
+        self.assertIsNotNone(tick_o['finished_at'])
+        self.assertIsNone(tick_o['checks_deferred'])
 
 
 if __name__ == '__main__':

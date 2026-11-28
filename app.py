@@ -2088,21 +2088,44 @@ def _pgid_alive(pgid):
 
 
 def _terminate_process_group(
-    process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC, max_total_sec=None,
+    process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC,
+    deadline=None, tail_reserve_sec=0.0, mono_fn=time.monotonic,
 ):
     """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。
-    max_total_sec が指定されている場合、SIGTERM 猶予と SIGKILL 後の回収待ちの合計をその範囲内に抑える。"""
+    deadline (mono_fn 基準の絶対期限) が指定されている場合、SIGTERM 猶予と SIGKILL 後の回収待ちを
+    その絶対期限内に収める。各フェーズ開始時点の単一時刻サンプルと deadline の最小値でフェーズ期限を決め、
+    開始遅延や後から取った時刻への加算で cleanup 窓が後ろへずれないようにする。"""
     pgid = process.pid
-    total_deadline = None if max_total_sec is None else (time.monotonic() + max(0.0, max_total_sec))
     with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(pgid, signal.SIGTERM)
 
-    grace_budget = max(0.0, grace_sec)
-    if total_deadline is not None:
-        grace_budget = min(grace_budget, max(0.0, total_deadline - time.monotonic()))
-    deadline = time.monotonic() + grace_budget
+    grace_cap = max(0.0, float(grace_sec))
+    kill_wait_cap = max(0.0, float(kill_wait_sec))
+    tail_cap = max(0.0, float(tail_reserve_sec))
+
+    term_start = mono_fn()
+    if deadline is None:
+        grace_budget = grace_cap
+        kill_wait_budget = kill_wait_cap
+        term_deadline = term_start + grace_budget
+    else:
+        cleanup_rem = max(0.0, deadline - term_start)
+        total_cap = grace_cap + kill_wait_cap + tail_cap
+        if total_cap <= 0 or cleanup_rem <= 0:
+            grace_budget = 0.0
+            kill_wait_budget = 0.0
+        elif cleanup_rem >= total_cap:
+            grace_budget = grace_cap
+            kill_wait_budget = kill_wait_cap
+        else:
+            scale = cleanup_rem / total_cap
+            grace_budget = grace_cap * scale
+            kill_wait_budget = kill_wait_cap * scale
+        term_deadline = min(term_start + grace_budget, deadline)
+
+    term_real_deadline = time.monotonic() + max(0.0, term_deadline - term_start)
     while True:
-        remaining = deadline - time.monotonic()
+        remaining = min(term_deadline - mono_fn(), term_real_deadline - time.monotonic())
         if process.returncode is None:
             if remaining > 0:
                 try:
@@ -2116,7 +2139,7 @@ def _terminate_process_group(
         # リーダー終了済み (reap 済み)。グループ内の子孫残存を killpg(pgid, 0) で確認する
         if not _pgid_alive(pgid):
             return
-        remaining = deadline - time.monotonic()
+        remaining = min(term_deadline - mono_fn(), term_real_deadline - time.monotonic())
         if remaining <= 0:
             break
         time.sleep(min(0.05, remaining))
@@ -2124,26 +2147,40 @@ def _terminate_process_group(
     if process.returncode is None or _pgid_alive(pgid):
         with suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signal.SIGKILL)
-    kill_wait_start = time.monotonic()
-    kill_wait_budget = max(0.0, kill_wait_sec)
+    kill_wait_start = mono_fn()
     kill_wait_deadline = kill_wait_start + kill_wait_budget
-    if total_deadline is not None:
-        kill_wait_deadline = min(kill_wait_deadline, total_deadline)
-        kill_wait_budget = max(0.0, kill_wait_deadline - kill_wait_start)
+    if deadline is not None:
+        kill_wait_deadline = min(kill_wait_deadline, deadline)
+    kill_wait_effective = max(0.0, kill_wait_deadline - kill_wait_start)
+    kill_wait_real_deadline = time.monotonic() + kill_wait_effective
     leader_wait_timed_out = False
     if process.returncode is None:
-        wait_remaining = max(0.0, kill_wait_deadline - time.monotonic())
-        try:
-            process.wait(timeout=wait_remaining)
-        except subprocess.TimeoutExpired:
-            leader_wait_timed_out = True
-        except OSError:
-            pass
-    while _pgid_alive(pgid) and time.monotonic() < kill_wait_deadline:
-        time.sleep(min(0.01, max(0.0, kill_wait_deadline - time.monotonic())))
+        wait_remaining = min(
+            kill_wait_deadline - mono_fn(),
+            kill_wait_real_deadline - time.monotonic(),
+        )
+        if wait_remaining > 0:
+            try:
+                process.wait(timeout=wait_remaining)
+            except subprocess.TimeoutExpired:
+                leader_wait_timed_out = True
+            except OSError:
+                pass
+        else:
+            process.poll()
+            if process.returncode is None:
+                leader_wait_timed_out = True
+    while _pgid_alive(pgid):
+        wait_remaining = min(
+            kill_wait_deadline - mono_fn(),
+            kill_wait_real_deadline - time.monotonic(),
+        )
+        if wait_remaining <= 0:
+            break
+        time.sleep(min(0.01, wait_remaining))
     if leader_wait_timed_out or process.returncode is None or _pgid_alive(pgid):
         print(
-            f'warning: process group {pgid} did not terminate within {kill_wait_budget:.2f}s after SIGKILL',
+            f'warning: process group {pgid} did not terminate within {kill_wait_effective:.2f}s after SIGKILL',
             file=sys.stderr,
         )
 
@@ -2564,29 +2601,13 @@ def run_check_command(
         return None, b'', str(error).encode('utf-8', errors='replace'), False, False
 
     def _cleanup_group():
-        if cleanup_deadline is None:
-            _terminate_process_group(process, kill_grace, kill_wait_sec=CHECK_KILL_WAIT_SEC)
-            return
-        cleanup_rem = max(0.0, cleanup_deadline - mono_fn())
-        grace_cap = max(0.0, float(kill_grace))
-        kill_wait_cap = CHECK_KILL_WAIT_SEC
-        drain_cap = CHECK_DRAIN_JOIN_SEC
-        total_cap = grace_cap + kill_wait_cap + drain_cap
-        if total_cap <= 0 or cleanup_rem <= 0:
-            grace_budget = 0.0
-            kill_wait_budget = 0.0
-        elif cleanup_rem >= total_cap:
-            grace_budget = grace_cap
-            kill_wait_budget = kill_wait_cap
-        else:
-            scale = cleanup_rem / total_cap
-            grace_budget = grace_cap * scale
-            kill_wait_budget = kill_wait_cap * scale
         _terminate_process_group(
             process,
-            grace_budget,
-            kill_wait_sec=kill_wait_budget,
-            max_total_sec=grace_budget + kill_wait_budget,
+            kill_grace,
+            kill_wait_sec=CHECK_KILL_WAIT_SEC,
+            deadline=cleanup_deadline,
+            tail_reserve_sec=0.0 if cleanup_deadline is None else CHECK_DRAIN_JOIN_SEC,
+            mono_fn=mono_fn,
         )
 
     try:
@@ -2634,12 +2655,13 @@ def run_check_command(
                 if thread.is_alive():
                     thread.join(timeout=max(0.0, drain_real_deadline - time.monotonic()))
         else:
-            drain_rem = min(CHECK_DRAIN_JOIN_SEC, max(0.0, cleanup_deadline - mono_fn()))
-            drain_real_deadline = time.monotonic() + drain_rem
+            drain_mono_start = mono_fn()
+            drain_mono_deadline = min(drain_mono_start + CHECK_DRAIN_JOIN_SEC, cleanup_deadline)
+            drain_real_deadline = time.monotonic() + max(0.0, drain_mono_deadline - drain_mono_start)
             for thread in (out_thread, err_thread):
                 if thread.is_alive():
                     rem_t = min(
-                        max(0.0, cleanup_deadline - mono_fn()),
+                        max(0.0, drain_mono_deadline - mono_fn()),
                         max(0.0, drain_real_deadline - time.monotonic()),
                     )
                     if rem_t <= 0:
@@ -3231,11 +3253,22 @@ def run_check_tick(
             print(f'error: check tick config_error: {error}', file=sys.stderr)
             return _finalize_tick('config_error', 1, None, error_msg=str(error))
 
-        # (5) checks テーブルの鏡同期
+        effective_reserve = (
+            min(CHECK_FINALIZE_RESERVE_SEC, max(0.0, float(tick_budget) * 0.1))
+            if finalize_reserve is None
+            else max(0.0, float(finalize_reserve))
+        )
+        end_work_deadline = tick_deadline - effective_reserve
+
+        # (5) checks テーブルの鏡同期 (DB 待ち時間は end_work_deadline までの残り作業時間で上限する)
+        mirror_rem = end_work_deadline - mono_fn()
+        if mirror_rem <= 0:
+            return _finalize_tick('aborted', 0, None)
+        mirror_busy_ms = min(max(0, int(commit_busy_timeout_ms)), max(0, int(mirror_rem * 1000)))
         try:
             sync_checks_mirror(
                 db_path, checks_cfg, now_iso_fn(),
-                busy_timeout_ms=commit_busy_timeout_ms,
+                busy_timeout_ms=mirror_busy_ms,
             )
         except sqlite3.Error as db_error:
             print(f'error: failed to sync checks mirror for check tick {tick_id}: {db_error}', file=sys.stderr)
@@ -3243,12 +3276,6 @@ def run_check_tick(
 
         # (6) due な check の実行
         due_checks = select_due_checks(db_path, checks_cfg, tick_started_ts)
-        effective_reserve = (
-            min(CHECK_FINALIZE_RESERVE_SEC, max(0.0, float(tick_budget) * 0.1))
-            if finalize_reserve is None
-            else max(0.0, float(finalize_reserve))
-        )
-        end_work_deadline = tick_deadline - effective_reserve
         work_budget = max(0.0, end_work_deadline - mono_start)
         effective_commit_reserve = (
             min(CHECK_COMMIT_RESERVE_SEC, work_budget * 0.1)
