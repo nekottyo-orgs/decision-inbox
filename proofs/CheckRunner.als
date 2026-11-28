@@ -19,6 +19,7 @@ one sig EmptyKey, KeyA, KeyB extends DedupKey {}
 
 sig Check {
   interval : one Int,
+  grace : one Int,
   faultThreshold : one Int,
   var enabled : one Int,          // 1 = enabled, 0 = disabled
   var commandVer : one Int,       // command の版 (変更検知用)
@@ -45,6 +46,8 @@ one sig Clock {
 fact StaticConstraints {
   all c : Check {
     c.interval = 3
+    // Lean の grace(interval) = min(30, floor(interval / 10)) と整合 (interval=3 -> 0)
+    c.grace = div[c.interval, 10]
     c.faultThreshold = 2
   }
 }
@@ -63,8 +66,8 @@ pred isDue[c : Check, now : Int] {
   no c.lastActualStarted or
   no c.lastOutcome or
   isClockAnomaly[c, now] or
-  (some c.lastOutcome and c.lastOutcome in SuccessOutcomes and now >= plus[c.lastStarted, minus[c.interval, 1]]) or
-  (some c.lastOutcome and c.lastOutcome in FailureOutcomes and now >= plus[c.lastActualStarted, minus[c.interval, 1]])
+  (some c.lastOutcome and c.lastOutcome in SuccessOutcomes and plus[now, c.grace] >= plus[c.lastStarted, c.interval]) or
+  (some c.lastOutcome and c.lastOutcome in FailureOutcomes and plus[now, c.grace] >= plus[c.lastActualStarted, c.interval])
 }
 
 pred init {
@@ -248,14 +251,21 @@ assert FailureDueRespectsActualStart {
      some c.lastOutcome and
      c.lastOutcome in FailureOutcomes and
      not isClockAnomaly[c, now]) implies
-      actual >= plus[c.lastActualStarted, minus[c.interval, 1]])
+      plus[actual, c.grace] >= plus[c.lastActualStarted, c.interval])
 }
 
-check LastOutcomeNeverAborted for 1 Check, 4 Task, 4 int, 8 steps expect 0
-check FaultCounterBoundedAndGated for 1 Check, 4 Task, 4 int, 8 steps expect 0
-check NoDuplicateIncompleteTasks for 1 Check, 4 Task, 4 int, 8 steps expect 0
-check AbortedLeavesCheckStateIntact for 1 Check, 4 Task, 4 int, 8 steps expect 0
-check FailureDueRespectsActualStart for 1 Check, 4 Task, 4 int, 8 steps expect 0
+assert IntervalThreeGraceBoundary {
+  always (all c : Check |
+    (c.lastStarted = 0 and c.lastActualStarted = 0 and some c.lastOutcome) implies
+      (not isDue[c, 2] and isDue[c, 3]))
+}
+
+check LastOutcomeNeverAborted for 1 Check, 4 Task, 5 int, 8 steps expect 0
+check FaultCounterBoundedAndGated for 1 Check, 4 Task, 5 int, 8 steps expect 0
+check NoDuplicateIncompleteTasks for 1 Check, 4 Task, 5 int, 8 steps expect 0
+check AbortedLeavesCheckStateIntact for 1 Check, 4 Task, 5 int, 8 steps expect 0
+check FailureDueRespectsActualStart for 1 Check, 4 Task, 5 int, 8 steps expect 0
+check IntervalThreeGraceBoundary for 1 Check, 4 Task, 5 int, 8 steps expect 0
 
 // --- Witness (非自明性の確認: expect 1) ---
 
@@ -263,7 +273,7 @@ check FailureDueRespectsActualStart for 1 Check, 4 Task, 4 int, 8 steps expect 0
 run NamespaceIsolationWitness {
   eventually (some c : Check |
     hasIncomplete[c, KindEvent, EmptyKey] and hasIncomplete[c, KindFault, EmptyKey])
-} for 1 Check, 3 Task, 4 int, 6 steps expect 1
+} for 1 Check, 3 Task, 5 int, 6 steps expect 1
 
 // 故障タスク起票 → 完了 → 再起票のライフサイクルが到達可能
 run FaultLifecycleWitness {
@@ -271,7 +281,7 @@ run FaultLifecycleWitness {
     t1.kind = KindFault and t2.kind = KindFault and
     t1.exists = 1 and t1.incomplete = 0 and
     t2.exists = 1 and t2.incomplete = 1)
-} for 1 Check, 3 Task, 4 int, 8 steps expect 1
+} for 1 Check, 3 Task, 5 int, 8 steps expect 1
 
 // 失敗途中に Aborted が挟まっても faultCount が維持され、次の失敗で故障タスクが起票される
 run AbortedDuringFailureStreakWitness {
@@ -279,4 +289,4 @@ run AbortedDuringFailureStreakWitness {
     c.faultCount = 1 and
     (after (c.lastRunOutcome = Aborted and c.faultCount = 1 and
       (after (hasIncomplete[c, KindFault, EmptyKey] and c.faultCount = 0)))))
-} for 1 Check, 3 Task, 4 int, 6 steps expect 1
+} for 1 Check, 3 Task, 5 int, 6 steps expect 1
