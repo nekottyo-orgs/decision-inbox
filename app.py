@@ -1867,6 +1867,7 @@ CHECK_WAKE_ITEM_TIMEOUT_SEC = 5.0
 CHECK_WAKE_CB_LIMIT = 2
 CHECK_GIT_TIMEOUT_SEC = 5.0
 CHECK_MAX_TIMEOUT_SEC = 180.0
+CHECK_MAX_FAULT_THRESHOLD = (1 << 63) - 1
 CHECK_KILL_GRACE_SEC = 5.0
 CHECK_KILL_WAIT_SEC = 1.0
 CHECK_STDOUT_LIMIT = 65536
@@ -2223,16 +2224,26 @@ def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_
         seen_names.add(name)
 
         timeout = entry.get('timeout')
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not (0 < timeout <= CHECK_MAX_TIMEOUT_SEC):
+        try:
+            timeout_val = None if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) else float(timeout)
+        except OverflowError:
+            timeout_val = None
+        if timeout_val is None or not math.isfinite(timeout_val) or not (0 < timeout_val <= CHECK_MAX_TIMEOUT_SEC):
             raise CheckConfigError(f'check {name!r} の timeout は 0 < timeout <= {int(CHECK_MAX_TIMEOUT_SEC)} である必要があります')
 
         interval = entry.get('interval')
-        if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval <= 0:
+        try:
+            interval_val = None if isinstance(interval, bool) or not isinstance(interval, (int, float)) else float(interval)
+        except OverflowError:
+            interval_val = None
+        if interval_val is None or not math.isfinite(interval_val) or interval_val <= 0:
             raise CheckConfigError(f'check {name!r} の interval は正の数である必要があります')
 
         fault_threshold = entry.get('fault_threshold', 3)
-        if isinstance(fault_threshold, bool) or not isinstance(fault_threshold, int) or fault_threshold < 1:
-            raise CheckConfigError(f'check {name!r} の fault_threshold は 1 以上の整数である必要があります')
+        if isinstance(fault_threshold, bool) or not isinstance(fault_threshold, int) or not (1 <= fault_threshold <= CHECK_MAX_FAULT_THRESHOLD):
+            raise CheckConfigError(
+                f'check {name!r} の fault_threshold は 1 以上 {CHECK_MAX_FAULT_THRESHOLD} 以下の整数である必要があります'
+            )
 
         skill = entry.get('skill')
         if not isinstance(skill, str) or not skill.strip() or '\x00' in skill or _has_surrogate(skill):
@@ -2260,13 +2271,11 @@ def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_
                 raise CheckConfigError(f'check {name!r} の command が不正です')
             cmd_path = command_raw
             cmd_args = []
-            canonical_cmd = command_raw
         elif isinstance(command_raw, list) and command_raw and all(isinstance(part, str) and '\x00' not in part for part in command_raw):
             if not command_raw[0].strip():
                 raise CheckConfigError(f'check {name!r} の command[0] が空です')
             cmd_path = command_raw[0]
             cmd_args = command_raw[1:]
-            canonical_cmd = json.dumps(command_raw, ensure_ascii=False)
         else:
             raise CheckConfigError(f'check {name!r} の command はパス文字列または非空の文字列配列である必要があります')
 
@@ -2281,12 +2290,18 @@ def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_
         if not os.path.isfile(real_cmd):
             raise CheckConfigError(f'check {name!r} の command ファイルが見つかりません: {cmd_path}')
 
+        resolved_argv = [real_cmd, *cmd_args]
+        # 文字列形 ('["probe"]') と配列形 (["probe"]) が衝突しないよう、配列 JSON として一意に表現する
+        canonical_cmd = json.dumps([cmd_path, *cmd_args], ensure_ascii=False)
+        command_identity = json.dumps(resolved_argv, ensure_ascii=False)
+
         validated.append({
             'name': name,
-            'interval': float(interval),
+            'interval': interval_val,
             'command': canonical_cmd,
-            'argv': [real_cmd, *cmd_args],
-            'timeout': float(timeout),
+            'command_identity': command_identity,
+            'argv': resolved_argv,
+            'timeout': timeout_val,
             'skill': skill,
             'env': env_clean,
             'fault_threshold': fault_threshold,
@@ -2311,7 +2326,7 @@ def sync_checks_mirror(db_path, checks_cfg, now_iso):
             enabled_int = 1 if item['enabled'] else 0
             if name in existing:
                 prev = existing[name]
-                command_changed = prev['prev_command'] != item['command']
+                command_changed = prev['prev_command'] != item['command_identity']
                 fault_count = 0 if (command_changed or not item['enabled']) else prev['fault_count']
                 connection.execute(
                     '''UPDATE checks
@@ -2321,7 +2336,7 @@ def sync_checks_mirror(db_path, checks_cfg, now_iso):
                     (
                         item['interval'], item['command'], item['timeout'], item['skill'], env_json,
                         item['fault_threshold'], enabled_int, item['toml_order'], fault_count,
-                        item['command'], now_iso, name,
+                        item['command_identity'], now_iso, name,
                     ),
                 )
             else:
@@ -2333,7 +2348,7 @@ def sync_checks_mirror(db_path, checks_cfg, now_iso):
                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)''',
                     (
                         name, item['interval'], item['command'], item['timeout'], item['skill'], env_json,
-                        item['fault_threshold'], enabled_int, item['toml_order'], item['command'], now_iso,
+                        item['fault_threshold'], enabled_int, item['toml_order'], item['command_identity'], now_iso,
                     ),
                 )
         for name in existing:
@@ -2345,12 +2360,13 @@ def sync_checks_mirror(db_path, checks_cfg, now_iso):
 
 
 def check_grace_seconds(interval):
-    return min(30.0, float(interval) * 0.1)
+    """proofs/CheckRunner.lean の grace(interval) = min(30, floor(interval / 10)) と一致する整数秒 grace を返す。"""
+    return float(min(30, max(0, math.floor(float(interval) / 10.0))))
 
 
 def check_due_info(row, tick_started_ts):
     """due 判定と優先群・巻き戻りフラグを返す: (is_due, priority_group, clock_anomaly, ls_ts, la_ts)。
-    proofs/CheckRunner.lean の isDue / isClockAnomaly / dueBase と一致させる。"""
+    整数秒の時刻・interval に対して proofs/CheckRunner.lean の isDue / isClockAnomaly / dueBase と一致させる。"""
     last_started = row['last_started']
     last_actual = row['last_actual_started_at']
     last_outcome = row['last_outcome']

@@ -20,6 +20,8 @@ from app import (
     CHECK_FAULT_SKILL,
     Store,
     _terminate_process_group,
+    check_due_info,
+    check_grace_seconds,
     check_list_data,
     check_lock_path,
     check_status_data,
@@ -1401,6 +1403,103 @@ sys.exit(2)
         self.assertEqual(rc, 1)
         self.assertEqual(res['status'], 'config_error')
         self.assertIn('5 秒', res['error'])
+
+    def test_fault_threshold_int64_bounds_rejected_as_config_error(self):
+        self.commit_config(
+            '[[checks]]\nname = "overflow"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n'
+            'fault_threshold = 9223372036854775808\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        res = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': '1700000000'})
+        self.assertEqual(res.returncode, 1)
+        body = json.loads(res.stdout)
+        self.assertEqual(body['status'], 'config_error')
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        self.assertEqual(self.query_all('SELECT * FROM checks'), [])
+
+        # signed 64-bit 最大値ちょうどは受理されて保存できる
+        self.commit_config(
+            '[[checks]]\nname = "max_i64"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n'
+            'fault_threshold = 9223372036854775807\n',
+        )
+        ok_res = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': '1700000100'})
+        self.assertEqual(ok_res.returncode, 0, ok_res.stderr)
+        self.assertEqual(json.loads(ok_res.stdout)['status'], 'ok')
+        row = self.query_one("SELECT fault_threshold FROM checks WHERE name='max_i64'")
+        self.assertEqual(row['fault_threshold'], 9223372036854775807)
+
+    def test_grace_seconds_floors_to_whole_seconds_matching_lean_model(self):
+        self.assertEqual(check_grace_seconds(3), 0.0)
+        self.assertEqual(check_grace_seconds(65), 6.0)
+        self.assertEqual(check_grace_seconds(299), 29.0)
+        self.assertEqual(check_grace_seconds(300), 30.0)
+        self.assertEqual(check_grace_seconds(600), 30.0)
+
+        self.commit_config(
+            '[[checks]]\nname = "g65"\ninterval = 65\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        clock = FakeClock(wall=1000.0, mono=100.0)
+        res, rc = run_check_tick(self.db, self.config, now_fn=clock.now, mono_fn=clock.monotonic, deliver_fn=lambda c, t: True)
+        self.assertEqual((rc, res['status']), (0, 'ok'))
+        self.assertEqual(len(self.query_all('SELECT * FROM check_runs')), 1)
+
+        # grace = floor(65 / 10) = 6 -> cutoff = 1000 + 65 - 6 = 1059
+        # 旧実装 (grace = 6.5 -> cutoff = 1058.5) では due になっていた 1058.5 は due でないこと
+        for ts in (1058.0, 1058.5, 1058.9):
+            clock.wall = ts
+            run_check_tick(self.db, self.config, now_fn=clock.now, mono_fn=clock.monotonic, deliver_fn=lambda c, t: True)
+            self.assertEqual(len(self.query_all('SELECT * FROM check_runs')), 1, f'ts={ts} should not be due')
+
+        # 1059.0 で due
+        clock.wall = 1059.0
+        run_check_tick(self.db, self.config, now_fn=clock.now, mono_fn=clock.monotonic, deliver_fn=lambda c, t: True)
+        self.assertEqual(len(self.query_all('SELECT * FROM check_runs')), 2)
+
+        # check_due_info 直接確認 (interval=3, grace=0 -> now=2 は False, now=3 は True)
+        iso0 = datetime.fromtimestamp(0, timezone.utc).isoformat(timespec='microseconds')
+        row3 = {'interval': 3.0, 'last_started': iso0, 'last_actual_started_at': iso0, 'last_outcome': 'ok_silent'}
+        self.assertFalse(check_due_info(row3, 2.0)[0])
+        self.assertTrue(check_due_info(row3, 3.0)[0])
+
+    def test_command_string_and_array_forms_have_distinct_identity_in_mirror_sync(self):
+        # literal なファイル名 `["probe"]` と `probe` の両方を用意する
+        self.commit_config(
+            '[[checks]]\nname = "ambig"\ninterval = 60\ncommand = \'["probe"]\'\ntimeout = 10\nskill = "s1"\nfault_threshold = 3\n',
+            {
+                '["probe"]': '#!/bin/sh\nexit 1\n',
+                'probe': '#!/bin/sh\nexit 1\n',
+            },
+        )
+        t = 1700000000
+        res1 = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': str(t)})
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        self.assertEqual(self.query_one("SELECT fault_count FROM checks WHERE name='ambig'")['fault_count'], 1)
+
+        # 同じ文字列形 command のまま (timeout だけ変更) なら fault_count を保持して 2 になる
+        self.commit_config(
+            '[[checks]]\nname = "ambig"\ninterval = 60\ncommand = \'["probe"]\'\ntimeout = 20\nskill = "s1"\nfault_threshold = 3\n',
+        )
+        t += 100
+        res2 = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': str(t)})
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual(self.query_one("SELECT fault_count FROM checks WHERE name='ambig'")['fault_count'], 2)
+
+        # 配列形 command = ["probe"] (別ファイル `probe`) に切り替えると identity が変わり fault_count が 0 にリセットされる
+        self.commit_config(
+            '[[checks]]\nname = "ambig"\ninterval = 60\ncommand = ["probe"]\ntimeout = 20\nskill = "s1"\nfault_threshold = 3\n',
+        )
+        t += 10  # due 前なので mirror sync のみ走る
+        res3 = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': str(t)})
+        self.assertEqual(res3.returncode, 0, res3.stderr)
+        self.assertEqual(self.query_one("SELECT fault_count FROM checks WHERE name='ambig'")['fault_count'], 0)
+
+        # 配列形のまま実行すると 1 になり、故障タスクは起票されない (旧 fault_count=2 を引き継いでいない)
+        t += 100
+        res4 = self.cli('check', 'tick', '--config', str(self.config), env_extra={'CUE_CHECK_NOW': str(t)})
+        self.assertEqual(res4.returncode, 0, res4.stderr)
+        self.assertEqual(self.query_one("SELECT fault_count FROM checks WHERE name='ambig'")['fault_count'], 1)
+        self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE kind='fault'"), [])
 
 
 if __name__ == '__main__':
