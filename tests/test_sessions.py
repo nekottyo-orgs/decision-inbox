@@ -17,6 +17,8 @@ from test_app import isolated_env, request_payload
 ROOT = Path(__file__).resolve().parents[1]
 # sessions 表を足す前の main (PR #46 の merge)。旧 release の app.py がそのまま動くかを確かめる基準
 OLD_RELEASE = '6927e03'
+# v0.0.2 の app.py と同じ計測列追加前の sessions スキーマ
+PRE_SAMPLE_RELEASE = 'd0ed5d5'
 
 
 class SessionTests(unittest.TestCase):
@@ -354,6 +356,64 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(json.loads(bad_window.stderr)['error'])
         self.assertIn('{"sessions":', self.cli('session', 'list', '--help').stdout)
 
+    def test_sample_CLI_は再送や逆順で累積値を戻さず欠測を残す(self):
+        with patch('app.utc_now', return_value='2000-01-01T10:00:00.000000+00:00'):
+            row = self.store.open_session(self.open_payload())
+        self.assertEqual((row['turn_count'], row['input_tokens'], row['elapsed_seconds']), (None, None, None))
+        base = ('session', 'sample', '--id', str(row['id']))
+        args = (*base, '--observed-at', '2000-01-01T19:00:04.990000+09:00', '--turn-count', '5')
+        first = self.cli(*args)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        saved = json.loads(first.stdout)
+        self.assertEqual((saved['turn_count'], saved['input_tokens'], saved['elapsed_seconds']), (5, None, 4))
+        self.assertEqual(json.loads(self.cli(*args).stdout), saved)
+        older = self.cli(*base, '--observed-at', '2000-01-01T10:00:02Z', '--turn-count', '1', '--input-tokens', '0')
+        self.assertEqual(older.returncode, 0, older.stderr)
+        self.assertEqual(json.loads(older.stdout), dict(saved, input_tokens=0))
+        self.assertEqual(json.loads(self.cli(*args).stdout), dict(saved, input_tokens=0))
+        self.assertEqual(json.loads(self.cli('session', 'list').stdout), {'sessions': [dict(saved, input_tokens=0)]})
+
+    def test_sample_は終了時刻で制限し開き直した同じ_native_session_を変更しない(self):
+        with patch('app.utc_now', side_effect=['2026-11-28T10:00:00Z', '2026-11-28T10:05:00Z', '2026-11-28T10:06:00Z']):
+            opened = self.store.open_session(self.open_payload())
+            closed = self.store.close_session(cli='claude', native_session_id=opened['native_session_id'], reason='replaced')
+            reopened = self.store.open_session(self.open_payload())
+
+        with patch('app.utc_now', return_value='2026-11-28T10:07:00Z'):
+            saved = self.store.sample_session(closed['id'], closed['closed_at'], input_tokens=250)
+            self.assertEqual(saved, dict(closed, input_tokens=250, elapsed_seconds=300))
+            self.assertEqual(self.status(self.store.sample_session, opened['id'], '2026-11-28T10:05:00.000001Z', turn_count=1), 409)
+        self.assertEqual(self.store.sessions()['sessions'], [saved, reopened])
+
+    def test_sample_は閉鎖前も未来の観測を断り閉鎖後は観測上限が変わる(self):
+        opened_at = '2026-11-28T10:00:00Z'
+        earlier_at = '2026-11-28T10:01:00Z'
+        closed_at = '2026-11-28T10:02:00Z'
+        later_at = '2026-11-28T10:02:01Z'
+        with patch('app.utc_now', return_value=opened_at):
+            row = self.store.open_session(self.open_payload())
+            self.assertEqual(self.status(self.store.sample_session, row['id'], later_at, turn_count=100), 400)
+            self.assertEqual(self.store.sessions()['sessions'], [row])
+        with patch('app.utc_now', return_value=closed_at):
+            before_close = self.store.sample_session(row['id'], earlier_at, turn_count=1)
+            self.assertEqual(before_close['elapsed_seconds'], 60)
+            closed = self.store.close_session(cli='claude', native_session_id=row['native_session_id'], reason='normal')
+        with patch('app.utc_now', return_value=later_at):
+            self.assertEqual(self.status(self.store.sample_session, row['id'], later_at, turn_count=100), 409)
+            saved = self.store.sample_session(row['id'], closed_at, turn_count=2)
+            self.assertEqual(saved, dict(closed, turn_count=2, elapsed_seconds=120))
+            self.assertEqual(self.store.sample_session(row['id'], earlier_at, turn_count=1), saved)
+
+    def test_sample_は不正値や未知の行で台帳を書き換えない(self):
+        row = self.store.open_session(self.open_payload())
+        for values in ({}, {'turn_count': -1}, {'turn_count': True}, {'input_tokens': 2**63}):
+            with self.subTest(values=values):
+                self.assertEqual(self.status(self.store.sample_session, row['id'], row['opened_at'], **values), 400)
+        self.assertEqual(self.status(self.store.sample_session, row['id'], '2026-11-28T10:00:00', turn_count=1), 400)
+        self.assertEqual(self.status(self.store.sample_session, 2**63, row['opened_at'], turn_count=1), 400)
+        self.assertEqual(self.status(self.store.sample_session, row['id'] + 1, row['opened_at'], turn_count=1), 404)
+        self.assertEqual(self.store.sessions()['sessions'], [row])
+
     def test_sessions_表の追加は既存表を変えず_user_version_は_2_のまま(self):
         decision = self.store.add(request_payload())
         self.store.open_session(self.open_payload())
@@ -363,7 +423,8 @@ class SessionTests(unittest.TestCase):
             decisions = [row[1] for row in connection.execute('PRAGMA table_info(decisions)')]
         self.assertEqual(
             columns,
-            ['id', 'run_id', 'role', 'req_id', 'pane', 'socket', 'cli', 'native_session_id', 'opened_at', 'closed_at', 'close_reason'],
+            ['id', 'run_id', 'role', 'req_id', 'pane', 'socket', 'cli', 'native_session_id', 'opened_at', 'closed_at',
+             'close_reason', 'turn_count', 'input_tokens', 'elapsed_seconds'],
         )
         self.assertEqual(
             decisions,
@@ -405,6 +466,30 @@ class SessionTests(unittest.TestCase):
         old_show = self.cli('run', 'show', '--run-id', 'r1', script=old, db=legacy)
         self.assertEqual(old_show.returncode, 0, old_show.stderr)
         self.assertEqual(len(json.loads(old_show.stdout)['runs']), 1)
+
+
+    def test_既存_sessions_に列を足した_DB_を旧_release_でも読んで閉じられる(self):
+        shown = subprocess.run(['git', 'show', f'{PRE_SAMPLE_RELEASE}:app.py'], cwd=ROOT, capture_output=True)
+        self.assertEqual(shown.returncode, 0, f'互換試験には {PRE_SAMPLE_RELEASE}:app.py を取得できる Git 履歴が必要です')
+        old = Path(self.temp.name) / 'old_app.py'
+        old.write_bytes(shown.stdout)
+        legacy = Path(self.temp.name) / 'legacy.sqlite3'
+        result = self.cli('session', 'open', '--run-id', 'r1', '--role', 'worker', '--cli', 'codex',
+                          '--session-id', 'uuid-legacy', '--pane', 'p1', '--socket', '/tmp/s', script=old, db=legacy)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        old_row = json.loads(result.stdout)
+        unmeasured = dict(old_row, turn_count=None, input_tokens=None, elapsed_seconds=None)
+        self.assertEqual(Store(legacy, readonly=True).sessions()['sessions'], [unmeasured])
+
+        new_store = Store(legacy)
+        self.assertEqual(new_store.sessions()['sessions'], [unmeasured])
+        saved = new_store.sample_session(old_row['id'], old_row['opened_at'], turn_count=2)
+        closed = self.cli('session', 'close', '--session-id', 'uuid-legacy', '--cli', 'codex',
+                          '--reason', 'normal', script=old, db=legacy)
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        old_closed = json.loads(closed.stdout)
+        self.assertEqual(old_closed, dict(saved, closed_at=old_closed['closed_at'], close_reason='normal'))
+        self.assertEqual(new_store.sessions()['sessions'], [old_closed])
 
 
 if __name__ == '__main__':
