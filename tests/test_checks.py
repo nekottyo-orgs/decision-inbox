@@ -2211,6 +2211,13 @@ sys.exit(2)
         anchor_b = [None]
         lock_state_b = []
 
+        def cleanup_b():
+            for t_b, rel_b in lock_state_b:
+                rel_b.set()
+                t_b.join(timeout=3.0)
+
+        self.addCleanup(cleanup_b)
+
         def mono_b():
             if anchor_b[0] is None:
                 return 0.0
@@ -2218,26 +2225,30 @@ sys.exit(2)
 
         def locked_prune(*args, **kwargs):
             # end_work_deadline まで 0.15s、finalize_reserve=0.45s (tick_deadline=0.60s)
-            # ロックは 0.25s で自動解放 -> prune は 0.15s で諦め、Step (9) は 0.25s 時点で成功する
-            t_b, rel_b = start_writer_lock(hold_sec=0.25)
+            # prune が返るまで writer ロックを保持し、prune 終了後 (Step (9) 前) に明示解放する
+            t_b, rel_b = start_writer_lock(hold_sec=5.0)
             lock_state_b.append((t_b, rel_b))
             anchor_b[0] = time.monotonic()
-            return orig_prune(*args, **kwargs)
+            try:
+                return orig_prune(*args, **kwargs)
+            finally:
+                rel_b.set()
+                t_b.join(timeout=3.0)
 
         t0_b = time.monotonic()
-        with mock.patch('app.prune_check_history', side_effect=locked_prune):
-            body_b, rc_b = run_check_tick(
-                self.db, self.config,
-                now_fn=lambda: base_now,
-                mono_fn=mono_b,
-                tick_budget=0.60,
-                finalize_reserve=0.45,
-                deliver_fn=lambda c, t: True,
-            )
+        try:
+            with mock.patch('app.prune_check_history', side_effect=locked_prune):
+                body_b, rc_b = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: base_now,
+                    mono_fn=mono_b,
+                    tick_budget=0.60,
+                    finalize_reserve=0.45,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            cleanup_b()
         elapsed_b = time.monotonic() - anchor_b[0] if anchor_b[0] is not None else time.monotonic() - t0_b
-        for t_b, rel_b in lock_state_b:
-            rel_b.set()
-            t_b.join(timeout=3.0)
         self.assertEqual((rc_b, body_b['status']), (0, 'ok'))
         self.assertLess(elapsed_b, 1.5, f'tick end work should finish well below 5s busy timeout, took {elapsed_b:.2f}s')
         self.assertIsNotNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (old_rid_b,)))
@@ -2557,21 +2568,30 @@ sys.exit(2)
             invocations_file.unlink()
 
         lock_acq_d = threading.Event()
+        release_lock_d = threading.Event()
         holder_d = [None]
 
-        def hold_writer_past_deadline(hold_sec):
+        def _cleanup_holder_d():
+            release_lock_d.set()
+            if holder_d[0] is not None:
+                holder_d[0].join(timeout=3.0)
+
+        self.addCleanup(_cleanup_holder_d)
+
+        def hold_writer_past_deadline(fallback_sec):
             conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
             try:
                 conn.execute('BEGIN IMMEDIATE')
                 lock_acq_d.set()
-                time.sleep(hold_sec)
+                release_lock_d.wait(timeout=fallback_sec)
             finally:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute('ROLLBACK')
                 conn.close()
 
         # tick 開始後の setup 時間を除き、check 完了時点から残り 120ms だけ retry_deadline まで残す。
-        # ロックは 220ms 保持 (deadline 超過後 100ms で解放 -> 旧実装の 500ms フォールバックなら成功していた)
+        # _commit_check_run_with_retry が戻る/例外送出するまで実 SQLite ロックを保持し、
+        # Step (9) finalization の直前に明示解放する (スレッドスケジューリング依存を避ける)。
         real_anchor_d = [None]
 
         def mono_d():
@@ -2581,27 +2601,35 @@ sys.exit(2)
 
         def cmd_then_lock_past_deadline(*args, **kwargs):
             res = orig_run_cmd(*args, **kwargs)
-            t = threading.Thread(target=hold_writer_past_deadline, args=(0.22,), daemon=True)
+            t = threading.Thread(target=hold_writer_past_deadline, args=(5.0,), daemon=True)
             holder_d[0] = t
             t.start()
             self.assertTrue(lock_acq_d.wait(timeout=3.0))
             real_anchor_d[0] = time.monotonic()
             return res
 
+        def release_after_commit_d(*args, **kwargs):
+            try:
+                return orig_commit_retry(*args, **kwargs)
+            finally:
+                _cleanup_holder_d()
+
         err_buf_d = io.StringIO()
-        with mock.patch('app.run_check_command', side_effect=cmd_then_lock_past_deadline), \
-                contextlib.redirect_stderr(err_buf_d):
-            res_d, rc_d = run_check_tick(
-                self.db, self.config,
-                now_fn=lambda: 1700000400.0,
-                mono_fn=mono_d,
-                tick_budget=0.62,
-                finalize_reserve=0.50,  # end_work_deadline = 0.12s, finalize は 0.50s 余裕あり (0.22s でロック解放後に完了)
-                commit_busy_timeout_ms=500,
-                deliver_fn=lambda c, t: True,
-            )
-        if holder_d[0] is not None:
-            holder_d[0].join(timeout=3.0)
+        try:
+            with mock.patch('app.run_check_command', side_effect=cmd_then_lock_past_deadline), \
+                    mock.patch('app._commit_check_run_with_retry', side_effect=release_after_commit_d), \
+                    contextlib.redirect_stderr(err_buf_d):
+                res_d, rc_d = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000400.0,
+                    mono_fn=mono_d,
+                    tick_budget=0.62,
+                    finalize_reserve=0.50,  # end_work_deadline = 0.12s, finalize は 0.50s 余裕あり
+                    commit_busy_timeout_ms=500,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            _cleanup_holder_d()
         self.assertEqual((rc_d, res_d['status']), (1, 'failed'))
         self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
         self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
