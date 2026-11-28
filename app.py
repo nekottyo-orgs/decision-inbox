@@ -1868,6 +1868,7 @@ CHECK_WAKE_CB_LIMIT = 2
 CHECK_GIT_TIMEOUT_SEC = 5.0
 CHECK_MAX_TIMEOUT_SEC = 180.0
 CHECK_KILL_GRACE_SEC = 5.0
+CHECK_KILL_WAIT_SEC = 1.0
 CHECK_STDOUT_LIMIT = 65536
 CHECK_STDERR_LIMIT = 65536
 CHECK_EXCERPT_LIMIT = 4096
@@ -2078,7 +2079,7 @@ def _pgid_alive(pgid):
         return False
 
 
-def _terminate_process_group(process, grace_sec):
+def _terminate_process_group(process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC):
     """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。"""
     pgid = process.pid
     with suppress(ProcessLookupError, PermissionError, OSError):
@@ -2108,12 +2109,24 @@ def _terminate_process_group(process, grace_sec):
     if process.returncode is None or _pgid_alive(pgid):
         with suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signal.SIGKILL)
+    kill_wait_budget = max(0.0, kill_wait_sec)
+    kill_wait_deadline = time.monotonic() + kill_wait_budget
+    leader_wait_timed_out = False
     if process.returncode is None:
-        with suppress(OSError):
-            process.wait()
-    kill_wait_deadline = time.monotonic() + 0.5
+        wait_remaining = max(0.0, kill_wait_deadline - time.monotonic())
+        try:
+            process.wait(timeout=wait_remaining)
+        except subprocess.TimeoutExpired:
+            leader_wait_timed_out = True
+        except OSError:
+            pass
     while _pgid_alive(pgid) and time.monotonic() < kill_wait_deadline:
-        time.sleep(0.01)
+        time.sleep(min(0.01, max(0.0, kill_wait_deadline - time.monotonic())))
+    if leader_wait_timed_out or process.returncode is None or _pgid_alive(pgid):
+        print(
+            f'warning: process group {pgid} did not terminate within {kill_wait_budget:.2f}s after SIGKILL',
+            file=sys.stderr,
+        )
 
 
 def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace=0.5):
@@ -2456,6 +2469,8 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。"""
     cmd_env = {**os.environ, **chk['env']}
     cmd_mono_start = mono_fn()
+    if cmd_mono_start >= tick_deadline:
+        return None, b'', b'', False, True
     timeout_at = cmd_mono_start + chk['timeout']
     try:
         process = subprocess.Popen(
