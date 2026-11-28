@@ -2060,6 +2060,152 @@ sys.exit(2)
         remaining_old = self.query_all('SELECT id FROM check_runs WHERE started_at = ?', (old_iso,))
         self.assertEqual(len(remaining_old), 1)
 
+    def test_end_of_tick_db_lock_wait_stays_within_tick_deadline(self):
+        import threading
+
+        self.commit_config(
+            '[[checks]]\nname = "ok_chk"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        base_now = 1700000000.0
+        old_iso = datetime.fromtimestamp(base_now - 31 * 86400, timezone.utc).isoformat(timespec='microseconds')
+        run_check_tick(self.db, self.config, now_fn=lambda: base_now - 1000.0, deliver_fn=lambda c, t: True)
+
+        def seed_old_row_and_reset_due():
+            with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute('DELETE FROM check_runs')
+                conn.execute('DELETE FROM check_ticks')
+                conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+                cur = conn.execute(
+                    "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, ?, 'ok', 0, 0, 0)",
+                    (old_iso, old_iso),
+                )
+                old_tid = cur.lastrowid
+                cur = conn.execute(
+                    "INSERT INTO check_runs(tick_id, check_name, started_at, finished_at, exit_code, outcome) VALUES(?, 'ok_chk', ?, ?, 0, 'ok_silent')",
+                    (old_tid, old_iso, old_iso),
+                )
+                return old_tid, cur.lastrowid
+
+        def start_writer_lock(hold_sec=5.0):
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def _worker():
+                conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    acquired.set()
+                    release.wait(timeout=hold_sec)
+                finally:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.execute('ROLLBACK')
+                    conn.close()
+
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+            self.assertTrue(acquired.wait(timeout=3.0))
+            return thread, release
+
+        # (a) prune_check_history は DB ロック保持中でも既定の 5 秒待たず deadline 内で False を返すこと
+        seed_old_row_and_reset_due()
+        t_a, rel_a = start_writer_lock(hold_sec=5.0)
+        try:
+            t0 = time.monotonic()
+            finished = prune_check_history(
+                self.db, current_tick_id=999999,
+                cutoff_iso=datetime.fromtimestamp(base_now - 1000.0, timezone.utc).isoformat(timespec='microseconds'),
+                deadline=t0 + 0.15,
+                mono_fn=time.monotonic,
+            )
+            elapsed_a = time.monotonic() - t0
+        finally:
+            rel_a.set()
+            t_a.join(timeout=3.0)
+        self.assertFalse(finished)
+        self.assertLess(elapsed_a, 1.0, f'prune should stay near 0.15s deadline, took {elapsed_a:.2f}s')
+
+        # (b) prune 開始時に DB ロックされ end_work_deadline 後・tick_deadline 前に解放される場合:
+        #     prune が 5 秒待ちせず切り上げ、finalize_reserve 内で最終 status=ok の更新が完了すること
+        old_tid_b, old_rid_b = seed_old_row_and_reset_due()
+        orig_prune = prune_check_history
+        anchor_b = [None]
+        lock_state_b = []
+
+        def mono_b():
+            if anchor_b[0] is None:
+                return 0.0
+            return time.monotonic() - anchor_b[0]
+
+        def locked_prune(*args, **kwargs):
+            # end_work_deadline まで 0.15s、finalize_reserve=0.45s (tick_deadline=0.60s)
+            # ロックは 0.25s で自動解放 -> prune は 0.15s で諦め、Step (9) は 0.25s 時点で成功する
+            t_b, rel_b = start_writer_lock(hold_sec=0.25)
+            lock_state_b.append((t_b, rel_b))
+            anchor_b[0] = time.monotonic()
+            return orig_prune(*args, **kwargs)
+
+        t0_b = time.monotonic()
+        with mock.patch('app.prune_check_history', side_effect=locked_prune):
+            body_b, rc_b = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: base_now,
+                mono_fn=mono_b,
+                tick_budget=0.60,
+                finalize_reserve=0.45,
+                deliver_fn=lambda c, t: True,
+            )
+        elapsed_b = time.monotonic() - anchor_b[0] if anchor_b[0] is not None else time.monotonic() - t0_b
+        for t_b, rel_b in lock_state_b:
+            rel_b.set()
+            t_b.join(timeout=3.0)
+        self.assertEqual((rc_b, body_b['status']), (0, 'ok'))
+        self.assertLess(elapsed_b, 1.5, f'tick end work should finish well below 5s busy timeout, took {elapsed_b:.2f}s')
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (old_rid_b,)))
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_ticks WHERE id=?', (old_tid_b,)))
+        self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (body_b['tick_id'],))['status'], 'ok')
+
+        # (c) end wake・prune・最終 status 更新の全区間で DB ロックが保持される場合:
+        #     既定の 5 秒待ちを越えず予算内で失敗 (status=failed, rc=1) として終了すること
+        seed_old_row_and_reset_due()
+        orig_commit_retry = sys.modules['app']._commit_check_run_with_retry
+        anchor_c = [None]
+        lock_state_c = []
+
+        def mono_c():
+            if anchor_c[0] is None:
+                return 0.0
+            return time.monotonic() - anchor_c[0]
+
+        def lock_after_commit(*args, **kwargs):
+            res = orig_commit_retry(*args, **kwargs)
+            t_c, rel_c = start_writer_lock(hold_sec=5.0)
+            lock_state_c.append((t_c, rel_c))
+            anchor_c[0] = time.monotonic()
+            return res
+
+        err_buf_c = io.StringIO()
+        try:
+            with mock.patch('app._commit_check_run_with_retry', side_effect=lock_after_commit), \
+                    contextlib.redirect_stderr(err_buf_c):
+                body_c, rc_c = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: base_now + 100.0,
+                    mono_fn=mono_c,
+                    tick_budget=0.45,
+                    finalize_reserve=0.20,
+                    deliver_fn=lambda c, t: True,
+                )
+            elapsed_c = time.monotonic() - anchor_c[0]
+        finally:
+            for t_c, rel_c in lock_state_c:
+                rel_c.set()
+                t_c.join(timeout=3.0)
+        self.assertEqual((rc_c, body_c['status']), (1, 'failed'))
+        self.assertIn('error', body_c)
+        self.assertIn('failed to finalize check tick', err_buf_c.getvalue())
+        self.assertLess(elapsed_c, 1.5, f'finalize under DB lock must not wait 5s, took {elapsed_c:.2f}s')
+
     def test_prune_preserves_parent_tick_of_retained_runs_until_runs_expire(self):
         self.commit_config(
             '[[checks]]\nname = "p1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',

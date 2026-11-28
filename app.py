@@ -1960,9 +1960,10 @@ def default_run_inbox_bin():
 def _check_db(db_path, *, busy_timeout_ms=5000):
     """check runner 用の DB 接続。WAL 切替や DDL は行わない (flock 取得後の初期化のみが行う)。"""
     resolved = _resolve_check_db_path(db_path)
-    connection = sqlite3.connect(str(resolved), timeout=busy_timeout_ms / 1000.0)
+    timeout_ms = max(0, int(busy_timeout_ms))
+    connection = sqlite3.connect(str(resolved), timeout=timeout_ms / 1000.0)
     connection.row_factory = sqlite3.Row
-    connection.execute(f'PRAGMA busy_timeout={int(busy_timeout_ms)}')
+    connection.execute(f'PRAGMA busy_timeout={timeout_ms}')
     try:
         with connection:
             yield connection
@@ -2790,48 +2791,63 @@ def run_wake_pass(
     run_inbox_bin=None, wake_run_id=None, skip_task_ids=None,
     pass_budget=CHECK_WAKE_PASS_BUDGET_SEC, item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
     cb_limit=CHECK_WAKE_CB_LIMIT, deliver_fn=None,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+    stop_on_db_contention=False,
 ):
     """1 回の wake パスを実行する。
     (1) I/O ループ前に回収 (claim 済み・終了済みの needs_wake=0) を無条件に一括 UPDATE。
     (2) トランザクション外で run-inbox 投入 (1 件 5 秒、パス合計 20 秒、2 件連続失敗で CB)。
     戻り値: (failed_task_ids: set[str], truncated_by_budget: bool, attempted_count: int)。"""
-    pass_deadline = mono_fn() + pass_budget
+    pass_budget_pos = max(0.0, float(pass_budget))
+    pass_deadline = mono_fn() + pass_budget_pos
+    pass_real_deadline = time.monotonic() + pass_budget_pos
     skip = set(skip_task_ids or ())
 
-    # 回収 (wake I/O ループの前に無条件で実行。notified_at は NULL のまま維持)
-    with _check_db(db_path) as connection:
-        connection.execute('BEGIN IMMEDIATE')
-        connection.execute(
-            '''UPDATE check_tasks
-               SET needs_wake = 0
-               WHERE needs_wake = 1
-                 AND NOT EXISTS (
-                     SELECT 1 FROM tasks
-                     WHERE tasks.id = check_tasks.task_id
-                       AND tasks.lane = 'todo'
-                       AND tasks.pane = ''
-                       AND tasks.run = ''
-                 )'''
-        )
+    def _wake_db_busy_ms():
+        rem = min(pass_deadline - mono_fn(), pass_real_deadline - time.monotonic())
+        if rem <= 0:
+            return 0
+        return min(max(0, int(busy_timeout_ms)), int(rem * 1000))
 
-    # 候補取得 (I/O 中はトランザクションを保持しない)
-    with _check_db(db_path) as connection:
-        candidates = [
-            dict(row)
-            for row in connection.execute(
-                '''SELECT ct.task_id, ct.check_name, ct.kind, ct.dedup_key, ct.skill,
-                          ct.created_at, ct.last_wake_attempt_at
-                   FROM check_tasks ct
-                   JOIN tasks t ON t.id = ct.task_id
-                   WHERE ct.needs_wake = 1
-                     AND t.lane = 'todo'
-                     AND t.pane = ''
-                     AND t.run = ''
-                   ORDER BY COALESCE(ct.last_wake_attempt_at, ct.created_at) ASC,
-                            CASE WHEN ct.kind = 'fault' THEN 0 ELSE 1 END ASC,
-                            ct.task_id ASC'''
+    # 回収 (wake I/O ループの前に無条件で実行。notified_at は NULL のまま維持)
+    try:
+        with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                '''UPDATE check_tasks
+                   SET needs_wake = 0
+                   WHERE needs_wake = 1
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks
+                         WHERE tasks.id = check_tasks.task_id
+                           AND tasks.lane = 'todo'
+                           AND tasks.pane = ''
+                           AND tasks.run = ''
+                     )'''
             )
-        ]
+
+        # 候補取得 (I/O 中はトランザクションを保持しない)
+        with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+            candidates = [
+                dict(row)
+                for row in connection.execute(
+                    '''SELECT ct.task_id, ct.check_name, ct.kind, ct.dedup_key, ct.skill,
+                              ct.created_at, ct.last_wake_attempt_at
+                       FROM check_tasks ct
+                       JOIN tasks t ON t.id = ct.task_id
+                       WHERE ct.needs_wake = 1
+                         AND t.lane = 'todo'
+                         AND t.pane = ''
+                         AND t.run = ''
+                       ORDER BY COALESCE(ct.last_wake_attempt_at, ct.created_at) ASC,
+                                CASE WHEN ct.kind = 'fault' THEN 0 ELSE 1 END ASC,
+                                ct.task_id ASC'''
+                )
+            ]
+    except sqlite3.Error as db_error:
+        if stop_on_db_contention and _is_sqlite_retryable_contention(db_error):
+            return set(), True, 0
+        raise
 
     candidates = [item for item in candidates if item['task_id'] not in skip]
     failed_ids = set()
@@ -2854,21 +2870,26 @@ def run_wake_pass(
             ok, _reason = _deliver_wake_run_inbox(
                 candidate, run_inbox_bin=inbox_bin, run_id_box=run_id_box, timeout=item_timeout, mono_fn=mono_fn,
             )
-        with _check_db(db_path) as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            if ok:
-                connection.execute(
-                    'UPDATE check_tasks SET needs_wake=0, notified_at=?, last_wake_attempt_at=? WHERE task_id=?',
-                    (attempt_iso, attempt_iso, candidate['task_id']),
-                )
-                consecutive_failures = 0
-            else:
-                connection.execute(
-                    'UPDATE check_tasks SET last_wake_attempt_at=? WHERE task_id=?',
-                    (attempt_iso, candidate['task_id']),
-                )
-                failed_ids.add(candidate['task_id'])
-                consecutive_failures += 1
+        try:
+            with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                if ok:
+                    connection.execute(
+                        'UPDATE check_tasks SET needs_wake=0, notified_at=?, last_wake_attempt_at=? WHERE task_id=?',
+                        (attempt_iso, attempt_iso, candidate['task_id']),
+                    )
+                    consecutive_failures = 0
+                else:
+                    connection.execute(
+                        'UPDATE check_tasks SET last_wake_attempt_at=? WHERE task_id=?',
+                        (attempt_iso, candidate['task_id']),
+                    )
+                    failed_ids.add(candidate['task_id'])
+                    consecutive_failures += 1
+        except sqlite3.Error as db_error:
+            if stop_on_db_contention and _is_sqlite_retryable_contention(db_error):
+                return failed_ids, True, attempted
+            raise
         if consecutive_failures >= cb_limit:
             break
 
@@ -2922,47 +2943,81 @@ def _commit_check_run_with_retry(
 def prune_check_history(
     db_path, current_tick_id, cutoff_iso, *,
     batch_size=CHECK_PRUNE_BATCH, deadline=None, mono_fn=time.monotonic,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
 ):
     """30 日を超えた check_runs / check_run_events / check_ticks を小さいバッチに分けて削除する。
-    deadline が指定されている場合は残り budget 内のバッチのみ実行し、保持される run を持つ親 tick は削除しない。"""
-    while True:
-        if deadline is not None and mono_fn() >= deadline:
-            return False
-        with _check_db(db_path) as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            run_ids = [
-                row['id']
-                for row in connection.execute(
-                    'SELECT id FROM check_runs WHERE started_at < ? ORDER BY id LIMIT ?',
-                    (cutoff_iso, batch_size),
-                )
-            ]
-            if not run_ids:
-                break
-            marks = ','.join('?' * len(run_ids))
-            connection.execute(f'DELETE FROM check_run_events WHERE run_id IN ({marks})', run_ids)
-            connection.execute(f'DELETE FROM check_runs WHERE id IN ({marks})', run_ids)
+    deadline が指定されている場合は残り budget 内のバッチのみ実行し、DB 待ちも残り budget 内に抑え、
+    保持される run を持つ親 tick は削除しない。"""
+    real_deadline = None
+    first_mono = None
+    if deadline is not None:
+        first_mono = mono_fn()
+        real_deadline = time.monotonic() + max(0.0, deadline - first_mono)
+
+    def _batch_busy_ms():
+        nonlocal first_mono
+        if deadline is None:
+            return max(0, int(busy_timeout_ms))
+        if first_mono is not None:
+            now_m = first_mono
+            first_mono = None
+        else:
+            now_m = mono_fn()
+        rem = min(deadline - now_m, real_deadline - time.monotonic())
+        if rem <= 0:
+            return None
+        return min(max(0, int(busy_timeout_ms)), int(rem * 1000))
 
     while True:
-        if deadline is not None and mono_fn() >= deadline:
+        batch_busy_ms = _batch_busy_ms()
+        if batch_busy_ms is None:
             return False
-        with _check_db(db_path) as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            tick_ids = [
-                row['id']
-                for row in connection.execute(
-                    '''SELECT id FROM check_ticks
-                       WHERE started_at < ?
-                         AND id != ?
-                         AND NOT EXISTS (SELECT 1 FROM check_runs WHERE check_runs.tick_id = check_ticks.id)
-                       ORDER BY id LIMIT ?''',
-                    (cutoff_iso, current_tick_id, batch_size),
-                )
-            ]
-            if not tick_ids:
-                break
-            marks = ','.join('?' * len(tick_ids))
-            connection.execute(f'DELETE FROM check_ticks WHERE id IN ({marks})', tick_ids)
+        try:
+            with _check_db(db_path, busy_timeout_ms=batch_busy_ms) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                run_ids = [
+                    row['id']
+                    for row in connection.execute(
+                        'SELECT id FROM check_runs WHERE started_at < ? ORDER BY id LIMIT ?',
+                        (cutoff_iso, batch_size),
+                    )
+                ]
+                if not run_ids:
+                    break
+                marks = ','.join('?' * len(run_ids))
+                connection.execute(f'DELETE FROM check_run_events WHERE run_id IN ({marks})', run_ids)
+                connection.execute(f'DELETE FROM check_runs WHERE id IN ({marks})', run_ids)
+        except sqlite3.Error as db_error:
+            if deadline is not None and _is_sqlite_retryable_contention(db_error):
+                return False
+            raise
+
+    while True:
+        batch_busy_ms = _batch_busy_ms()
+        if batch_busy_ms is None:
+            return False
+        try:
+            with _check_db(db_path, busy_timeout_ms=batch_busy_ms) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                tick_ids = [
+                    row['id']
+                    for row in connection.execute(
+                        '''SELECT id FROM check_ticks
+                           WHERE started_at < ?
+                             AND id != ?
+                             AND NOT EXISTS (SELECT 1 FROM check_runs WHERE check_runs.tick_id = check_ticks.id)
+                           ORDER BY id LIMIT ?''',
+                        (cutoff_iso, current_tick_id, batch_size),
+                    )
+                ]
+                if not tick_ids:
+                    break
+                marks = ','.join('?' * len(tick_ids))
+                connection.execute(f'DELETE FROM check_ticks WHERE id IN ({marks})', tick_ids)
+        except sqlite3.Error as db_error:
+            if deadline is not None and _is_sqlite_retryable_contention(db_error):
+                return False
+            raise
     return True
 
 
@@ -2990,6 +3045,7 @@ def run_check_tick(
         kill_grace = CHECK_KILL_GRACE_SEC
 
     mono_start = mono_fn()
+    tick_deadline = mono_start + tick_budget
     env_now = _parse_check_now_env() if now_fn is None else None
     if now_fn is not None:
         tick_started_ts = float(now_fn())
@@ -3051,13 +3107,21 @@ def run_check_tick(
         except CheckConfigError as error:
             # config_error: (5)〜(8) を飛ばし、(9) は必ず実行
             finished_iso = now_iso_fn()
-            with _check_db(db_path) as connection:
-                connection.execute('BEGIN IMMEDIATE')
-                unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
-                connection.execute(
-                    "UPDATE check_ticks SET finished_at=?, status='config_error', wake_failed=?, unnotified_tasks=?, checks_deferred=NULL WHERE id=?",
-                    (finished_iso, len(all_failed), unnotified, tick_id),
-                )
+            config_finalize_busy_ms = min(
+                CHECK_COMMIT_BUSY_TIMEOUT_MS,
+                max(0, int((tick_deadline - mono_fn()) * 1000)),
+            )
+            unnotified = None
+            try:
+                with _check_db(db_path, busy_timeout_ms=config_finalize_busy_ms) as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
+                    connection.execute(
+                        "UPDATE check_ticks SET finished_at=?, status='config_error', wake_failed=?, unnotified_tasks=?, checks_deferred=NULL WHERE id=?",
+                        (finished_iso, len(all_failed), unnotified, tick_id),
+                    )
+            except sqlite3.Error as db_error:
+                print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
             print(f'error: check tick config_error: {error}', file=sys.stderr)
             if all_failed or any_wake_truncated:
                 print(
@@ -3075,7 +3139,6 @@ def run_check_tick(
 
         # (6) due な check の実行
         due_checks = select_due_checks(db_path, checks_cfg, tick_started_ts)
-        tick_deadline = mono_start + tick_budget
         effective_reserve = (
             min(CHECK_FINALIZE_RESERVE_SEC, max(0.0, float(tick_budget) * 0.1))
             if finalize_reserve is None
@@ -3141,6 +3204,7 @@ def run_check_tick(
                     skip_task_ids=start_failed,
                     pass_budget=end_wake_budget, item_timeout=wake_item_timeout,
                     deliver_fn=deliver_fn,
+                    stop_on_db_contention=True,
                 )
                 all_failed |= end_failed
                 any_wake_truncated = any_wake_truncated or end_truncated
@@ -3154,17 +3218,27 @@ def run_check_tick(
                     deadline=end_work_deadline, mono_fn=mono_fn,
                 )
 
-        # (9) check_ticks を最終 status に UPDATE
+        # (9) check_ticks を最終 status に UPDATE (DB 待ちも公称 tick_deadline 内に制限)
         finished_iso = now_iso_fn()
-        with _check_db(db_path) as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
-            connection.execute(
-                'UPDATE check_ticks SET finished_at=?, status=?, wake_failed=?, unnotified_tasks=?, checks_deferred=? WHERE id=?',
-                (finished_iso, tick_status, len(all_failed), unnotified, checks_deferred, tick_id),
-            )
+        finalize_rem = tick_deadline - mono_fn()
+        finalize_busy_ms = min(CHECK_COMMIT_BUSY_TIMEOUT_MS, max(0, int(finalize_rem * 1000)))
+        unnotified = None
+        finalize_error = None
+        try:
+            with _check_db(db_path, busy_timeout_ms=finalize_busy_ms) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
+                connection.execute(
+                    'UPDATE check_ticks SET finished_at=?, status=?, wake_failed=?, unnotified_tasks=?, checks_deferred=? WHERE id=?',
+                    (finished_iso, tick_status, len(all_failed), unnotified, checks_deferred, tick_id),
+                )
+        except sqlite3.Error as db_error:
+            print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
+            tick_status = 'failed'
+            tick_exit_code = 1
+            finalize_error = str(db_error)
 
-        if end_wake_skipped_by_budget and unnotified > 0:
+        if end_wake_skipped_by_budget and (unnotified is None or unnotified > 0):
             any_wake_truncated = True
 
         if all_failed or any_wake_truncated:
@@ -3173,11 +3247,14 @@ def run_check_tick(
                 file=sys.stderr,
             )
 
-        return {
+        result_body = {
             'tick_id': tick_id, 'status': tick_status, 'started_at': tick_started_iso,
             'finished_at': finished_iso, 'wake_failed': len(all_failed),
             'unnotified_tasks': unnotified, 'checks_deferred': checks_deferred,
-        }, tick_exit_code
+        }
+        if finalize_error is not None:
+            result_body['error'] = finalize_error
+        return result_body, tick_exit_code
     finally:
         with suppress(OSError):
             os.close(lock_fd)
