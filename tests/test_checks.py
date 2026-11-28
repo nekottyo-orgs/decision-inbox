@@ -710,15 +710,20 @@ sys.exit(2)
         before_c1 = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual((before_c1['last_outcome'], before_c1['fault_count']), ('failed_exit', 1))
 
-        # tick_budget = 0.8s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し exec_deadline で aborted。
-        # commit_reserve (0.25s) 内で aborted run を保存し、c2 は未着手で checks_deferred=1、status='aborted' になる。
-        # setup (git / SQLite) の所要時間に依存しないよう、最初の check 起動時から経過時間を計る
+        # tick_budget=4.5s, finalize_reserve=0.2s, commit_reserve=0.5s, kill_grace=0.2s
+        # -> end_work_deadline=4.3s, commit_start_deadline=3.8s, cleanup_reserve=1.7s
+        #    (kill_grace 0.2s + CHECK_KILL_WAIT_SEC 1.0s + CHECK_DRAIN_JOIN_SEC 0.5s),
+        #    exec_deadline=2.1s (< c1.timeout=10s)。
+        # 先頭 c1 は免除で着手し exec_deadline で aborted。孤児 reap が遅く cleanup が最大所要になっても
+        # commit_start_deadline (3.8s) までに終わり、commit_reserve (0.5s) 内で aborted run を保存し、
+        # c2 は未着手で checks_deferred=1、status='aborted' になる。
+        # setup (git / SQLite) の所要時間に依存しないよう、最初の check 起動時に exec_deadline 0.3s 手前から時計を進める
         real_origin = [None]
 
         def mono_fn():
             if real_origin[0] is None:
                 return 0.0
-            return time.monotonic() - real_origin[0]
+            return 1.8 + (time.monotonic() - real_origin[0])
 
         def start_clock_on_first_check(*args, **kwargs):
             if real_origin[0] is None:
@@ -732,8 +737,9 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=lambda: 1700001000.0,
                 mono_fn=mono_fn,
-                tick_budget=0.8,
-                commit_reserve=0.25,
+                tick_budget=4.5,
+                finalize_reserve=0.2,
+                commit_reserve=0.5,
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
@@ -800,17 +806,19 @@ sys.exit(2)
                 'scripts/slow.sh': '#!/bin/sh\nsleep 5\n',
             },
         )
-        # c1_fast 完了後に c2_guard_skip が着手前ガードで見送り (+1)、
-        # c3_aborted はガード通過後に残り時間が縮んで exec_deadline で aborted になり、
-        # commit_reserve 内で ('c3_aborted', 'aborted') を保存して tick は status='aborted' になる。
+        # tick_budget=4.5s, finalize_reserve=0.2s, commit_reserve=0.5s, kill_grace=0.1s
+        # -> end_work_deadline=4.3s, commit_start_deadline=3.8s, cleanup_reserve=1.6s, exec_deadline=2.2s。
+        # c1_fast (timeout=1) 完了後に c2_guard_skip (timeout=50) が着手前ガードで見送り (+1)、
+        # c3_aborted (timeout=1) はガード通過後に残り時間が縮んで exec_deadline (2.2s) で aborted になり、
+        # cleanup_reserve (1.6s) と commit_reserve (0.5s) 内で ('c3_aborted', 'aborted') を保存して tick は status='aborted' になる。
         # 残りの c4_unstarted / c5_unstarted (+2) と合算されて checks_deferred == 3 になること
-        # setup 時間で c1_fast / c3_aborted の前提が崩れないよう、c3_aborted 着手時から時計を進める
+        # setup 時間で c1_fast / c3_aborted の前提が崩れないよう、c3_aborted 着手時に exec_deadline 0.3s 手前から時計を進める
         c3_real_origin = [None]
 
         def mono_fn():
             if c3_real_origin[0] is None:
                 return 0.0
-            return 1.4 + (time.monotonic() - c3_real_origin[0])
+            return 1.9 + (time.monotonic() - c3_real_origin[0])
 
         def wrapped_run_check(chk, *args, **kwargs):
             if chk['name'] == 'c3_aborted':
@@ -822,7 +830,9 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=lambda: 1700000000.0,
                 mono_fn=mono_fn,
-                tick_budget=2.0,
+                tick_budget=4.5,
+                finalize_reserve=0.2,
+                commit_reserve=0.5,
                 kill_grace=0.1,
                 deliver_fn=lambda c, t: True,
             )
@@ -1696,7 +1706,8 @@ sys.exit(2)
             time.sleep(0.02)
         self.assertFalse(_pid_alive(helper_pid))
 
-        # (b) exec_deadline が支配的 -> commit_reserve 内で aborted として記録され、
+        # (b) exec_deadline が支配的 -> cleanup (kill_grace + kill_wait + drain = 1.7s) を
+        # commit_start_deadline (3.8s) 内に収めた上で commit_reserve (0.5s) 内で aborted として記録され、
         # tick は status='aborted' になり checks 状態は進めない
         helper_pid_file.unlink()
         self.commit_config(
@@ -1707,7 +1718,7 @@ sys.exit(2)
         def mono_fn():
             if real_origin[0] is None:
                 return 0.0
-            return time.monotonic() - real_origin[0]
+            return 1.6 + (time.monotonic() - real_origin[0])
 
         def start_on_check(*args, **kwargs):
             if real_origin[0] is None:
@@ -1719,8 +1730,9 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=lambda: 1700000200.0,
                 mono_fn=mono_fn,
-                tick_budget=0.8,
-                commit_reserve=0.25,
+                tick_budget=4.5,
+                finalize_reserve=0.2,
+                commit_reserve=0.5,
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
@@ -3139,20 +3151,23 @@ sys.exit(2)
                 ),
             },
         )
-        # tick_budget=20.0, finalize_reserve=2.0 -> end_work_deadline=1018.0
-        # commit_reserve=2.0 -> exec_deadline=1016.0
-        # c1 完了後に clock=1012.0 とすると:
-        #   tick_deadline まで 8s (>= 5s), end_work_deadline まで 6s (>= 5s),
-        #   しかし exec_deadline まで 4s (< c2_border.timeout=5s) -> c2_border は見送り!
-        #   c3_light (timeout=3s <= 4s) は着手し、timeout ギリギリ (3s 消費して 1015.0) で完了しても
-        #   end_work_deadline (1018.0) まで 3s 残るため保存に成功する!
+        # tick_budget=100.0, finalize_reserve=2.0 -> end_work_deadline=1098.0
+        # commit_reserve=2.0 -> commit_start_deadline=1096.0
+        # default kill_grace=5.0 + CHECK_KILL_WAIT_SEC=1.0 + CHECK_DRAIN_JOIN_SEC=0.5 -> cleanup_reserve=6.5
+        # exec_deadline=1089.5
+        # c1 完了後に clock=1085.5 とすると:
+        #   tick_deadline まで 14.5s (>= 5s), end_work_deadline まで 12.5s (>= 5s),
+        #   commit_start_deadline まで 10.5s (>= 5s),
+        #   しかし exec_deadline まで 4.0s (< c2_border.timeout=5s) -> c2_border は見送り!
+        #   c3_light (timeout=3s <= 4.0s) は着手し、timeout ギリギリ (3s 消費して 1088.5) で完了しても
+        #   end_work_deadline (1098.0) まで 9.5s 残るため保存に成功する!
         clock1 = FakeClock(wall=1700000000.0, mono=1000.0)
         orig_run = run_check_command
 
         def advance_after_checks(chk, *args, **kwargs):
             res = orig_run(chk, *args, **kwargs)
             if chk['name'] == 'c1':
-                clock1.advance(12.0)
+                clock1.advance(85.5)
             elif chk['name'] == 'c3_light':
                 clock1.advance(3.0)
             return res
@@ -3162,7 +3177,7 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=clock1.now,
                 mono_fn=clock1.monotonic,
-                tick_budget=20.0,
+                tick_budget=100.0,
                 finalize_reserve=2.0,
                 commit_reserve=2.0,
                 deliver_fn=lambda c, t: True,
@@ -3175,10 +3190,11 @@ sys.exit(2)
         self.assertEqual(len(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='k_c3'")), 1)
 
         # 2. 先頭免除 (idx == 0) も exec_deadline 内でのみ許可され、
-        #    end_work_deadline 超過後 (finalize_reserve 内) や commit_reserve 内では起動しないこと
+        #    cleanup_reserve / commit_reserve / finalize_reserve 内では起動しないこと
         for case_label, advance_sec, tick_wall in (
-            ('inside_commit_reserve', 16.5, 1700000200.0),
-            ('inside_finalize_reserve', 18.5, 1700000400.0),
+            ('inside_cleanup_reserve', 90.0, 1700000100.0),
+            ('inside_commit_reserve', 96.5, 1700000200.0),
+            ('inside_finalize_reserve', 98.5, 1700000400.0),
         ):
             with self.subTest(case=case_label):
                 with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
@@ -3205,7 +3221,7 @@ sys.exit(2)
                         self.db, self.config,
                         now_fn=clock2.now,
                         mono_fn=clock2.monotonic,
-                        tick_budget=20.0,
+                        tick_budget=100.0,
                         finalize_reserve=2.0,
                         commit_reserve=2.0,
                         deliver_fn=lambda c, t: True,
@@ -3215,6 +3231,99 @@ sys.exit(2)
                 self.assertEqual(spawned, [], 'first-check exemption must not run after exec_deadline')
                 self.assertEqual(self.query_all('SELECT * FROM check_runs'), [])
                 self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (body2['tick_id'],))['status'], 'aborted')
+
+    def test_sigterm_ignoring_first_check_at_default_reserves_still_commits_aborted_run(self):
+        # 既定の tick_budget (240s) / kill_grace (5s) / commit_reserve (2s) / finalize_reserve (2s) で、
+        # SIGTERM を無視する先頭 check が exec_deadline (229.5s) に到達しても、
+        # cleanup が commit_start_deadline (236s) 内に収まり、aborted run と出力抜粋が
+        # end_work_deadline (238s) 前に commit され status='aborted' (exit 0) で完了すること。
+        ready_flag = self.root / 'ignore_sigterm.ready'
+        pid_file = self.root / 'ignore_sigterm.pid'
+        self.addCleanup(_cleanup_pid_file, pid_file)
+        script = (
+            '#!/usr/bin/env python3\n'
+            'import os, pathlib, signal, sys, time\n'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+            f'pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")\n'
+            'print("partial stdout before abort", flush=True)\n'
+            'print("partial stderr before abort", file=sys.stderr, flush=True)\n'
+            f'pathlib.Path({str(ready_flag)!r}).write_text("ready", encoding="utf-8")\n'
+            'time.sleep(60)\n'
+        )
+        self.commit_config(
+            '[[checks]]\nname = "c1_ign"\ninterval = 60\ncommand = "scripts/ign.py"\ntimeout = 60\nskill = "s1"\n'
+            '[[checks]]\nname = "c2_after"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {
+                'scripts/ign.py': script,
+                'scripts/ok.sh': '#!/bin/sh\nexit 0\n',
+            },
+        )
+
+        # setup 中は mono=0.0、c1_ign 起動直前は 229.0 (exec_deadline=229.5 の 0.5s 手前)。
+        # プロセスが SIG_IGN 設定と出力 flush を完了した時点で exec_deadline 0.1s 手前 (229.4) に合わせ、
+        # 以降は実時間の経過をそのまま mono_fn に反映する。
+        phase = ['setup']
+        real_origin = [None]
+        orig_run = run_check_command
+        orig_popen = subprocess.Popen
+        orig_commit = commit_check_run
+        commit_mono_at = []
+
+        def mono_fn():
+            if phase[0] == 'setup':
+                return 0.0
+            if real_origin[0] is None:
+                return 229.0
+            return 229.4 + (time.monotonic() - real_origin[0])
+
+        def start_check_phase(chk, *args, **kwargs):
+            if chk['name'] == 'c1_ign':
+                phase[0] = 'check'
+            return orig_run(chk, *args, **kwargs)
+
+        def popen_wait_ready(argv, *args, **kwargs):
+            proc = orig_popen(argv, *args, **kwargs)
+            if any('ign.py' in str(part) for part in argv):
+                dl = time.monotonic() + 5.0
+                while not ready_flag.exists() and time.monotonic() < dl:
+                    time.sleep(0.01)
+                self.assertTrue(ready_flag.exists(), 'c1_ign did not become ready in time')
+                real_origin[0] = time.monotonic()
+            return proc
+
+        def spy_commit(*args, **kwargs):
+            commit_mono_at.append(mono_fn())
+            return orig_commit(*args, **kwargs)
+
+        with mock.patch('app.run_check_command', side_effect=start_check_phase), \
+                mock.patch('app.subprocess.Popen', side_effect=popen_wait_ready), \
+                mock.patch('app.commit_check_run', side_effect=spy_commit):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000000.0,
+                mono_fn=mono_fn,
+                deliver_fn=lambda c, t: True,
+            )
+
+        elapsed_real = time.monotonic() - real_origin[0]
+        self.assertGreaterEqual(elapsed_real, 4.5, 'default 5s kill_grace must actually run against SIGTERM-ignoring check')
+        self.assertEqual((rc, body['status']), (0, 'aborted'))
+        self.assertEqual(body['checks_deferred'], 1)
+        self.assertEqual(len(commit_mono_at), 1)
+        self.assertLess(commit_mono_at[0], 238.0, 'aborted run commit must start before end_work_deadline')
+        self.assertLess(mono_fn(), 240.0, 'tick must finish within nominal tick_deadline')
+
+        run_row = self.query_one("SELECT outcome, exit_code, stdout_excerpt, stderr_excerpt FROM check_runs WHERE check_name='c1_ign'")
+        self.assertIsNotNone(run_row)
+        self.assertEqual((run_row['outcome'], run_row['exit_code']), ('aborted', None))
+        self.assertIn('partial stdout before abort', run_row['stdout_excerpt'])
+        self.assertIn('partial stderr before abort', run_row['stderr_excerpt'])
+        chk_row = self.query_one("SELECT last_started, last_outcome, fault_count FROM checks WHERE name='c1_ign'")
+        self.assertEqual((chk_row['last_started'], chk_row['last_outcome'], chk_row['fault_count']), (None, None, 0))
+        tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks WHERE id=?', (body['tick_id'],))
+        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 1))
+        ign_pid = int(pid_file.read_text(encoding='utf-8').strip())
+        self.assertFalse(_pid_alive(ign_pid))
 
 
 if __name__ == '__main__':

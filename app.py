@@ -1874,6 +1874,7 @@ CHECK_MAX_FAULT_THRESHOLD = (1 << 63) - 1
 CHECK_KILL_GRACE_SEC = 5.0
 CHECK_INTERRUPT_KILL_GRACE_SEC = 0.5
 CHECK_KILL_WAIT_SEC = 1.0
+CHECK_DRAIN_JOIN_SEC = 0.5
 CHECK_STDOUT_LIMIT = 65536
 CHECK_STDERR_LIMIT = 65536
 CHECK_EXCERPT_LIMIT = 4096
@@ -2086,13 +2087,20 @@ def _pgid_alive(pgid):
         return False
 
 
-def _terminate_process_group(process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC):
-    """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。"""
+def _terminate_process_group(
+    process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC, max_total_sec=None,
+):
+    """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。
+    max_total_sec が指定されている場合、SIGTERM 猶予と SIGKILL 後の回収待ちの合計をその範囲内に抑える。"""
     pgid = process.pid
+    total_deadline = None if max_total_sec is None else (time.monotonic() + max(0.0, max_total_sec))
     with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(pgid, signal.SIGTERM)
 
-    deadline = time.monotonic() + max(0.0, grace_sec)
+    grace_budget = max(0.0, grace_sec)
+    if total_deadline is not None:
+        grace_budget = min(grace_budget, max(0.0, total_deadline - time.monotonic()))
+    deadline = time.monotonic() + grace_budget
     while True:
         remaining = deadline - time.monotonic()
         if process.returncode is None:
@@ -2116,8 +2124,12 @@ def _terminate_process_group(process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAI
     if process.returncode is None or _pgid_alive(pgid):
         with suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signal.SIGKILL)
+    kill_wait_start = time.monotonic()
     kill_wait_budget = max(0.0, kill_wait_sec)
-    kill_wait_deadline = time.monotonic() + kill_wait_budget
+    kill_wait_deadline = kill_wait_start + kill_wait_budget
+    if total_deadline is not None:
+        kill_wait_deadline = min(kill_wait_deadline, total_deadline)
+        kill_wait_budget = max(0.0, kill_wait_deadline - kill_wait_start)
     leader_wait_timed_out = False
     if process.returncode is None:
         wait_remaining = max(0.0, kill_wait_deadline - time.monotonic())
@@ -2499,7 +2511,8 @@ def _drain_pipe(stream, limit, state):
 
 def run_check_command(
     chk, config_dir, tick_deadline, *,
-    mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC, launch_state=None,
+    mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC,
+    cleanup_deadline=None, launch_state=None,
 ):
     """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。
 
@@ -2510,6 +2523,8 @@ def run_check_command(
       exit code を捨てる。
     - helper が stdout/stderr を開いたまま等で EOF 回収が wait_until 内に完了しない場合も、不完全な出力を parse せず
       プロセスグループを終了させ deadline miss (または失敗) として記録する。
+    - cleanup_deadline が指定されている場合、SIGTERM 猶予・SIGKILL 後の回収待ち・drain thread join の合計を
+      cleanup_deadline 内に収め、後続の commit 予約予算を圧迫しない。
     - KeyboardInterrupt 等の割り込み時は、tick lock 解放前にプロセスグループを上限付きで終了・回収してから再送出する。
     """
     cmd_env = {**os.environ, **chk['env']}
@@ -2548,6 +2563,32 @@ def run_check_command(
     except (OSError, ValueError) as error:
         return None, b'', str(error).encode('utf-8', errors='replace'), False, False
 
+    def _cleanup_group():
+        if cleanup_deadline is None:
+            _terminate_process_group(process, kill_grace, kill_wait_sec=CHECK_KILL_WAIT_SEC)
+            return
+        cleanup_rem = max(0.0, cleanup_deadline - mono_fn())
+        grace_cap = max(0.0, float(kill_grace))
+        kill_wait_cap = CHECK_KILL_WAIT_SEC
+        drain_cap = CHECK_DRAIN_JOIN_SEC
+        total_cap = grace_cap + kill_wait_cap + drain_cap
+        if total_cap <= 0 or cleanup_rem <= 0:
+            grace_budget = 0.0
+            kill_wait_budget = 0.0
+        elif cleanup_rem >= total_cap:
+            grace_budget = grace_cap
+            kill_wait_budget = kill_wait_cap
+        else:
+            scale = cleanup_rem / total_cap
+            grace_budget = grace_cap * scale
+            kill_wait_budget = kill_wait_cap * scale
+        _terminate_process_group(
+            process,
+            grace_budget,
+            kill_wait_sec=kill_wait_budget,
+            max_total_sec=grace_budget + kill_wait_budget,
+        )
+
     try:
         out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_state), daemon=True)
         err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_state), daemon=True)
@@ -2559,13 +2600,13 @@ def run_check_command(
             process.wait(timeout=wait_budget)
         except subprocess.TimeoutExpired:
             timed_out, aborted = _classify_deadline_miss()
-            _terminate_process_group(process, kill_grace)
+            _cleanup_group()
         else:
             now_m = mono_fn()
             if now_m >= wait_until:
                 # wait_until 以降に観測された完了は TimeoutExpired と同じく deadline miss とし exit code を捨てる
                 timed_out, aborted = _classify_deadline_miss()
-                _terminate_process_group(process, kill_grace)
+                _cleanup_group()
             else:
                 # stdout / stderr の EOF 回収にも同じ wait_until を適用する
                 for thread in (out_thread, err_thread):
@@ -2577,24 +2618,38 @@ def run_check_command(
                 if out_thread.is_alive() or err_thread.is_alive():
                     # pipe が deadline までに EOF へ到達しなかった: グループを停止し不完全出力を parse させない
                     timed_out, aborted = _classify_deadline_miss()
-                    _terminate_process_group(process, kill_grace)
+                    _cleanup_group()
                 elif not out_state['eof'] or not err_state['eof']:
                     # EOF に到達しない読み取り異常: 空出力を ok_silent と誤認させない
                     capture_incomplete = True
-                    _terminate_process_group(process, kill_grace)
+                    _cleanup_group()
                 elif now_m >= wait_until:
                     timed_out, aborted = _classify_deadline_miss()
-                    _terminate_process_group(process, kill_grace)
+                    _cleanup_group()
 
-        # グループ停止後の drain thread 終了を短く上限付きで待ち、抜粋を可能な限り回収する
-        for thread in (out_thread, err_thread):
-            if thread.is_alive():
-                thread.join(timeout=0.5)
+        # グループ停止後の drain thread 終了を上限付きで待ち、抜粋を可能な限り回収する
+        if cleanup_deadline is None:
+            drain_real_deadline = time.monotonic() + CHECK_DRAIN_JOIN_SEC
+            for thread in (out_thread, err_thread):
+                if thread.is_alive():
+                    thread.join(timeout=max(0.0, drain_real_deadline - time.monotonic()))
+        else:
+            drain_rem = min(CHECK_DRAIN_JOIN_SEC, max(0.0, cleanup_deadline - mono_fn()))
+            drain_real_deadline = time.monotonic() + drain_rem
+            for thread in (out_thread, err_thread):
+                if thread.is_alive():
+                    rem_t = min(
+                        max(0.0, cleanup_deadline - mono_fn()),
+                        max(0.0, drain_real_deadline - time.monotonic()),
+                    )
+                    if rem_t <= 0:
+                        break
+                    thread.join(timeout=rem_t)
     except BaseException:
         _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
         for thread, stream in ((out_thread, process.stdout), (err_thread, process.stderr)):
             if thread is not None and thread.is_alive():
-                thread.join(timeout=0.5)
+                thread.join(timeout=CHECK_DRAIN_JOIN_SEC)
             if (thread is None or thread.ident is None) and stream is not None:
                 with suppress(OSError, ValueError):
                     stream.close()
@@ -3193,13 +3248,17 @@ def run_check_tick(
             if commit_reserve is None
             else max(0.0, float(commit_reserve))
         )
-        exec_deadline = end_work_deadline - effective_commit_reserve
+        commit_start_deadline = end_work_deadline - effective_commit_reserve
+        pre_commit_budget = max(0.0, commit_start_deadline - mono_start)
+        max_cleanup_sec = max(0.0, float(kill_grace)) + CHECK_KILL_WAIT_SEC + CHECK_DRAIN_JOIN_SEC
+        effective_cleanup_reserve = min(max_cleanup_sec, pre_commit_budget * 0.5)
+        exec_deadline = commit_start_deadline - effective_cleanup_reserve
         checks_deferred = 0
         tick_status = 'ok'
         tick_exit_code = 0
 
         if (exec_deadline - mono_fn()) <= 0:
-            # step (6) 開始時点で実行・保存予算の残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
+            # step (6) 開始時点で実行・cleanup・保存予算の残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
             checks_deferred = len(due_checks)
             tick_status = 'aborted'
         else:
@@ -3219,7 +3278,8 @@ def run_check_tick(
                 launch_state = {'refused': False}
                 exit_code, raw_stdout, raw_stderr, timed_out, aborted = run_check_command(
                     chk, config_dir, exec_deadline,
-                    mono_fn=mono_fn, kill_grace=kill_grace, launch_state=launch_state,
+                    mono_fn=mono_fn, kill_grace=kill_grace,
+                    cleanup_deadline=commit_start_deadline, launch_state=launch_state,
                 )
                 if aborted and launch_state['refused']:
                     # 起動直前ガードで未着手となった due check は step (6) 開始時・ループ前ガードと

@@ -92,4 +92,4 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 | `applyOutcome` | `commit_check_run` が 1 つの `BEGIN IMMEDIATE` 内で `check_runs` / `check_run_events` / `tasks` / `check_tasks` / `checks` を更新 (`aborted` は `check_runs` のみ) |
 | `syncFaultCount` | `sync_checks_mirror` が `command` 変更または無効化時に `fault_count = 0` へリセット |
 
-前提は、flock により tick が直列化されること、SQLite の `BEGIN IMMEDIATE` が 1 check 実行の確定を原子的に直列化すること。flock の競合・skip 記録、git checkout 検査、TOML 検証、JSONL 64KiB/スキーマ検証、プロセスグループ SIGTERM/SIGKILL・割り込み時 cleanup、run-inbox への wake (20 秒上限・CB・回収)、check の着手・実行・commit リトライ予算の統一 (保存猶予・終了処理予約を含む)・終了処理 (end wake / prune / 最終 status 更新) の DB busy timeout 上限、30 日 prune、`PRAGMA user_version = 2` 互換は `tests/test_checks.py` で検査する。
+前提は、flock により tick が直列化されること、SQLite の `BEGIN IMMEDIATE` が 1 check 実行の確定を原子的に直列化すること。flock の競合・skip 記録、git checkout 検査、TOML 検証、JSONL 64KiB/スキーマ検証、プロセスグループ SIGTERM/SIGKILL・割り込み時 cleanup、run-inbox への wake (20 秒上限・CB・回収)、check の着手・実行・deadline 超過時のグループ停止/pipe 回収・commit リトライ予算の統一 (cleanup 予約・保存猶予・終了処理予約を含む)・終了処理 (end wake / prune / 最終 status 更新) の DB busy timeout 上限、30 日 prune、`PRAGMA user_version = 2` 互換は `tests/test_checks.py` で検査する。
