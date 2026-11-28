@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.0.4](https://github.com/nekottyo-orgs/decision-inbox/compare/v0.0.3...v0.0.4) - 2026-11-28
+
+- chore: Dependabot cooldown 7d と workflow lockfile への統一 by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/63
+
 ## [v0.0.3](https://github.com/nekottyo-orgs/decision-inbox/compare/v0.0.2...v0.0.3) - 2026-11-28
 
 - feat: Board の依頼 thread に task の中身と msg の tag を出す by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/56
