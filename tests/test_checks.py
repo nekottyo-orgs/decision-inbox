@@ -3128,6 +3128,142 @@ sys.exit(2)
         self.assertIn('error', body_c)
         self.assertIn('failed to finalize check tick', err_c.getvalue())
 
+    def test_mirror_sync_db_contention_finalizes_failed_tick_without_running_checks(self):
+        import threading
+
+        ran_marker = self.root / 'mirror_fail_should_not_run.marker'
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/mark.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/mark.sh': f'#!/bin/sh\necho ran > {str(ran_marker)!r}\nexit 0\n'},
+        )
+        # DB を初期化しておく
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+        if ran_marker.exists():
+            ran_marker.unlink()
+
+        def start_writer_lock():
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def _worker():
+                conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    acquired.set()
+                    release.wait(timeout=5.0)
+                finally:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.execute('ROLLBACK')
+                    conn.close()
+
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+            self.assertTrue(acquired.wait(timeout=3.0))
+            return thread, release
+
+        orig_sync = sys.modules['app'].sync_checks_mirror
+
+        # (a) mirror 同期が DB 競合で失敗した後、finalization 前に writer が解放される場合:
+        #     例外送出せず status='failed' (exit 1, checks_deferred=None) へ最終更新し、
+        #     running 行を残さず、check の選択・起動を行わないこと
+        holder_a = []
+
+        def cleanup_a():
+            for t, rel in holder_a:
+                rel.set()
+                t.join(timeout=3.0)
+
+        self.addCleanup(cleanup_a)
+
+        def locked_sync(*args, **kwargs):
+            t, rel = start_writer_lock()
+            holder_a.append((t, rel))
+            try:
+                return orig_sync(*args, **kwargs)
+            finally:
+                rel.set()
+                t.join(timeout=3.0)
+
+        select_called_a = []
+        run_called_a = []
+        err_a = io.StringIO()
+        with mock.patch('app.sync_checks_mirror', side_effect=locked_sync), \
+                mock.patch('app.select_due_checks', side_effect=lambda *a, **kw: select_called_a.append(True)), \
+                mock.patch('app.run_check_command', side_effect=lambda *a, **kw: run_called_a.append(True)), \
+                contextlib.redirect_stderr(err_a):
+            body_a, rc_a = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000100.0,
+                tick_budget=10.0,
+                commit_busy_timeout_ms=80,
+                deliver_fn=lambda c, t: True,
+            )
+
+        self.assertEqual((rc_a, body_a['status']), (1, 'failed'))
+        self.assertIsNone(body_a['checks_deferred'])
+        self.assertIn('error', body_a)
+        self.assertEqual(select_called_a, [], 'select_due_checks must not run after mirror sync failure')
+        self.assertEqual(run_called_a, [], 'run_check_command must not run after mirror sync failure')
+        self.assertFalse(ran_marker.exists())
+        self.assertIn('failed to sync checks mirror', err_a.getvalue())
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        tick_a = self.query_one('SELECT status, finished_at, checks_deferred FROM check_ticks WHERE id=?', (body_a['tick_id'],))
+        self.assertEqual(tick_a['status'], 'failed')
+        self.assertIsNotNone(tick_a['finished_at'])
+        self.assertIsNone(tick_a['checks_deferred'])
+
+        # (b) mirror 同期から finalization まで一貫してロックされ続ける場合も
+        #     例外送出せず failed (exit 1) を返し、check を起動しないこと
+        holder_b = []
+
+        def cleanup_b():
+            for t, rel in holder_b:
+                rel.set()
+                t.join(timeout=3.0)
+
+        self.addCleanup(cleanup_b)
+        anchor_b = [None]
+
+        def mono_b():
+            if anchor_b[0] is None:
+                return 0.0
+            return time.monotonic() - anchor_b[0]
+
+        def locked_sync_through_finalize(*args, **kwargs):
+            t, rel = start_writer_lock()
+            holder_b.append((t, rel))
+            anchor_b[0] = time.monotonic()
+            return orig_sync(*args, **kwargs)
+
+        select_called_b = []
+        run_called_b = []
+        err_b = io.StringIO()
+        try:
+            with mock.patch('app.sync_checks_mirror', side_effect=locked_sync_through_finalize), \
+                    mock.patch('app.select_due_checks', side_effect=lambda *a, **kw: select_called_b.append(True)), \
+                    mock.patch('app.run_check_command', side_effect=lambda *a, **kw: run_called_b.append(True)), \
+                    contextlib.redirect_stderr(err_b):
+                body_b, rc_b = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000200.0,
+                    mono_fn=mono_b,
+                    tick_budget=0.25,
+                    commit_busy_timeout_ms=60,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            cleanup_b()
+
+        self.assertEqual((rc_b, body_b['status']), (1, 'failed'))
+        self.assertIsNone(body_b['checks_deferred'])
+        self.assertIsNone(body_b['unnotified_tasks'])
+        self.assertIn('error', body_b)
+        self.assertEqual(select_called_b, [])
+        self.assertEqual(run_called_b, [])
+        self.assertFalse(ran_marker.exists())
+        self.assertIn('failed to sync checks mirror', err_b.getvalue())
+        self.assertIn('failed to finalize check tick', err_b.getvalue())
+
     def test_unified_budget_defers_unpersistable_checks_and_bounds_first_check_exemption(self):
         # 1. 2 件目以降: timeout が tick_deadline / end_work_deadline に収まっても
         #    commit_reserve を残せない check は着手せず deferred とし、ワンタイムイベントを失わないこと。

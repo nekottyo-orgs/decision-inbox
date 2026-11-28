@@ -2339,10 +2339,10 @@ def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_
     return checkout_root, config_dir, validated
 
 
-def sync_checks_mirror(db_path, checks_cfg, now_iso):
+def sync_checks_mirror(db_path, checks_cfg, now_iso, *, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS):
     """TOML 定義を checks テーブルへ鏡同期する。TOML に無い定義は無効化し履歴を残す。
     command 変更または無効化時のみ fault_count を 0 に戻す (env / timeout のみの変更では戻さない)。"""
-    with _check_db(db_path) as connection:
+    with _check_db(db_path, busy_timeout_ms=busy_timeout_ms) as connection:
         connection.execute('BEGIN IMMEDIATE')
         existing = {row['name']: dict(row) for row in connection.execute('SELECT * FROM checks')}
         seen = set()
@@ -3232,7 +3232,14 @@ def run_check_tick(
             return _finalize_tick('config_error', 1, None, error_msg=str(error))
 
         # (5) checks テーブルの鏡同期
-        sync_checks_mirror(db_path, checks_cfg, now_iso_fn())
+        try:
+            sync_checks_mirror(
+                db_path, checks_cfg, now_iso_fn(),
+                busy_timeout_ms=commit_busy_timeout_ms,
+            )
+        except sqlite3.Error as db_error:
+            print(f'error: failed to sync checks mirror for check tick {tick_id}: {db_error}', file=sys.stderr)
+            return _finalize_tick('failed', 1, None, error_msg=str(db_error))
 
         # (6) due な check の実行
         due_checks = select_due_checks(db_path, checks_cfg, tick_started_ts)
