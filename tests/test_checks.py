@@ -687,7 +687,7 @@ sys.exit(2)
 
     # --- 6. tick 上限・先頭免除・2 件目以降ガード・aborted / failed_timeout・プロセスグループ終了 ---
 
-    def test_first_check_exemption_deadline_miss_fails_tick_without_mutating_check_state(self):
+    def test_first_check_exemption_aborted_does_not_mutate_check_state(self):
         self.commit_config(
             '[[checks]]\nname = "c1"\ninterval = 300\ncommand = "scripts/sleep.sh"\ntimeout = 10\nskill = "s1"\n'
             '[[checks]]\nname = "c2"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
@@ -710,8 +710,8 @@ sys.exit(2)
         before_c1 = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual((before_c1['last_outcome'], before_c1['fault_count']), ('failed_exit', 1))
 
-        # tick_budget = 0.6s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し tick 上限で aborted。
-        # ただし commit 時点では retry deadline (end_work_deadline) を過ぎているため保存されず tick は failed になる。
+        # tick_budget = 0.8s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し exec_deadline で aborted。
+        # commit_reserve (0.25s) 内で aborted run を保存し、c2 は未着手で checks_deferred=1、status='aborted' になる。
         # setup (git / SQLite) の所要時間に依存しないよう、最初の check 起動時から経過時間を計る
         real_origin = [None]
 
@@ -732,19 +732,20 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=lambda: 1700001000.0,
                 mono_fn=mono_fn,
-                tick_budget=0.6,
+                tick_budget=0.8,
+                commit_reserve=0.25,
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual(rc1, 1)
-        self.assertEqual(b1['status'], 'failed')
+        self.assertEqual(rc1, 0)
+        self.assertEqual(b1['status'], 'aborted')
         self.assertEqual(b1['checks_deferred'], 1)
 
-        # deadline 後の commit は試行されず aborted run は保存されない。checks の実行状態カラムも一切変わらない!
+        # check_runs に aborted が記録され、checks の実行状態カラムは一切変わらない!
         after_c1 = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual(after_c1, before_c1)
         c1_runs = [r['outcome'] for r in self.query_all("SELECT outcome FROM check_runs WHERE check_name='c1' ORDER BY id")]
-        self.assertEqual(c1_runs, ['failed_exit'])
+        self.assertEqual(c1_runs, ['failed_exit', 'aborted'])
 
     def test_step6_remaining_zero_aborts_with_zero_runs_and_all_deferred(self):
         self.commit_config(
@@ -800,8 +801,8 @@ sys.exit(2)
             },
         )
         # c1_fast 完了後に c2_guard_skip が着手前ガードで見送り (+1)、
-        # c3_aborted はガード通過後に残り時間が縮んで tick 上限で aborted になるが、
-        # commit 時点で retry deadline を過ぎているため保存されず tick は failed になる。
+        # c3_aborted はガード通過後に残り時間が縮んで exec_deadline で aborted になり、
+        # commit_reserve 内で ('c3_aborted', 'aborted') を保存して tick は status='aborted' になる。
         # 残りの c4_unstarted / c5_unstarted (+2) と合算されて checks_deferred == 3 になること
         # setup 時間で c1_fast / c3_aborted の前提が崩れないよう、c3_aborted 着手時から時計を進める
         c3_real_origin = [None]
@@ -809,7 +810,7 @@ sys.exit(2)
         def mono_fn():
             if c3_real_origin[0] is None:
                 return 0.0
-            return 1.6 + (time.monotonic() - c3_real_origin[0])
+            return 1.4 + (time.monotonic() - c3_real_origin[0])
 
         def wrapped_run_check(chk, *args, **kwargs):
             if chk['name'] == 'c3_aborted':
@@ -825,13 +826,13 @@ sys.exit(2)
                 kill_grace=0.1,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual(rc, 1)
-        self.assertEqual(body['status'], 'failed')
+        self.assertEqual(rc, 0)
+        self.assertEqual(body['status'], 'aborted')
         self.assertEqual(body['checks_deferred'], 3)
         runs = [(r['check_name'], r['outcome']) for r in self.query_all('SELECT check_name, outcome FROM check_runs ORDER BY id')]
-        self.assertEqual(runs, [('c1_fast', 'ok_silent')])
+        self.assertEqual(runs, [('c1_fast', 'ok_silent'), ('c3_aborted', 'aborted')])
         tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT 1')
-        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('failed', 3))
+        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 3))
 
     def test_deadline_crossed_after_guard_fails_tick_without_spawning_check(self):
         ran_marker = self.root / 'should_not_run.marker'
@@ -1657,8 +1658,8 @@ sys.exit(2)
             time.sleep(0.02)
         self.assertFalse(_pid_alive(helper_pid))
 
-        # (b) tick deadline が支配的 -> aborted にはなるが、commit は retry deadline 後なので試行されず
-        # tick は failed になり checks 状態も進めない
+        # (b) exec_deadline が支配的 -> commit_reserve 内で aborted として記録され、
+        # tick は status='aborted' になり checks 状態は進めない
         helper_pid_file.unlink()
         self.commit_config(
             '[[checks]]\nname = "holder_ab"\ninterval = 60\ncommand = "scripts/holder.py"\ntimeout = 10\nskill = "s1"\n',
@@ -1680,12 +1681,15 @@ sys.exit(2)
                 self.db, self.config,
                 now_fn=lambda: 1700000200.0,
                 mono_fn=mono_fn,
-                tick_budget=0.4,
+                tick_budget=0.8,
+                commit_reserve=0.25,
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual((rc2, body2['status']), (1, 'failed'))
-        self.assertIsNone(self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_ab'"))
+        self.assertEqual((rc2, body2['status']), (0, 'aborted'))
+        run2 = self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_ab'")
+        self.assertIsNotNone(run2)
+        self.assertEqual((run2['outcome'], run2['exit_code']), ('aborted', None))
         chk2 = self.query_one("SELECT last_started, last_outcome, fault_count FROM checks WHERE name='holder_ab'")
         self.assertEqual((chk2['last_started'], chk2['last_outcome'], chk2['fault_count']), (None, None, 0))
         helper_pid2 = int(helper_pid_file.read_text(encoding='utf-8').strip())
@@ -3045,6 +3049,106 @@ sys.exit(2)
         self.assertIsNone(body_c['unnotified_tasks'])
         self.assertIn('error', body_c)
         self.assertIn('failed to finalize check tick', err_c.getvalue())
+
+    def test_unified_budget_defers_unpersistable_checks_and_bounds_first_check_exemption(self):
+        # 1. 2 件目以降: timeout が tick_deadline / end_work_deadline に収まっても
+        #    commit_reserve を残せない check は着手せず deferred とし、ワンタイムイベントを失わないこと。
+        #    後続の軽い check (exec_deadline 内に収まる) は実行して保存できること。
+        c2_invocations = self.root / 'c2_invocations.txt'
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/fast.sh"\ntimeout = 2\nskill = "s1"\n'
+            '[[checks]]\nname = "c2_border"\ninterval = 60\ncommand = "scripts/c2_onetime.py"\ntimeout = 5\nskill = "s1"\n'
+            '[[checks]]\nname = "c3_light"\ninterval = 60\ncommand = "scripts/c3_emit.py"\ntimeout = 3\nskill = "s1"\n',
+            {
+                'scripts/fast.sh': '#!/bin/sh\nexit 0\n',
+                'scripts/c2_onetime.py': (
+                    '#!/usr/bin/env python3\nimport json, pathlib\n'
+                    f'p = pathlib.Path({str(c2_invocations)!r})\n'
+                    'p.write_text("1")\n'
+                    'print(json.dumps({"key": "k_c2", "title": "c2 event", "body": "once"}))\n'
+                ),
+                'scripts/c3_emit.py': (
+                    '#!/usr/bin/env python3\nimport json\n'
+                    'print(json.dumps({"key": "k_c3", "title": "c3 event", "body": "stored"}))\n'
+                ),
+            },
+        )
+        # tick_budget=20.0, finalize_reserve=2.0 -> end_work_deadline=1018.0
+        # commit_reserve=2.0 -> exec_deadline=1016.0
+        # c1 完了後に clock=1012.0 とすると:
+        #   tick_deadline まで 8s (>= 5s), end_work_deadline まで 6s (>= 5s),
+        #   しかし exec_deadline まで 4s (< c2_border.timeout=5s) -> c2_border は見送り!
+        #   c3_light (timeout=3s <= 4s) は着手し、timeout ギリギリ (3s 消費して 1015.0) で完了しても
+        #   end_work_deadline (1018.0) まで 3s 残るため保存に成功する!
+        clock1 = FakeClock(wall=1700000000.0, mono=1000.0)
+        orig_run = run_check_command
+
+        def advance_after_checks(chk, *args, **kwargs):
+            res = orig_run(chk, *args, **kwargs)
+            if chk['name'] == 'c1':
+                clock1.advance(12.0)
+            elif chk['name'] == 'c3_light':
+                clock1.advance(3.0)
+            return res
+
+        with mock.patch('app.run_check_command', side_effect=advance_after_checks):
+            body1, rc1 = run_check_tick(
+                self.db, self.config,
+                now_fn=clock1.now,
+                mono_fn=clock1.monotonic,
+                tick_budget=20.0,
+                finalize_reserve=2.0,
+                commit_reserve=2.0,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc1, body1['status']), (0, 'ok'))
+        self.assertEqual(body1['checks_deferred'], 1)
+        self.assertFalse(c2_invocations.exists(), 'c2_border must not run when commit window would be lost')
+        runs1 = [(r['check_name'], r['outcome']) for r in self.query_all('SELECT check_name, outcome FROM check_runs ORDER BY id')]
+        self.assertEqual(runs1, [('c1', 'ok_silent'), ('c3_light', 'fired')])
+        self.assertEqual(len(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='k_c3'")), 1)
+
+        # 2. 先頭免除 (idx == 0) も exec_deadline 内でのみ許可され、
+        #    end_work_deadline 超過後 (finalize_reserve 内) や commit_reserve 内では起動しないこと
+        for case_label, advance_sec, tick_wall in (
+            ('inside_commit_reserve', 16.5, 1700000200.0),
+            ('inside_finalize_reserve', 18.5, 1700000400.0),
+        ):
+            with self.subTest(case=case_label):
+                with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+                    conn.execute('DELETE FROM check_runs')
+                    conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+                if c2_invocations.exists():
+                    c2_invocations.unlink()
+                clock2 = FakeClock(wall=tick_wall, mono=2000.0)
+                orig_sync = sys.modules['app'].sync_checks_mirror
+                spawned = []
+
+                def advance_before_step6(*args, **kwargs):
+                    res = orig_sync(*args, **kwargs)
+                    clock2.advance(advance_sec)
+                    return res
+
+                def spy_run(*args, **kwargs):
+                    spawned.append(args[0]['name'])
+                    return orig_run(*args, **kwargs)
+
+                with mock.patch('app.sync_checks_mirror', side_effect=advance_before_step6), \
+                        mock.patch('app.run_check_command', side_effect=spy_run):
+                    body2, rc2 = run_check_tick(
+                        self.db, self.config,
+                        now_fn=clock2.now,
+                        mono_fn=clock2.monotonic,
+                        tick_budget=20.0,
+                        finalize_reserve=2.0,
+                        commit_reserve=2.0,
+                        deliver_fn=lambda c, t: True,
+                    )
+                self.assertEqual((rc2, body2['status']), (0, 'aborted'))
+                self.assertEqual(body2['checks_deferred'], 3)
+                self.assertEqual(spawned, [], 'first-check exemption must not run after exec_deadline')
+                self.assertEqual(self.query_all('SELECT * FROM check_runs'), [])
+                self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (body2['tick_id'],))['status'], 'aborted')
 
 
 if __name__ == '__main__':

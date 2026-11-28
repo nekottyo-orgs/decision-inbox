@@ -1863,6 +1863,7 @@ def list_claims(store, directory, identifier=None):
 
 CHECK_TICK_BUDGET_SEC = 240.0
 CHECK_FINALIZE_RESERVE_SEC = 2.0
+CHECK_COMMIT_RESERVE_SEC = 2.0
 CHECK_COMMIT_BUSY_TIMEOUT_MS = 5000
 CHECK_WAKE_PASS_BUDGET_SEC = 20.0
 CHECK_WAKE_ITEM_TIMEOUT_SEC = 5.0
@@ -3037,6 +3038,7 @@ def run_check_tick(
     wake_item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
     kill_grace=CHECK_KILL_GRACE_SEC,
     finalize_reserve=None,
+    commit_reserve=None,
     commit_busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
     deliver_fn=None,
 ):
@@ -3180,17 +3182,24 @@ def run_check_tick(
             else max(0.0, float(finalize_reserve))
         )
         end_work_deadline = tick_deadline - effective_reserve
+        work_budget = max(0.0, end_work_deadline - mono_start)
+        effective_commit_reserve = (
+            min(CHECK_COMMIT_RESERVE_SEC, work_budget * 0.1)
+            if commit_reserve is None
+            else max(0.0, float(commit_reserve))
+        )
+        exec_deadline = end_work_deadline - effective_commit_reserve
         checks_deferred = 0
         tick_status = 'ok'
         tick_exit_code = 0
 
-        if (tick_deadline - mono_fn()) <= 0:
-            # step (6) 開始時点で残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
+        if (exec_deadline - mono_fn()) <= 0:
+            # step (6) 開始時点で実行・保存予算の残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
             checks_deferred = len(due_checks)
             tick_status = 'aborted'
         else:
             for idx, chk in enumerate(due_checks):
-                remaining = tick_deadline - mono_fn()
+                remaining = exec_deadline - mono_fn()
                 if idx == 0:
                     if remaining <= 0:
                         checks_deferred += len(due_checks) - idx
@@ -3203,7 +3212,7 @@ def run_check_tick(
 
                 actual_started_iso = now_iso_fn()
                 exit_code, raw_stdout, raw_stderr, timed_out, aborted = run_check_command(
-                    chk, config_dir, tick_deadline, mono_fn=mono_fn, kill_grace=kill_grace,
+                    chk, config_dir, exec_deadline, mono_fn=mono_fn, kill_grace=kill_grace,
                 )
                 finished_run_iso = now_iso_fn()
                 try:
