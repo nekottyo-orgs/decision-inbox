@@ -2238,6 +2238,115 @@ sys.exit(2)
         self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
         self.assertIn('failed to commit check run', err_buf.getvalue())
 
+        # (c) deadline 到達後に初めて成功する commit は試行されず、成功記録を残さず tick が failed になること
+        # また残り 50ms 未満のとき busy_timeout_ms が残り時間で clamp され 50ms 下限で超過しないこと
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+        if invocations_file.exists():
+            invocations_file.unlink()
+
+        clock_c = FakeClock(wall=1700000300.0, mono=1000.0)
+        seen_busy_ms = []
+        commit_calls_after_deadline = []
+
+        def cmd_leaving_20ms(*args, **kwargs):
+            res = orig_run_cmd(*args, **kwargs)
+            # tick_budget=10.0, finalize_reserve=2.0 -> end_work_deadline=1008.0。残り 20ms (50ms 未満) にする
+            clock_c.advance(7.98)
+            return res
+
+        def commit_only_succeeds_after_deadline(*args, **kwargs):
+            seen_busy_ms.append(kwargs.get('busy_timeout_ms'))
+            if clock_c.monotonic() >= 1008.0:
+                commit_calls_after_deadline.append(clock_c.monotonic())
+                return orig_commit(*args, **kwargs)
+            # 1 回目は deadline ちょうどまで競合失敗 (この後なら成功し得る状態)
+            clock_c.advance(0.02)
+            raise sqlite3.OperationalError('database is locked')
+
+        err_buf_c = io.StringIO()
+        with mock.patch('app.run_check_command', side_effect=cmd_leaving_20ms), \
+                mock.patch('app.commit_check_run', side_effect=commit_only_succeeds_after_deadline), \
+                contextlib.redirect_stderr(err_buf_c):
+            res_c, rc_c = run_check_tick(
+                self.db, self.config,
+                now_fn=clock_c.now,
+                mono_fn=clock_c.monotonic,
+                tick_budget=10.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=500,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc_c, res_c['status']), (1, 'failed'))
+        self.assertEqual(len(seen_busy_ms), 1, 'must not retry after retry deadline')
+        self.assertLessEqual(seen_busy_ms[0], 20, f'busy_timeout_ms must be clamped to remaining 20ms, got {seen_busy_ms[0]}')
+        self.assertEqual(commit_calls_after_deadline, [], 'must never attempt commit after deadline')
+        self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
+        self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
+
+        # (d) sleep 後に deadline 到達した場合も再試行せず、実 SQLite ロックが deadline 後に解放されても failed になること
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+        if invocations_file.exists():
+            invocations_file.unlink()
+
+        lock_acq_d = threading.Event()
+        holder_d = [None]
+
+        def hold_writer_past_deadline(hold_sec):
+            conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                lock_acq_d.set()
+                time.sleep(hold_sec)
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                conn.close()
+
+        # tick 開始後の setup 時間を除き、check 完了時点から残り 120ms だけ retry_deadline まで残す。
+        # ロックは 220ms 保持 (deadline 超過後 100ms で解放 -> 旧実装の 500ms フォールバックなら成功していた)
+        real_anchor_d = [None]
+
+        def mono_d():
+            if real_anchor_d[0] is None:
+                return 0.0
+            return time.monotonic() - real_anchor_d[0]
+
+        def cmd_then_lock_past_deadline(*args, **kwargs):
+            res = orig_run_cmd(*args, **kwargs)
+            t = threading.Thread(target=hold_writer_past_deadline, args=(0.22,), daemon=True)
+            holder_d[0] = t
+            t.start()
+            self.assertTrue(lock_acq_d.wait(timeout=3.0))
+            real_anchor_d[0] = time.monotonic()
+            return res
+
+        err_buf_d = io.StringIO()
+        with mock.patch('app.run_check_command', side_effect=cmd_then_lock_past_deadline), \
+                contextlib.redirect_stderr(err_buf_d):
+            res_d, rc_d = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000400.0,
+                mono_fn=mono_d,
+                tick_budget=0.62,
+                finalize_reserve=0.50,  # end_work_deadline = 0.12s, finalize は 0.50s 余裕あり (0.22s でロック解放後に完了)
+                commit_busy_timeout_ms=500,
+                deliver_fn=lambda c, t: True,
+            )
+        if holder_d[0] is not None:
+            holder_d[0].join(timeout=3.0)
+        self.assertEqual((rc_d, res_d['status']), (1, 'failed'))
+        self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
+        self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
+        self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (res_d['tick_id'],))['status'], 'failed')
+
     def test_status_does_not_report_active_running_tick_as_abnormal_exit(self):
         started_flag = self.root / 'active_tick.started'
         release_flag = self.root / 'active_tick.release'

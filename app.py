@@ -2880,18 +2880,22 @@ def _commit_check_run_with_retry(
     *, exit_code, raw_stdout, raw_stderr, timed_out, aborted,
     retry_deadline, mono_fn, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
 ):
-    """SQLite の一時的な書き込み競合 (locked / busy) に対し、command を再実行せず残り budget 内で commit を再試行する。"""
+    """SQLite の一時的な書き込み競合 (locked / busy) に対し、command を再実行せず残り budget 内で commit を再試行する。
+    rem <= 0 では新たな commit リトライを行わず、各試行の busy timeout は残り時間で clamp する。
+    初回時点で既に rem <= 0 の場合は busy_timeout_ms=0 の即時試行のみ行い、競合時は待たずに失敗させる。"""
     retry_mono_start = mono_fn()
     retry_budget = max(0.0, retry_deadline - retry_mono_start)
     retry_real_deadline = time.monotonic() + retry_budget
+    last_error = None
+    attempt = 0
     while True:
         mono_rem = retry_deadline - mono_fn()
         real_rem = retry_real_deadline - time.monotonic()
         rem = min(mono_rem, real_rem)
-        attempt_busy_ms = min(
-            int(busy_timeout_ms),
-            max(50, int(rem * 1000)) if rem > 0 else min(int(busy_timeout_ms), 500),
-        )
+        if attempt > 0 and rem <= 0:
+            raise last_error
+        attempt_busy_ms = min(max(0, int(busy_timeout_ms)), max(0, int(rem * 1000))) if rem > 0 else 0
+        attempt += 1
         try:
             return commit_check_run(
                 db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
@@ -2902,12 +2906,17 @@ def _commit_check_run_with_retry(
         except sqlite3.Error as db_error:
             if not _is_sqlite_retryable_contention(db_error):
                 raise
+            last_error = db_error
             mono_rem = retry_deadline - mono_fn()
             real_rem = retry_real_deadline - time.monotonic()
             rem = min(mono_rem, real_rem)
-            if rem <= 0:
+            if rem <= 0 or int(rem * 1000) <= 0:
                 raise
-            time.sleep(min(0.05, rem))
+            time.sleep(min(0.05, rem / 2.0))
+            mono_rem = retry_deadline - mono_fn()
+            real_rem = retry_real_deadline - time.monotonic()
+            if min(mono_rem, real_rem) <= 0:
+                raise
 
 
 def prune_check_history(
