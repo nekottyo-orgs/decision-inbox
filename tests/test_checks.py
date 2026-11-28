@@ -2384,6 +2384,13 @@ sys.exit(2)
         release_lock2 = threading.Event()
         holder2 = [None]
 
+        def _cleanup_holder_b():
+            release_lock2.set()
+            if holder2[0] is not None:
+                holder2[0].join(timeout=3.0)
+
+        self.addCleanup(_cleanup_holder_b)
+
         def hold_writer_until_released():
             conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
             try:
@@ -2395,6 +2402,15 @@ sys.exit(2)
                     conn.execute('ROLLBACK')
                 conn.close()
 
+        # SQLite / git setup の所要時間が 0.6s budget を消費しないよう、
+        # command 完了・writer lock 確保後の commit 境界から単調時計を進める
+        commit_clock_origin_b = [None]
+
+        def mono_b():
+            if commit_clock_origin_b[0] is None:
+                return 0.0
+            return time.monotonic() - commit_clock_origin_b[0]
+
         orig_run_cmd = run_check_command
 
         def start_writer_after_command(*args, **kwargs):
@@ -2403,6 +2419,7 @@ sys.exit(2)
             holder2[0] = t
             t.start()
             self.assertTrue(lock_acquired2.wait(timeout=3.0))
+            commit_clock_origin_b[0] = time.monotonic()
             return res
 
         # commit が失敗してリトライを諦めた直後に writer を解放する (finalization が走れる状況を作る)
@@ -2412,21 +2429,24 @@ sys.exit(2)
             try:
                 return orig_commit_retry(*args, **kwargs)
             finally:
-                release_lock2.set()
-                if holder2[0] is not None:
-                    holder2[0].join(timeout=3.0)
+                _cleanup_holder_b()
 
-        with mock.patch('app.run_check_command', side_effect=start_writer_after_command), \
-                mock.patch('app._commit_check_run_with_retry', side_effect=release_after_commit_fails), \
-                contextlib.redirect_stderr(err_buf):
-            res_fail, rc_fail = run_check_tick(
-                self.db, self.config,
-                now_fn=lambda: 1700000200.0,
-                tick_budget=0.6,
-                finalize_reserve=0.25,
-                commit_busy_timeout_ms=60,
-                deliver_fn=lambda c, t: True,
-            )
+        try:
+            with mock.patch('app.run_check_command', side_effect=start_writer_after_command), \
+                    mock.patch('app._commit_check_run_with_retry', side_effect=release_after_commit_fails), \
+                    contextlib.redirect_stderr(err_buf):
+                res_fail, rc_fail = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000200.0,
+                    mono_fn=mono_b,
+                    tick_budget=0.6,
+                    finalize_reserve=0.25,
+                    commit_busy_timeout_ms=60,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            _cleanup_holder_b()
+        self.assertIsNotNone(commit_clock_origin_b[0], 'setup must not exhaust tick budget before command/commit')
         self.assertEqual(rc_fail, 1)
         self.assertEqual(res_fail['status'], 'failed')
         self.assertEqual(int(invocations_file.read_text()), 1)
@@ -2434,6 +2454,7 @@ sys.exit(2)
         self.assertEqual(tick_row['status'], 'failed')
         self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
         self.assertIn('failed to commit check run', err_buf.getvalue())
+        self.assertNotIn('before the first attempt', err_buf.getvalue())
 
         # (c) deadline 到達後に初めて成功する commit は試行されず、成功記録を残さず tick が failed になること
         # また残り 50ms 未満のとき busy_timeout_ms が残り時間で clamp され 50ms 下限で超過しないこと
