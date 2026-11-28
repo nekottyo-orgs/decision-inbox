@@ -52,14 +52,69 @@ def _write_exec(path, content):
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _pid_alive(pid):
+CHECK_RUNNER_ENV_KEYS = (
+    'CUE_CHECK_NOW',
+    'CUE_CHECKS_CONFIG',
+    'CUE_RUN_INBOX_BIN',
+    'CUE_WAKE_RUN_ID',
+    'CUE_CHECK_TICK_BUDGET_SEC',
+    'CUE_CHECK_WAKE_BUDGET_SEC',
+    'CUE_CHECK_WAKE_ITEM_TIMEOUT_SEC',
+    'CUE_CHECK_KILL_GRACE_SEC',
+    'FAKE_WAKE_SLEEP',
+    'FAKE_ACTIVE_RC',
+    'FAKE_SEND_RC',
+)
+
+
+def _pid_is_zombie(pid):
+    proc_stat = Path(f'/proc/{pid}/stat')
+    if proc_stat.exists():
+        try:
+            content = proc_stat.read_text(encoding='utf-8', errors='replace')
+            rparen = content.rfind(')')
+            if rparen != -1:
+                fields = content[rparen + 2:].split()
+                if fields and fields[0] in ('Z', 'X', 'x'):
+                    return True
+            return False
+        except OSError:
+            return True
+    try:
+        out = subprocess.run(
+            ['ps', '-o', 'stat=', '-p', str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        state = out.stdout.strip()
+        return not state or state.startswith('Z')
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _pid_stopped(pid):
+    """プロセスが存在しないか、終了済み zombie (未 reap) なら True を返す。"""
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
+        return True
+    except PermissionError:
         return False
     except OSError:
-        return False
+        return True
+    return _pid_is_zombie(pid)
+
+
+def _wait_pid_stopped(pid, timeout=2.0):
+    deadline = time.monotonic() + max(0.0, timeout)
+    while not _pid_stopped(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _pid_alive(pid):
+    return not _pid_stopped(pid)
 
 
 def _cleanup_pid_file(pid_file):
@@ -70,6 +125,17 @@ def _cleanup_pid_file(pid_file):
         if pid > 0 and _pid_alive(pid):
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                 os.kill(pid, signal.SIGKILL)
+
+
+def _cleanup_pgid_file(pgid_file):
+    if not pgid_file.exists():
+        return
+    with contextlib.suppress(OSError, ValueError):
+        pgid = int(pgid_file.read_text(encoding='utf-8').strip())
+        if pgid > 0:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pgid, signal.SIGKILL)
+            _wait_pid_stopped(pgid, timeout=2.0)
 
 
 class FakeClock:
@@ -90,6 +156,13 @@ class FakeClock:
 
 class CheckRunnerTests(unittest.TestCase):
     def setUp(self):
+        # 呼び出し側 shell の check-runner 系環境変数を隔離する (直接呼び出し・CLI 経由の両方)
+        self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        for key in CHECK_RUNNER_ENV_KEYS:
+            os.environ.pop(key, None)
+
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -103,6 +176,15 @@ class CheckRunnerTests(unittest.TestCase):
         self.wake_log = self.root / 'wake.jsonl'
         self.run_inbox = self.root / 'fake-run-inbox.sh'
         self._install_fake_run_inbox()
+
+    def _cli_env(self, env_extra=None):
+        env = isolated_env(self.root)
+        for key in CHECK_RUNNER_ENV_KEYS:
+            env.pop(key, None)
+        env['CUE_RUN_INBOX_BIN'] = str(self.run_inbox)
+        if env_extra:
+            env.update(env_extra)
+        return env
 
     def _install_fake_run_inbox(self, *, active_rc=0, send_rc=0, sleep_sec=0.0):
         script = f"""#!/usr/bin/env python3
@@ -139,10 +221,7 @@ sys.exit(2)
         _git(self.repo, 'commit', '-m', 'update checks')
 
     def cli(self, *args, env_extra=None, timeout=15):
-        env = isolated_env(self.root)
-        env['CUE_RUN_INBOX_BIN'] = str(self.run_inbox)
-        if env_extra:
-            env.update(env_extra)
+        env = self._cli_env(env_extra)
         return subprocess.run(
             [sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), *args],
             capture_output=True, text=True, timeout=timeout, env=env,
@@ -336,28 +415,37 @@ sys.exit(2)
     # --- 3. kill -9 後の running 残留と次 tick の継続 ---
 
     def test_kill_9_leaves_running_tick_and_next_tick_recovers(self):
-        marker = self.root / 'started.flag'
+        pgid_file = self.root / 'slow.pgid'
+        self.addCleanup(_cleanup_pgid_file, pgid_file)
         self.commit_config(
             '[[checks]]\nname = "slow"\ninterval = 300\ncommand = "scripts/slow.sh"\ntimeout = 30\nskill = "s1"\n',
-            {'scripts/slow.sh': f'#!/bin/sh\ntouch {str(marker)!r}\nsleep 20\n'},
+            {
+                'scripts/slow.sh': (
+                    '#!/bin/sh\n'
+                    f'tmp={str(pgid_file)!r}.tmp\n'
+                    'echo $$ > "$tmp"\n'
+                    f'mv "$tmp" {str(pgid_file)!r}\n'
+                    'sleep 20\n'
+                ),
+            },
         )
-        env = isolated_env(self.root)
-        env['CUE_RUN_INBOX_BIN'] = str(self.run_inbox)
-        env['CUE_CHECK_NOW'] = '1700000000'
+        env = self._cli_env({'CUE_CHECK_NOW': '1700000000'})
         proc = subprocess.Popen(
             [sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'check', 'tick', '--config', str(self.config)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
         )
         try:
             deadline = time.monotonic() + 10
-            while not marker.exists() and time.monotonic() < deadline:
+            while not pgid_file.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self.assertTrue(marker.exists(), 'slow check did not start')
+            self.assertTrue(pgid_file.exists(), 'slow check did not start')
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
         finally:
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.killpg(proc.pid, signal.SIGKILL)
+            # 独自セッションで起動した check 側のプロセスグループも明示的に掃除する
+            _cleanup_pgid_file(pgid_file)
             if proc.stdout:
                 proc.stdout.close()
             if proc.stderr:
@@ -836,11 +924,9 @@ sys.exit(2)
         run = self.query_one('SELECT outcome, exit_code FROM check_runs')
         self.assertEqual(run['outcome'], 'failed_timeout')
         self.assertIsNone(run['exit_code'])
-        # 孫プロセスも SIGKILL で確実に消えていること
+        # 孫プロセスも SIGKILL で確実に停止していること (未 reap の zombie も停止済みとみなす)
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
-        time.sleep(0.1)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        self.assertTrue(_wait_pid_stopped(child_pid, timeout=2.0), f'child pid {child_pid} still running')
 
     def test_timeout_sigkills_term_ignoring_child_after_leader_exits_on_term(self):
         child_pid_file = self.root / 'child_orphan.pid'
@@ -884,10 +970,9 @@ sys.exit(2)
         # 子が SIGTERM 無視を設定済みであり、リーダーが SIGTERM で即終了したこと (既存テストと区別)
         self.assertTrue(child_ready_flag.exists())
         self.assertTrue(leader_exited_flag.exists())
-        # TERM を無視した子プロセスも猶予後の SIGKILL で残っていないこと
+        # TERM を無視した子プロセスも猶予後の SIGKILL で停止していること (未 reap の zombie も停止済みとみなす)
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        self.assertTrue(_wait_pid_stopped(child_pid, timeout=2.0), f'orphan child pid {child_pid} still running')
 
     def test_terminate_process_group_bounds_wait_after_sigkill(self):
         signals_sent = []
@@ -2077,9 +2162,7 @@ sys.exit(2)
                 ),
             },
         )
-        env = isolated_env(self.root)
-        env['CUE_RUN_INBOX_BIN'] = str(self.run_inbox)
-        env['CUE_CHECK_NOW'] = '1700000000'
+        env = self._cli_env({'CUE_CHECK_NOW': '1700000000'})
         proc = subprocess.Popen(
             [sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'check', 'tick', '--config', str(self.config)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
@@ -2183,6 +2266,33 @@ sys.exit(2)
         snap_after = check_status_data(self.db, now_fn=lambda: 1700000110.0)
         self.assertEqual(snap_after['last_ok_tick_at'], ts1)
         self.assertEqual([t['status'] for t in snap_after['recent_ticks']], ['ok'])
+
+    def test_fixture_isolates_check_runner_env_overrides_and_distinguishes_zombie(self):
+        # 1. setUp は親環境からの check-runner 系設定を除去していること
+        for key in CHECK_RUNNER_ENV_KEYS:
+            if key != 'CUE_RUN_INBOX_BIN':
+                self.assertNotIn(key, os.environ)
+        # 2. _cli_env も親環境の check-runner 系 override を除去し、明示指定だけを残すこと
+        with mock.patch.dict(os.environ, {
+            'CUE_CHECK_TICK_BUDGET_SEC': '0',
+            'CUE_CHECK_NOW': '123',
+            'CUE_WAKE_RUN_ID': 'leaked-run',
+            'CUE_CHECKS_CONFIG': '/tmp/leaked.toml',
+        }):
+            clean = self._cli_env()
+            for key in ('CUE_CHECK_TICK_BUDGET_SEC', 'CUE_CHECK_NOW', 'CUE_WAKE_RUN_ID', 'CUE_CHECKS_CONFIG'):
+                self.assertNotIn(key, clean)
+            overridden = self._cli_env({'CUE_CHECK_NOW': '1700000999'})
+            self.assertEqual(overridden['CUE_CHECK_NOW'], '1700000999')
+            self.assertNotIn('CUE_CHECK_TICK_BUDGET_SEC', overridden)
+
+        # 3. 終了済みだが未 reap の zombie プロセスを停止済みとみなせること
+        zombie = subprocess.Popen([sys.executable, '-c', 'pass'])
+        try:
+            self.assertTrue(_wait_pid_stopped(zombie.pid, timeout=2.0))
+            self.assertTrue(_pid_stopped(zombie.pid))
+        finally:
+            zombie.wait(timeout=5)
 
 
 if __name__ == '__main__':
