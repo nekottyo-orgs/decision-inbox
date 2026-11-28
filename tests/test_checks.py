@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import (
     CHECK_FAULT_SKILL,
     Store,
+    _terminate_process_group,
     check_list_data,
     check_lock_path,
     check_status_data,
@@ -54,6 +55,16 @@ def _pid_alive(pid):
         return False
     except OSError:
         return False
+
+
+def _cleanup_pid_file(pid_file):
+    if not pid_file.exists():
+        return
+    with contextlib.suppress(OSError, ValueError):
+        pid = int(pid_file.read_text(encoding='utf-8').strip())
+        if pid > 0 and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGKILL)
 
 
 class FakeClock:
@@ -576,10 +587,26 @@ sys.exit(2)
         self.assertEqual((before_c1['last_outcome'], before_c1['fault_count']), ('failed_exit', 1))
 
         # tick_budget = 0.6s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し tick 上限で aborted。c2 は未着手で checks_deferred=1
-        with mock.patch.dict(os.environ, {'MODE': 'sleep'}):
+        # setup (git / SQLite) の所要時間に依存しないよう、最初の check 起動時から経過時間を計る
+        real_origin = [None]
+
+        def mono_fn():
+            if real_origin[0] is None:
+                return 0.0
+            return time.monotonic() - real_origin[0]
+
+        def start_clock_on_first_check(*args, **kwargs):
+            if real_origin[0] is None:
+                real_origin[0] = time.monotonic()
+            return run_check_command(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {'MODE': 'sleep'}), mock.patch(
+            'app.run_check_command', side_effect=start_clock_on_first_check,
+        ):
             b1, rc1 = run_check_tick(
                 self.db, self.config,
                 now_fn=lambda: 1700001000.0,
+                mono_fn=mono_fn,
                 tick_budget=0.6,
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
@@ -600,9 +627,11 @@ sys.exit(2)
             '[[checks]]\nname = "c2"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
             {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
         )
+        clock = FakeClock(wall=1700000000.0, mono=1000.0)
         body, rc = run_check_tick(
             self.db, self.config,
-            now_fn=lambda: 1700000000.0,
+            now_fn=clock.now,
+            mono_fn=clock.monotonic,
             tick_budget=0.0,
             deliver_fn=lambda c, t: True,
         )
@@ -619,9 +648,11 @@ sys.exit(2)
             {'scripts/fast.sh': '#!/bin/sh\nexit 0\n'},
         )
         # tick_budget = 5s: c1 (timeout 1) 実行 -> c2_heavy (timeout 50 > remaining) 見送り -> c3_light (timeout 1) 実行!
+        clock = FakeClock(wall=1700000000.0, mono=1000.0)
         body, rc = run_check_tick(
             self.db, self.config,
-            now_fn=lambda: 1700000000.0,
+            now_fn=clock.now,
+            mono_fn=clock.monotonic,
             tick_budget=5.0,
             deliver_fn=lambda c, t: True,
         )
@@ -646,31 +677,28 @@ sys.exit(2)
         # c1_fast 完了後に c2_guard_skip が着手前ガードで見送り (+1)、
         # c3_aborted はガード通過後に残り時間が縮んで tick 上限で aborted、
         # 残りの c4_unstarted / c5_unstarted (+2) と合算されて checks_deferred == 3 になること
-        extra_mono = [0.0]
-        bumped = [False]
+        # setup 時間で c1_fast / c3_aborted の前提が崩れないよう、c3_aborted 着手時から時計を進める
+        c3_real_origin = [None]
 
         def mono_fn():
-            return time.monotonic() + extra_mono[0]
+            if c3_real_origin[0] is None:
+                return 0.0
+            return 1.6 + (time.monotonic() - c3_real_origin[0])
 
-        def now_fn():
-            if not bumped[0] and self.db.exists():
-                with contextlib.closing(sqlite3.connect(self.db)) as conn:
-                    has_table = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='check_runs'"
-                    ).fetchone()
-                    if has_table and conn.execute("SELECT 1 FROM check_runs WHERE check_name='c1_fast'").fetchone():
-                        bumped[0] = True
-                        extra_mono[0] = 1.6
-            return 1700000000.0
+        def wrapped_run_check(chk, *args, **kwargs):
+            if chk['name'] == 'c3_aborted':
+                c3_real_origin[0] = time.monotonic()
+            return run_check_command(chk, *args, **kwargs)
 
-        body, rc = run_check_tick(
-            self.db, self.config,
-            now_fn=now_fn,
-            mono_fn=mono_fn,
-            tick_budget=2.0,
-            kill_grace=0.1,
-            deliver_fn=lambda c, t: True,
-        )
+        with mock.patch('app.run_check_command', side_effect=wrapped_run_check):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000000.0,
+                mono_fn=mono_fn,
+                tick_budget=2.0,
+                kill_grace=0.1,
+                deliver_fn=lambda c, t: True,
+            )
         self.assertEqual(rc, 0)
         self.assertEqual(body['status'], 'aborted')
         self.assertEqual(body['checks_deferred'], 3)
@@ -678,6 +706,52 @@ sys.exit(2)
         self.assertEqual(runs, [('c1_fast', 'ok_silent'), ('c3_aborted', 'aborted')])
         tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT 1')
         self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 3))
+
+    def test_deadline_crossed_after_guard_aborts_without_spawning_check(self):
+        ran_marker = self.root / 'should_not_run.marker'
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/mark.sh"\ntimeout = 10\nskill = "s1"\n'
+            '[[checks]]\nname = "c2"\ninterval = 60\ncommand = "scripts/mark.sh"\ntimeout = 10\nskill = "s1"\n',
+            {
+                'scripts/mark.sh': f'#!/bin/sh\necho ran > {str(ran_marker)!r}\nexit 0\n',
+            },
+        )
+        clock = FakeClock(wall=1700000000.0, mono=1000.0)
+        spawned_commands = []
+        orig_popen = subprocess.Popen
+
+        def spy_popen(argv, *args, **kwargs):
+            spawned_commands.append(list(argv))
+            return orig_popen(argv, *args, **kwargs)
+
+        def advance_past_deadline_after_guard(chk, *args, **kwargs):
+            # budget guard を通過した後、run_check_command の Popen 直前で deadline を跨ぐ
+            clock.advance(1.5)
+            return run_check_command(chk, *args, **kwargs)
+
+        with mock.patch('app.subprocess.Popen', side_effect=spy_popen), mock.patch(
+            'app.run_check_command', side_effect=advance_past_deadline_after_guard,
+        ):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=clock.now,
+                mono_fn=clock.monotonic,
+                tick_budget=1.0,
+                deliver_fn=lambda c, t: True,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(body['status'], 'aborted')
+        self.assertEqual(body['checks_deferred'], 1)
+        self.assertFalse(ran_marker.exists())
+        self.assertFalse(any(any('mark.sh' in part for part in cmd) for cmd in spawned_commands))
+        runs = [(r['check_name'], r['outcome'], r['exit_code']) for r in self.query_all('SELECT check_name, outcome, exit_code FROM check_runs')]
+        self.assertEqual(runs, [('c1', 'aborted', None)])
+        c1_state = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
+        self.assertEqual(
+            (c1_state['last_started'], c1_state['last_actual_started_at'], c1_state['last_outcome'], c1_state['fault_count']),
+            (None, None, None, 0),
+        )
 
     def test_cli_ignores_fixed_budget_override_env_vars(self):
         self.commit_config(
@@ -704,6 +778,7 @@ sys.exit(2)
 
     def test_timeout_priority_and_process_group_sigterm_then_sigkill(self):
         child_pid_file = self.root / 'child.pid'
+        self.addCleanup(_cleanup_pid_file, child_pid_file)
         self.commit_config(
             '[[checks]]\nname = "hang"\ninterval = 60\ncommand = "scripts/hang.sh"\ntimeout = 0.5\nskill = "s1"\n',
             {
@@ -728,13 +803,13 @@ sys.exit(2)
         self.assertIsNone(run['exit_code'])
         # 孫プロセスも SIGKILL で確実に消えていること
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
-        self.addCleanup(lambda: os.kill(child_pid, signal.SIGKILL) if _pid_alive(child_pid) else None)
         time.sleep(0.1)
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
 
     def test_timeout_sigkills_term_ignoring_child_after_leader_exits_on_term(self):
         child_pid_file = self.root / 'child_orphan.pid'
+        self.addCleanup(_cleanup_pid_file, child_pid_file)
         child_ready_flag = self.root / 'child_ready.flag'
         leader_exited_flag = self.root / 'leader_exited.flag'
         child_code = (
@@ -776,9 +851,43 @@ sys.exit(2)
         self.assertTrue(leader_exited_flag.exists())
         # TERM を無視した子プロセスも猶予後の SIGKILL で残っていないこと
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
-        self.addCleanup(lambda: os.kill(child_pid, signal.SIGKILL) if _pid_alive(child_pid) else None)
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
+
+    def test_terminate_process_group_bounds_wait_after_sigkill(self):
+        signals_sent = []
+        wait_timeouts = []
+
+        class UnkillableFakeProcess:
+            pid = 999999
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                wait_timeouts.append(timeout)
+                if timeout is None:
+                    raise AssertionError('unbounded wait() called after SIGKILL')
+                time.sleep(min(timeout, 0.05))
+                raise subprocess.TimeoutExpired(cmd=['fake'], timeout=timeout)
+
+        def fake_killpg(pgid, sig):
+            signals_sent.append((pgid, sig))
+
+        stderr_buf = io.StringIO()
+        started = time.monotonic()
+        with mock.patch('app.os.killpg', side_effect=fake_killpg), contextlib.redirect_stderr(stderr_buf):
+            _terminate_process_group(UnkillableFakeProcess(), grace_sec=0.05, kill_wait_sec=0.05)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertIn((999999, signal.SIGTERM), signals_sent)
+        self.assertIn((999999, signal.SIGKILL), signals_sent)
+        self.assertGreaterEqual(len(wait_timeouts), 2)
+        self.assertTrue(all(t is not None and t >= 0.0 for t in wait_timeouts))
+        self.assertIn('warning:', stderr_buf.getvalue())
+        self.assertIn('SIGKILL', stderr_buf.getvalue())
 
     # --- 7. JSONL 契約と検証違反 (failed_output) ---
 
