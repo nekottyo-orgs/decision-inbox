@@ -1,0 +1,20 @@
+# Dependabot の supply chain 対策設定。
+# - version updates は有効化する。依存の自動更新 PR は通常どおり作られる。
+# - cooldown.default-days: 7 は version updates に適用される。
+#   新しいリリースが公開されてから 7 日経つまで version update の PR は作られない。
+#   悪意あるリリースや事故リリースの初期被害を避けるための supply chain 対策。
+# - security updates は cooldown の対象外。脆弱性修正は従来どおり即時に PR が作られる。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
