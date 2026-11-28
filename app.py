@@ -62,7 +62,8 @@ def utc_now():
 def timestamp_after(previous):
     current = utc_now()
     if current <= previous:
-        return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
+        with suppress(ValueError):
+            return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
     return current
 
 
