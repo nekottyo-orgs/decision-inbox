@@ -834,7 +834,7 @@ sys.exit(2)
         tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT 1')
         self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 3))
 
-    def test_deadline_crossed_after_guard_fails_tick_without_spawning_check(self):
+    def test_deadline_crossed_after_guard_defers_unstarted_checks_consistently(self):
         ran_marker = self.root / 'should_not_run.marker'
         self.commit_config(
             '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/mark.sh"\ntimeout = 10\nskill = "s1"\n'
@@ -843,6 +843,9 @@ sys.exit(2)
                 'scripts/mark.sh': f'#!/bin/sh\necho ran > {str(ran_marker)!r}\nexit 0\n',
             },
         )
+        # (a) 先頭 check (idx == 0) がガード通過後・Popen 直前で deadline を跨いだ場合:
+        #     step (6) 開始時と同じ規則で未着手の全件 (c1 + c2 = 2 件) を checks_deferred に数え、
+        #     check_runs を書かず status='aborted' (exit 0) で終えること
         clock = FakeClock(wall=1700000000.0, mono=1000.0)
         spawned_commands = []
         orig_popen = subprocess.Popen
@@ -867,18 +870,53 @@ sys.exit(2)
                 deliver_fn=lambda c, t: True,
             )
 
-        self.assertEqual(rc, 1)
-        self.assertEqual(body['status'], 'failed')
-        self.assertEqual(body['checks_deferred'], 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(body['status'], 'aborted')
+        self.assertEqual(body['checks_deferred'], 2)
         self.assertFalse(ran_marker.exists())
         self.assertFalse(any(any('mark.sh' in part for part in cmd) for cmd in spawned_commands))
-        # deadline 後の commit は試行されず aborted run も保存されない
         self.assertEqual(self.query_all('SELECT * FROM check_runs'), [])
         c1_state = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual(
             (c1_state['last_started'], c1_state['last_actual_started_at'], c1_state['last_outcome'], c1_state['fault_count']),
             (None, None, None, 0),
         )
+
+        # (b) 2 件目 (idx == 1) がガード通過後・Popen 直前で exec_deadline を跨いだ場合:
+        #     c1 は完了しており、未着手の c2 + c3 = 2 件が checks_deferred に計上され、
+        #     check_runs には c1 のみ、tick は status='ok' (exit 0) になること
+        c2_marker = self.root / 'c2_should_not_run.marker'
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 1\nskill = "s1"\n'
+            '[[checks]]\nname = "c2"\ninterval = 60\ncommand = "scripts/mark_c2.sh"\ntimeout = 1\nskill = "s1"\n'
+            '[[checks]]\nname = "c3"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 1\nskill = "s1"\n',
+            {
+                'scripts/ok.sh': '#!/bin/sh\nexit 0\n',
+                'scripts/mark_c2.sh': f'#!/bin/sh\necho ran > {str(c2_marker)!r}\nexit 0\n',
+            },
+        )
+        clock2 = FakeClock(wall=1700000100.0, mono=2000.0)
+
+        def advance_past_deadline_on_c2(chk, *args, **kwargs):
+            if chk['name'] == 'c2':
+                clock2.advance(5.0)
+            return run_check_command(chk, *args, **kwargs)
+
+        with mock.patch('app.run_check_command', side_effect=advance_past_deadline_on_c2):
+            body2, rc2 = run_check_tick(
+                self.db, self.config,
+                now_fn=clock2.now,
+                mono_fn=clock2.monotonic,
+                tick_budget=5.0,
+                deliver_fn=lambda c, t: True,
+            )
+
+        self.assertEqual(rc2, 0)
+        self.assertEqual(body2['status'], 'ok')
+        self.assertEqual(body2['checks_deferred'], 2)
+        self.assertFalse(c2_marker.exists())
+        runs2 = [(r['check_name'], r['outcome']) for r in self.query_all('SELECT check_name, outcome FROM check_runs ORDER BY id')]
+        self.assertEqual(runs2, [('c1', 'ok_silent')])
 
     def test_cli_ignores_fixed_budget_override_env_vars(self):
         self.commit_config(

@@ -2497,7 +2497,10 @@ def _drain_pipe(stream, limit, state):
             stream.close()
 
 
-def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC):
+def run_check_command(
+    chk, config_dir, tick_deadline, *,
+    mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC, launch_state=None,
+):
     """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。
 
     Policy:
@@ -2512,6 +2515,8 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     cmd_env = {**os.environ, **chk['env']}
     cmd_mono_start = mono_fn()
     if cmd_mono_start >= tick_deadline:
+        if launch_state is not None:
+            launch_state['refused'] = True
         return None, b'', b'', False, True
     timeout_at = cmd_mono_start + chk['timeout']
     wait_until = min(timeout_at, tick_deadline)
@@ -3211,9 +3216,18 @@ def run_check_tick(
                         continue
 
                 actual_started_iso = now_iso_fn()
+                launch_state = {'refused': False}
                 exit_code, raw_stdout, raw_stderr, timed_out, aborted = run_check_command(
-                    chk, config_dir, exec_deadline, mono_fn=mono_fn, kill_grace=kill_grace,
+                    chk, config_dir, exec_deadline,
+                    mono_fn=mono_fn, kill_grace=kill_grace, launch_state=launch_state,
                 )
+                if aborted and launch_state['refused']:
+                    # 起動直前ガードで未着手となった due check は step (6) 開始時・ループ前ガードと
+                    # 同一規則 (issue-701-v9) で記録せず checks_deferred に計上する。
+                    checks_deferred += len(due_checks) - idx
+                    if idx == 0:
+                        tick_status = 'aborted'
+                    break
                 finished_run_iso = now_iso_fn()
                 try:
                     run_result = _commit_check_run_with_retry(
