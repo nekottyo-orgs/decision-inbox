@@ -19,13 +19,13 @@ jobs:
   # 変更ファイルが verify の対象に当たるかを判定する（pull_request のみ）。
   # push では path filter を使わず、その push の tip に対して verify を常時実行するため、
   # この job は常に relevant=true を返す。
-  # checkout は verify と同じ pin に揃え、base ブランチとの差分を取れるよう全履歴を取得する。
+  # checkout は verify と同じバージョンに揃え、base ブランチとの差分を取れるよう全履歴を取得する。
   paths:
     runs-on: ubuntu-latest
     outputs:
       relevant: ${{ steps.check.outputs.relevant }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -73,7 +73,7 @@ jobs:
     if: needs.paths.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           # 旧 release の app.py と現行 DB の互換テストは Git 履歴を使う。
           fetch-depth: 0
