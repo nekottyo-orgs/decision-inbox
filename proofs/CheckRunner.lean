@@ -22,7 +22,8 @@ def Outcome.isFailure : Outcome → Bool
   | _ => false
 
 /-- 優先順位に従う outcome の分類。
-    check の経過時間が timeout に達していれば tick 上限と同時でも failedTimeout。 -/
+    command timeout の期限が tick 上限以下 (同時を含む) で支配的であれば failedTimeout、
+    tick 上限が先に到来していれば観測時刻が遅れても aborted。 -/
 def classifyOutcome (timedOut aborted exitNonZero badOutput : Bool)
     (firedCount suppressedCount : Nat) : Outcome :=
   if timedOut then .failedTimeout
