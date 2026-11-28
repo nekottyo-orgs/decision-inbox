@@ -3096,14 +3096,67 @@ def run_check_tick(
             )
             tick_id = cursor.lastrowid
 
+        all_failed = set()
+        any_wake_truncated = False
+
+        def _finalize_tick(status, exit_code, checks_deferred_val, *, error_msg=None, end_wake_skipped=False):
+            nonlocal any_wake_truncated
+            finished_iso = now_iso_fn()
+            finalize_rem = tick_deadline - mono_fn()
+            finalize_busy_ms = min(CHECK_COMMIT_BUSY_TIMEOUT_MS, max(0, int(finalize_rem * 1000)))
+            unnotified = None
+            result_status = status
+            result_exit_code = exit_code
+            result_error = error_msg
+            try:
+                with _check_db(db_path, busy_timeout_ms=finalize_busy_ms) as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
+                    connection.execute(
+                        'UPDATE check_ticks SET finished_at=?, status=?, wake_failed=?, unnotified_tasks=?, checks_deferred=? WHERE id=?',
+                        (finished_iso, status, len(all_failed), unnotified, checks_deferred_val, tick_id),
+                    )
+            except sqlite3.Error as db_error:
+                print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
+                if result_status != 'config_error':
+                    result_status = 'failed'
+                    result_exit_code = 1
+                if result_error is None:
+                    result_error = str(db_error)
+
+            if end_wake_skipped and (unnotified is None or unnotified > 0):
+                any_wake_truncated = True
+
+            if all_failed or any_wake_truncated:
+                print(
+                    f'warning: check tick wake issue (wake_failed={len(all_failed)}, truncated={any_wake_truncated}, unnotified={unnotified})',
+                    file=sys.stderr,
+                )
+
+            result_body = {
+                'tick_id': tick_id, 'status': result_status, 'started_at': tick_started_iso,
+                'finished_at': finished_iso, 'wake_failed': len(all_failed),
+                'unnotified_tasks': unnotified, 'checks_deferred': checks_deferred_val,
+            }
+            if result_error is not None:
+                result_body['error'] = result_error
+            return result_body, result_exit_code
+
         # (3) tick 開始時 wake (config 検査より前に行う)
-        start_failed, start_truncated, _ = run_wake_pass(
-            db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
-            run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
-            pass_budget=wake_pass_budget, item_timeout=wake_item_timeout,
-            deliver_fn=deliver_fn,
-        )
-        all_failed = set(start_failed)
+        try:
+            start_failed, start_truncated, _ = run_wake_pass(
+                db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
+                run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
+                pass_budget=wake_pass_budget, item_timeout=wake_item_timeout,
+                deliver_fn=deliver_fn,
+                busy_timeout_ms=commit_busy_timeout_ms,
+                failed_ids_out=all_failed,
+            )
+        except sqlite3.Error as db_error:
+            any_wake_truncated = True
+            print(f'error: failed during start wake pass for check tick {tick_id}: {db_error}', file=sys.stderr)
+            return _finalize_tick('failed', 1, None, error_msg=str(db_error))
+        all_failed |= start_failed
         any_wake_truncated = start_truncated
 
         # (4) checkout 検査と TOML 読込・検証
@@ -3113,33 +3166,8 @@ def run_check_tick(
             _checkout_root, config_dir, checks_cfg = load_and_validate_checks_config(config_path, mono_fn=mono_fn)
         except CheckConfigError as error:
             # config_error: (5)〜(8) を飛ばし、(9) は必ず実行
-            finished_iso = now_iso_fn()
-            config_finalize_busy_ms = min(
-                CHECK_COMMIT_BUSY_TIMEOUT_MS,
-                max(0, int((tick_deadline - mono_fn()) * 1000)),
-            )
-            unnotified = None
-            try:
-                with _check_db(db_path, busy_timeout_ms=config_finalize_busy_ms) as connection:
-                    connection.execute('BEGIN IMMEDIATE')
-                    unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
-                    connection.execute(
-                        "UPDATE check_ticks SET finished_at=?, status='config_error', wake_failed=?, unnotified_tasks=?, checks_deferred=NULL WHERE id=?",
-                        (finished_iso, len(all_failed), unnotified, tick_id),
-                    )
-            except sqlite3.Error as db_error:
-                print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
             print(f'error: check tick config_error: {error}', file=sys.stderr)
-            if all_failed or any_wake_truncated:
-                print(
-                    f'warning: check tick wake issue (wake_failed={len(all_failed)}, truncated={any_wake_truncated}, unnotified={unnotified})',
-                    file=sys.stderr,
-                )
-            return {
-                'tick_id': tick_id, 'status': 'config_error', 'started_at': tick_started_iso,
-                'finished_at': finished_iso, 'wake_failed': len(all_failed),
-                'unnotified_tasks': unnotified, 'checks_deferred': None, 'error': str(error),
-            }, 1
+            return _finalize_tick('config_error', 1, None, error_msg=str(error))
 
         # (5) checks テーブルの鏡同期
         sync_checks_mirror(db_path, checks_cfg, now_iso_fn())
@@ -3211,6 +3239,7 @@ def run_check_tick(
                     skip_task_ids=start_failed,
                     pass_budget=end_wake_budget, item_timeout=wake_item_timeout,
                     deliver_fn=deliver_fn,
+                    busy_timeout_ms=commit_busy_timeout_ms,
                     stop_on_db_contention=True,
                 )
                 all_failed |= end_failed
@@ -3226,42 +3255,10 @@ def run_check_tick(
                 )
 
         # (9) check_ticks を最終 status に UPDATE (DB 待ちも公称 tick_deadline 内に制限)
-        finished_iso = now_iso_fn()
-        finalize_rem = tick_deadline - mono_fn()
-        finalize_busy_ms = min(CHECK_COMMIT_BUSY_TIMEOUT_MS, max(0, int(finalize_rem * 1000)))
-        unnotified = None
-        finalize_error = None
-        try:
-            with _check_db(db_path, busy_timeout_ms=finalize_busy_ms) as connection:
-                connection.execute('BEGIN IMMEDIATE')
-                unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
-                connection.execute(
-                    'UPDATE check_ticks SET finished_at=?, status=?, wake_failed=?, unnotified_tasks=?, checks_deferred=? WHERE id=?',
-                    (finished_iso, tick_status, len(all_failed), unnotified, checks_deferred, tick_id),
-                )
-        except sqlite3.Error as db_error:
-            print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
-            tick_status = 'failed'
-            tick_exit_code = 1
-            finalize_error = str(db_error)
-
-        if end_wake_skipped_by_budget and (unnotified is None or unnotified > 0):
-            any_wake_truncated = True
-
-        if all_failed or any_wake_truncated:
-            print(
-                f'warning: check tick wake issue (wake_failed={len(all_failed)}, truncated={any_wake_truncated}, unnotified={unnotified})',
-                file=sys.stderr,
-            )
-
-        result_body = {
-            'tick_id': tick_id, 'status': tick_status, 'started_at': tick_started_iso,
-            'finished_at': finished_iso, 'wake_failed': len(all_failed),
-            'unnotified_tasks': unnotified, 'checks_deferred': checks_deferred,
-        }
-        if finalize_error is not None:
-            result_body['error'] = finalize_error
-        return result_body, tick_exit_code
+        return _finalize_tick(
+            tick_status, tick_exit_code, checks_deferred,
+            end_wake_skipped=end_wake_skipped_by_budget,
+        )
     finally:
         with suppress(OSError):
             os.close(lock_fd)

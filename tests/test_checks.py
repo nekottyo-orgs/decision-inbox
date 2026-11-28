@@ -2874,6 +2874,178 @@ sys.exit(2)
         ct_ok = self.query_one('SELECT needs_wake, notified_at, last_wake_attempt_at FROM check_tasks')
         self.assertEqual((ct_ok['needs_wake'], ct_ok['notified_at'], ct_ok['last_wake_attempt_at']), (1, None, None))
 
+    def test_start_wake_db_contention_finalizes_failed_tick_instead_of_raising(self):
+        import threading
+
+        self.commit_config(
+            '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        # DB を初期化しておく
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+
+        def start_writer_lock():
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def _worker():
+                conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    acquired.set()
+                    release.wait(timeout=5.0)
+                finally:
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.execute('ROLLBACK')
+                    conn.close()
+
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+            self.assertTrue(acquired.wait(timeout=3.0))
+            return thread, release
+
+        # (a) start wake 回収/候補取得が DB 競合で失敗した後、finalization 前に writer が解放される場合:
+        #     例外送出せず status='failed' へ最終更新し、running 行を残さないこと
+        orig_wake = run_wake_pass
+        config_called = []
+        holder_a = []
+
+        def cleanup_a():
+            for t, rel in holder_a:
+                rel.set()
+                t.join(timeout=3.0)
+
+        self.addCleanup(cleanup_a)
+
+        def locked_start_wake(*args, **kwargs):
+            t, rel = start_writer_lock()
+            holder_a.append((t, rel))
+            try:
+                return orig_wake(*args, **kwargs)
+            finally:
+                rel.set()
+                t.join(timeout=3.0)
+
+        err_a = io.StringIO()
+        with mock.patch('app.run_wake_pass', side_effect=locked_start_wake), \
+                mock.patch('app.load_and_validate_checks_config', side_effect=lambda *a, **kw: config_called.append(True)), \
+                contextlib.redirect_stderr(err_a):
+            body_a, rc_a = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000100.0,
+                tick_budget=10.0,
+                wake_pass_budget=0.15,
+                commit_busy_timeout_ms=60,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc_a, body_a['status']), (1, 'failed'))
+        self.assertIsNone(body_a['checks_deferred'])
+        self.assertIn('error', body_a)
+        self.assertEqual(config_called, [], 'config validation must not run after start-wake DB failure')
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        row_a = self.query_one('SELECT status, finished_at, checks_deferred, wake_failed FROM check_ticks WHERE id=?', (body_a['tick_id'],))
+        self.assertEqual(row_a['status'], 'failed')
+        self.assertIsNotNone(row_a['finished_at'])
+        self.assertIsNone(row_a['checks_deferred'])
+        self.assertEqual(row_a['wake_failed'], 0)
+        self.assertIn('failed during start wake pass', err_a.getvalue())
+
+        # (b) start wake 中に 1 件配送失敗した直後の bookkeeping が DB 競合で失敗した場合:
+        #     wake_failed=1 を失わずに status='failed' へ最終更新すること
+        now_iso = datetime.fromtimestamp(1700000150.0, timezone.utc).isoformat(timespec='microseconds')
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute(
+                "INSERT INTO tasks(id, title, request, pane, run, result, remaining, lane, decision_id, created_at, updated_at, machine, kind, done_when) "
+                "VALUES('t_sw_fail', 'title', 'body', '', '', '', '', 'todo', NULL, ?, ?, '', 'monitor', 'done')",
+                (now_iso, now_iso),
+            )
+            conn.execute(
+                "INSERT INTO check_tasks(task_id, check_name, kind, dedup_key, skill, needs_wake, notified_at, last_wake_attempt_at, created_at) "
+                "VALUES('t_sw_fail', 'c1', 'event', 'k_sw', 's1', 1, NULL, NULL, ?)",
+                (now_iso,),
+            )
+
+        holder_b = []
+
+        def cleanup_b():
+            for t, rel in holder_b:
+                rel.set()
+                t.join(timeout=3.0)
+
+        self.addCleanup(cleanup_b)
+
+        def fail_deliver_then_lock(cand, _timeout):
+            t, rel = start_writer_lock()
+            holder_b.append((t, rel))
+            return False
+
+        def release_after_start_wake(*args, **kwargs):
+            try:
+                return orig_wake(*args, **kwargs)
+            finally:
+                cleanup_b()
+
+        err_b = io.StringIO()
+        with mock.patch('app.run_wake_pass', side_effect=release_after_start_wake), \
+                contextlib.redirect_stderr(err_b):
+            body_b, rc_b = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000200.0,
+                tick_budget=10.0,
+                wake_pass_budget=0.20,
+                wake_item_timeout=0.05,
+                commit_busy_timeout_ms=60,
+                deliver_fn=fail_deliver_then_lock,
+            )
+        self.assertEqual((rc_b, body_b['status']), (1, 'failed'))
+        self.assertEqual(body_b['wake_failed'], 1)
+        self.assertEqual(body_b['unnotified_tasks'], 1)
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        row_b = self.query_one('SELECT status, wake_failed, unnotified_tasks FROM check_ticks WHERE id=?', (body_b['tick_id'],))
+        self.assertEqual((row_b['status'], row_b['wake_failed'], row_b['unnotified_tasks']), ('failed', 1, 1))
+
+        # (c) finalization までずっと DB ロックが続く場合でも例外で落ちず (result_body, 1) を返すこと
+        holder_c = []
+
+        def cleanup_c():
+            for t, rel in holder_c:
+                rel.set()
+                t.join(timeout=3.0)
+
+        self.addCleanup(cleanup_c)
+        anchor_c = [None]
+
+        def mono_c():
+            if anchor_c[0] is None:
+                return 0.0
+            return time.monotonic() - anchor_c[0]
+
+        def lock_through_finalize(*args, **kwargs):
+            t, rel = start_writer_lock()
+            holder_c.append((t, rel))
+            anchor_c[0] = time.monotonic()
+            return orig_wake(*args, **kwargs)
+
+        err_c = io.StringIO()
+        try:
+            with mock.patch('app.run_wake_pass', side_effect=lock_through_finalize), \
+                    contextlib.redirect_stderr(err_c):
+                body_c, rc_c = run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000300.0,
+                    mono_fn=mono_c,
+                    tick_budget=0.25,
+                    wake_pass_budget=0.10,
+                    commit_busy_timeout_ms=60,
+                    deliver_fn=lambda c, t: True,
+                )
+        finally:
+            cleanup_c()
+        self.assertEqual((rc_c, body_c['status']), (1, 'failed'))
+        self.assertIsNone(body_c['unnotified_tasks'])
+        self.assertIn('error', body_c)
+        self.assertIn('failed to finalize check tick', err_c.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
