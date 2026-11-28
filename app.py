@@ -1886,17 +1886,6 @@ class CheckConfigError(Exception):
     """checkout 検査または checks.toml の検証失敗。tick 全体を config_error として止める。"""
 
 
-def _check_env_float(name, default):
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return value if math.isfinite(value) and value >= 0 else default
-
-
 def _parse_check_now_env():
     """テスト用の現在時刻注入 (CUE_CHECK_NOW: epoch 秒または timezone 付き ISO 8601)。"""
     raw = os.environ.get('CUE_CHECK_NOW')
@@ -1943,9 +1932,14 @@ def _excerpt_4k(raw):
     return text_out
 
 
+def _resolve_check_db_path(db_path):
+    """DB パスの symlink を解決した実体パスを返す。"""
+    return Path(db_path).expanduser().resolve()
+
+
 def check_lock_path(db_path):
     """DB と同じ永続ディレクトリに置く固定パスの flock 用 lockfile。終了時に unlink しない。"""
-    target = Path(db_path).expanduser().absolute()
+    target = _resolve_check_db_path(db_path)
     return target.parent / (target.name + '.check.lock')
 
 
@@ -1960,7 +1954,8 @@ def default_run_inbox_bin():
 @contextmanager
 def _check_db(db_path, *, busy_timeout_ms=5000):
     """check runner 用の DB 接続。WAL 切替や DDL は行わない (flock 取得後の初期化のみが行う)。"""
-    connection = sqlite3.connect(str(db_path), timeout=busy_timeout_ms / 1000.0)
+    resolved = _resolve_check_db_path(db_path)
+    connection = sqlite3.connect(str(resolved), timeout=busy_timeout_ms / 1000.0)
     connection.row_factory = sqlite3.Row
     connection.execute(f'PRAGMA busy_timeout={int(busy_timeout_ms)}')
     try:
@@ -1972,8 +1967,9 @@ def _check_db(db_path, *, busy_timeout_ms=5000):
 
 def ensure_check_schema(db_path):
     """flock 取得後の (1)〜(2) の間でのみ呼ぶ。WAL 切替と additive テーブル作成を行う (user_version は 2 のまま)。"""
-    Store(db_path)
-    connection = sqlite3.connect(str(db_path), timeout=5.0)
+    resolved = _resolve_check_db_path(db_path)
+    Store(resolved)
+    connection = sqlite3.connect(str(resolved), timeout=5.0)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute('PRAGMA busy_timeout=5000')
@@ -2045,13 +2041,14 @@ def ensure_check_schema(db_path):
 
 def _record_skipped_tick(db_path, started_iso):
     """ロック不取得時の最小 skip 記録。DDL・WAL 切替は行わず、競合で書けない場合は stderr に残して終了する。"""
-    if not Path(db_path).exists():
+    resolved = _resolve_check_db_path(db_path)
+    if not resolved.exists():
         print('warning: check tick skipped (lock held, DB not initialized)', file=sys.stderr)
         return None
     connection = None
     try:
         # ブロックし続けないよう短い timeout にする
-        connection = sqlite3.connect(str(db_path), timeout=0.5)
+        connection = sqlite3.connect(str(resolved), timeout=0.5)
         connection.execute('PRAGMA busy_timeout=500')
         with connection:
             cursor = connection.execute(
@@ -2068,20 +2065,55 @@ def _record_skipped_tick(db_path, started_iso):
                 connection.close()
 
 
+def _pgid_alive(pgid):
+    """プロセスグループ pgid に残存プロセスがあるか確認する。"""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def _terminate_process_group(process, grace_sec):
-    """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に SIGKILL。"""
+    """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。"""
+    pgid = process.pid
     with suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(process.pid, signal.SIGTERM)
-    if grace_sec > 0:
-        try:
-            process.wait(timeout=grace_sec)
+        os.killpg(pgid, signal.SIGTERM)
+
+    deadline = time.monotonic() + max(0.0, grace_sec)
+    while True:
+        remaining = deadline - time.monotonic()
+        if process.returncode is None:
+            if remaining > 0:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    break
+            else:
+                process.poll()
+                if process.returncode is None:
+                    break
+        # リーダー終了済み (reap 済み)。グループ内の子孫残存を killpg(pgid, 0) で確認する
+        if not _pgid_alive(pgid):
             return
-        except subprocess.TimeoutExpired:
-            pass
-    with suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(process.pid, signal.SIGKILL)
-    with suppress(OSError):
-        process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+
+    if process.returncode is None or _pgid_alive(pgid):
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+    if process.returncode is None:
+        with suppress(OSError):
+            process.wait()
+    kill_wait_deadline = time.monotonic() + 0.5
+    while _pgid_alive(pgid) and time.monotonic() < kill_wait_deadline:
+        time.sleep(0.01)
 
 
 def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace=0.5):
@@ -2092,7 +2124,7 @@ def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         return None, b'', str(error).encode('utf-8', errors='replace'), False
     try:
         out, err = process.communicate(timeout=max(0.01, timeout))
@@ -2202,8 +2234,11 @@ def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_
             raise CheckConfigError(f'check {name!r} の env はテーブルである必要があります')
         env_clean = {}
         for env_key, env_val in env_raw.items():
-            if not isinstance(env_key, str) or not env_key or '\x00' in env_key or not isinstance(env_val, str) or '\x00' in env_val:
-                raise CheckConfigError(f'check {name!r} の env は文字列の組である必要があります')
+            if (
+                not isinstance(env_key, str) or not env_key or '\x00' in env_key or '=' in env_key or _has_surrogate(env_key)
+                or not isinstance(env_val, str) or '\x00' in env_val or _has_surrogate(env_val)
+            ):
+                raise CheckConfigError(f'check {name!r} の env は有効なキーと文字列の組である必要があります')
             env_clean[env_key] = env_val
 
         command_raw = entry.get('command')
@@ -2432,7 +2467,7 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         return None, b'', str(error).encode('utf-8', errors='replace'), False, False
 
     out_box = []
@@ -2768,19 +2803,22 @@ def run_check_tick(
     db_path, config_path, *,
     run_inbox_bin=None, wake_run_id=None,
     now_fn=None, mono_fn=time.monotonic,
-    tick_budget=None, wake_pass_budget=None, wake_item_timeout=None,
-    kill_grace=None, deliver_fn=None,
+    tick_budget=CHECK_TICK_BUDGET_SEC,
+    wake_pass_budget=CHECK_WAKE_PASS_BUDGET_SEC,
+    wake_item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
+    kill_grace=CHECK_KILL_GRACE_SEC,
+    deliver_fn=None,
 ):
     """app.py check tick の本体。設計書 (issue-701-v9) の処理順 (1)〜(9) を厳密に実行する。"""
-    db_path = Path(db_path).expanduser().absolute()
+    db_path = _resolve_check_db_path(db_path)
     if tick_budget is None:
-        tick_budget = _check_env_float('CUE_CHECK_TICK_BUDGET_SEC', CHECK_TICK_BUDGET_SEC)
+        tick_budget = CHECK_TICK_BUDGET_SEC
     if wake_pass_budget is None:
-        wake_pass_budget = _check_env_float('CUE_CHECK_WAKE_BUDGET_SEC', CHECK_WAKE_PASS_BUDGET_SEC)
+        wake_pass_budget = CHECK_WAKE_PASS_BUDGET_SEC
     if wake_item_timeout is None:
-        wake_item_timeout = _check_env_float('CUE_CHECK_WAKE_ITEM_TIMEOUT_SEC', CHECK_WAKE_ITEM_TIMEOUT_SEC)
+        wake_item_timeout = CHECK_WAKE_ITEM_TIMEOUT_SEC
     if kill_grace is None:
-        kill_grace = _check_env_float('CUE_CHECK_KILL_GRACE_SEC', CHECK_KILL_GRACE_SEC)
+        kill_grace = CHECK_KILL_GRACE_SEC
 
     mono_start = mono_fn()
     env_now = _parse_check_now_env() if now_fn is None else None
@@ -2957,7 +2995,7 @@ def run_check_tick(
 @contextmanager
 def _check_readonly_db(db_path):
     """読み取り専用の接続。WAL 切替・DDL・DB 新規作成を行わない。"""
-    target = Path(db_path).expanduser().absolute()
+    target = _resolve_check_db_path(db_path)
     if not target.exists():
         yield None
         return
