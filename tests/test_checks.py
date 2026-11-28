@@ -686,7 +686,7 @@ sys.exit(2)
 
     # --- 6. tick 上限・先頭免除・2 件目以降ガード・aborted / failed_timeout・プロセスグループ終了 ---
 
-    def test_first_check_exemption_aborted_does_not_mutate_check_state(self):
+    def test_first_check_exemption_deadline_miss_fails_tick_without_mutating_check_state(self):
         self.commit_config(
             '[[checks]]\nname = "c1"\ninterval = 300\ncommand = "scripts/sleep.sh"\ntimeout = 10\nskill = "s1"\n'
             '[[checks]]\nname = "c2"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
@@ -709,7 +709,8 @@ sys.exit(2)
         before_c1 = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual((before_c1['last_outcome'], before_c1['fault_count']), ('failed_exit', 1))
 
-        # tick_budget = 0.6s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し tick 上限で aborted。c2 は未着手で checks_deferred=1
+        # tick_budget = 0.6s (< c1.timeout=10s) -> 先頭 c1 は免除で着手し tick 上限で aborted。
+        # ただし commit 時点では retry deadline (end_work_deadline) を過ぎているため保存されず tick は failed になる。
         # setup (git / SQLite) の所要時間に依存しないよう、最初の check 起動時から経過時間を計る
         real_origin = [None]
 
@@ -734,15 +735,15 @@ sys.exit(2)
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual(rc1, 0)
-        self.assertEqual(b1['status'], 'aborted')
+        self.assertEqual(rc1, 1)
+        self.assertEqual(b1['status'], 'failed')
         self.assertEqual(b1['checks_deferred'], 1)
 
-        # check_runs に aborted が記録され、checks テーブルの実行状態カラムは一切変わらない!
+        # deadline 後の commit は試行されず aborted run は保存されない。checks の実行状態カラムも一切変わらない!
         after_c1 = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual(after_c1, before_c1)
-        last_run = self.query_one("SELECT outcome FROM check_runs WHERE check_name='c1' ORDER BY id DESC LIMIT 1")
-        self.assertEqual(last_run['outcome'], 'aborted')
+        c1_runs = [r['outcome'] for r in self.query_all("SELECT outcome FROM check_runs WHERE check_name='c1' ORDER BY id")]
+        self.assertEqual(c1_runs, ['failed_exit'])
 
     def test_step6_remaining_zero_aborts_with_zero_runs_and_all_deferred(self):
         self.commit_config(
@@ -798,7 +799,8 @@ sys.exit(2)
             },
         )
         # c1_fast 完了後に c2_guard_skip が着手前ガードで見送り (+1)、
-        # c3_aborted はガード通過後に残り時間が縮んで tick 上限で aborted、
+        # c3_aborted はガード通過後に残り時間が縮んで tick 上限で aborted になるが、
+        # commit 時点で retry deadline を過ぎているため保存されず tick は failed になる。
         # 残りの c4_unstarted / c5_unstarted (+2) と合算されて checks_deferred == 3 になること
         # setup 時間で c1_fast / c3_aborted の前提が崩れないよう、c3_aborted 着手時から時計を進める
         c3_real_origin = [None]
@@ -822,15 +824,15 @@ sys.exit(2)
                 kill_grace=0.1,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual(rc, 0)
-        self.assertEqual(body['status'], 'aborted')
+        self.assertEqual(rc, 1)
+        self.assertEqual(body['status'], 'failed')
         self.assertEqual(body['checks_deferred'], 3)
         runs = [(r['check_name'], r['outcome']) for r in self.query_all('SELECT check_name, outcome FROM check_runs ORDER BY id')]
-        self.assertEqual(runs, [('c1_fast', 'ok_silent'), ('c3_aborted', 'aborted')])
+        self.assertEqual(runs, [('c1_fast', 'ok_silent')])
         tick_row = self.query_one('SELECT status, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT 1')
-        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('aborted', 3))
+        self.assertEqual((tick_row['status'], tick_row['checks_deferred']), ('failed', 3))
 
-    def test_deadline_crossed_after_guard_aborts_without_spawning_check(self):
+    def test_deadline_crossed_after_guard_fails_tick_without_spawning_check(self):
         ran_marker = self.root / 'should_not_run.marker'
         self.commit_config(
             '[[checks]]\nname = "c1"\ninterval = 60\ncommand = "scripts/mark.sh"\ntimeout = 10\nskill = "s1"\n'
@@ -863,13 +865,13 @@ sys.exit(2)
                 deliver_fn=lambda c, t: True,
             )
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(body['status'], 'aborted')
+        self.assertEqual(rc, 1)
+        self.assertEqual(body['status'], 'failed')
         self.assertEqual(body['checks_deferred'], 1)
         self.assertFalse(ran_marker.exists())
         self.assertFalse(any(any('mark.sh' in part for part in cmd) for cmd in spawned_commands))
-        runs = [(r['check_name'], r['outcome'], r['exit_code']) for r in self.query_all('SELECT check_name, outcome, exit_code FROM check_runs')]
-        self.assertEqual(runs, [('c1', 'aborted', None)])
+        # deadline 後の commit は試行されず aborted run も保存されない
+        self.assertEqual(self.query_all('SELECT * FROM check_runs'), [])
         c1_state = self.query_one("SELECT last_started, last_actual_started_at, last_outcome, fault_count FROM checks WHERE name='c1'")
         self.assertEqual(
             (c1_state['last_started'], c1_state['last_actual_started_at'], c1_state['last_outcome'], c1_state['fault_count']),
@@ -1654,7 +1656,8 @@ sys.exit(2)
             time.sleep(0.02)
         self.assertFalse(_pid_alive(helper_pid))
 
-        # (b) tick deadline が支配的 -> aborted として記録され checks 状態も進めない
+        # (b) tick deadline が支配的 -> aborted にはなるが、commit は retry deadline 後なので試行されず
+        # tick は failed になり checks 状態も進めない
         helper_pid_file.unlink()
         self.commit_config(
             '[[checks]]\nname = "holder_ab"\ninterval = 60\ncommand = "scripts/holder.py"\ntimeout = 10\nskill = "s1"\n',
@@ -1680,10 +1683,8 @@ sys.exit(2)
                 kill_grace=0.2,
                 deliver_fn=lambda c, t: True,
             )
-        self.assertEqual((rc2, body2['status']), (0, 'aborted'))
-        run2 = self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_ab'")
-        self.assertEqual(run2['outcome'], 'aborted')
-        self.assertIsNone(run2['exit_code'])
+        self.assertEqual((rc2, body2['status']), (1, 'failed'))
+        self.assertIsNone(self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_ab'"))
         chk2 = self.query_one("SELECT last_started, last_outcome, fault_count FROM checks WHERE name='holder_ab'")
         self.assertEqual((chk2['last_started'], chk2['last_outcome'], chk2['fault_count']), (None, None, 0))
         helper_pid2 = int(helper_pid_file.read_text(encoding='utf-8').strip())
@@ -1965,14 +1966,22 @@ sys.exit(2)
             )
             old_run_id = cur.lastrowid
 
-        # (a) 最後の check が tick 開始 239 秒で完了 (budget=240s, reserve=2s -> end_work_deadline=238s)
+        # (a) 最後の check が tick 開始 237 秒で完了し、commit が 239 秒までかかった
+        # (budget=240s, reserve=2s -> end_work_deadline=238s)。
         # end wake も pruning も新規の 20s 予算を得ずにスキップされ、最終 status 記録だけ完了すること
         clock = FakeClock(wall=base_now, mono=1000.0)
         delivered = []
 
-        def slow_check_advancing_to_239(*args, **kwargs):
+        def slow_check_advancing_to_237(*args, **kwargs):
             res = run_check_command(*args, **kwargs)
-            clock.advance(239.0)
+            # commit は retry deadline (238s) より前に開始させる
+            clock.advance(237.0)
+            return res
+
+        def commit_advancing_to_239(*args, **kwargs):
+            res = commit_check_run(*args, **kwargs)
+            # commit 自体は成功したが、完了が end_work_deadline を過ぎた状況を作る
+            clock.advance(2.0)
             return res
 
         def record_deliver(cand, _timeout):
@@ -1980,7 +1989,9 @@ sys.exit(2)
             return True
 
         err_buf = io.StringIO()
-        with mock.patch('app.run_check_command', side_effect=slow_check_advancing_to_239), contextlib.redirect_stderr(err_buf):
+        with mock.patch('app.run_check_command', side_effect=slow_check_advancing_to_237), \
+                mock.patch('app.commit_check_run', side_effect=commit_advancing_to_239), \
+                contextlib.redirect_stderr(err_buf):
             body, rc = run_check_tick(
                 self.db, self.config,
                 now_fn=clock.now,
@@ -2492,6 +2503,58 @@ sys.exit(2)
         self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
         self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
         self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (res_d['tick_id'],))['status'], 'failed')
+
+    def test_commit_retry_skips_initial_attempt_when_retry_deadline_already_passed(self):
+        # 初回の commit 呼び出し時点で既に retry deadline を過ぎている場合は、
+        # busy_timeout_ms=0 の即時試行すら行わず、保存せずに tick を failed にすること。
+        self.commit_config(
+            '[[checks]]\nname = "onetime"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        # DB だけ先に初期化して、onetime は未実行のままにする
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000500.0, deliver_fn=lambda c, t: True)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+
+        clock = FakeClock(wall=1700000600.0, mono=2000.0)
+        orig_run_cmd = run_check_command
+        orig_commit = commit_check_run
+        commit_calls = []
+
+        def cmd_finishing_after_deadline(*args, **kwargs):
+            res = orig_run_cmd(*args, **kwargs)
+            # tick_budget=10.0, finalize_reserve=2.0 -> end_work_deadline=3008.0。
+            # check 完了時点で deadline を確実に過ぎた状態にする。
+            clock.advance(10.001)
+            return res
+
+        def commit_spy(*args, **kwargs):
+            commit_calls.append(clock.monotonic())
+            return orig_commit(*args, **kwargs)
+
+        err_buf = io.StringIO()
+        with mock.patch('app.run_check_command', side_effect=cmd_finishing_after_deadline), \
+                mock.patch('app.commit_check_run', side_effect=commit_spy), \
+                contextlib.redirect_stderr(err_buf):
+            res, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=clock.now,
+                mono_fn=clock.monotonic,
+                tick_budget=10.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=500,
+                deliver_fn=lambda c, t: True,
+            )
+
+        self.assertEqual((rc, res['status']), (1, 'failed'))
+        self.assertEqual(commit_calls, [], 'must not attempt commit when retry deadline already passed')
+        self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
+        self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
+        self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (res['tick_id'],))['status'], 'failed')
+        self.assertIn('failed to commit check run', err_buf.getvalue())
 
     def test_status_does_not_report_active_running_tick_as_abnormal_exit(self):
         started_flag = self.root / 'active_tick.started'

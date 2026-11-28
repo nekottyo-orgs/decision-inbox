@@ -2902,21 +2902,23 @@ def _commit_check_run_with_retry(
     retry_deadline, mono_fn, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
 ):
     """SQLite の一時的な書き込み競合 (locked / busy) に対し、command を再実行せず残り budget 内で commit を再試行する。
-    rem <= 0 では新たな commit リトライを行わず、各試行の busy timeout は残り時間で clamp する。
-    初回時点で既に rem <= 0 の場合は busy_timeout_ms=0 の即時試行のみ行い、競合時は待たずに失敗させる。"""
+    rem <= 0 では commit を試行しない (初回を含む)。各試行の busy timeout は残り時間で clamp する。
+    初回時点で既に rem <= 0 の場合は commit を呼ばず、期限超過を表す sqlite3.OperationalError を送出する。"""
     retry_mono_start = mono_fn()
     retry_budget = max(0.0, retry_deadline - retry_mono_start)
     retry_real_deadline = time.monotonic() + retry_budget
     last_error = None
-    attempt = 0
     while True:
         mono_rem = retry_deadline - mono_fn()
         real_rem = retry_real_deadline - time.monotonic()
         rem = min(mono_rem, real_rem)
-        if attempt > 0 and rem <= 0:
-            raise last_error
+        if rem <= 0:
+            if last_error is not None:
+                raise last_error
+            raise sqlite3.OperationalError(
+                'commit retry deadline exceeded before the first attempt'
+            )
         attempt_busy_ms = min(max(0, int(busy_timeout_ms)), max(0, int(rem * 1000))) if rem > 0 else 0
-        attempt += 1
         try:
             return commit_check_run(
                 db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
