@@ -471,6 +471,119 @@ theorem fault_detection_at_threshold (chk : String) (threshold : Nat) (hth : 1 �
       have ⟨hfc, _⟩ := streak_before_threshold chk (m + 1) tasks hnoFault s0 h0 m (Nat.lt_succ_self m)
       simp [runFailureStreak, applyOutcome, Outcome.isSuccess, hnoFault, hfc]
 
+/-- 4 段階 tick 予算 (exec → cleanup → commit → finalize)。
+    時刻・時間はすべて単調時計の自然数 (例: ms) で表す。 -/
+structure TickBudget where
+  monoStart : Nat
+  tickBudget : Nat
+  finalizeReserve : Nat
+  commitReserve : Nat
+  cleanupReserve : Nat
+  deriving DecidableEq, Repr
+
+def TickBudget.tickDeadline (b : TickBudget) : Nat :=
+  b.monoStart + b.tickBudget
+
+def TickBudget.effectiveFinalize (b : TickBudget) : Nat :=
+  min b.finalizeReserve b.tickBudget
+
+def TickBudget.endWorkDeadline (b : TickBudget) : Nat :=
+  b.tickDeadline - b.effectiveFinalize
+
+def TickBudget.workBudget (b : TickBudget) : Nat :=
+  b.endWorkDeadline - b.monoStart
+
+def TickBudget.effectiveCommit (b : TickBudget) : Nat :=
+  min b.commitReserve b.workBudget
+
+def TickBudget.commitStartDeadline (b : TickBudget) : Nat :=
+  b.endWorkDeadline - b.effectiveCommit
+
+def TickBudget.preCommitBudget (b : TickBudget) : Nat :=
+  b.commitStartDeadline - b.monoStart
+
+def TickBudget.effectiveCleanup (b : TickBudget) : Nat :=
+  min b.cleanupReserve b.preCommitBudget
+
+def TickBudget.execDeadline (b : TickBudget) : Nat :=
+  b.commitStartDeadline - b.effectiveCleanup
+
+/-- 4 段階の絶対期限は常に単調に並ぶ:
+    monoStart ≤ execDeadline ≤ commitStartDeadline ≤ endWorkDeadline ≤ tickDeadline。 -/
+theorem budget_stages_ordered (b : TickBudget) :
+    b.monoStart ≤ b.execDeadline ∧
+    b.execDeadline ≤ b.commitStartDeadline ∧
+    b.commitStartDeadline ≤ b.endWorkDeadline ∧
+    b.endWorkDeadline ≤ b.tickDeadline := by
+  unfold TickBudget.execDeadline TickBudget.effectiveCleanup TickBudget.preCommitBudget
+    TickBudget.commitStartDeadline TickBudget.effectiveCommit TickBudget.workBudget
+    TickBudget.endWorkDeadline TickBudget.effectiveFinalize TickBudget.tickDeadline
+  omega
+
+/-- 単一フェーズの絶対期限: フェーズ開始時刻 phaseStart に設定時間 configured を足した時刻と
+    絶対上限 absDeadline の小さい方。開始遅延や後から取った時刻サンプルへの加算で absDeadline を超えない。 -/
+def phaseDeadline (phaseStart configured absDeadline : Nat) : Nat :=
+  min (phaseStart + configured) absDeadline
+
+/-- 任意の開始時刻・遅延であっても、フェーズ期限は絶対上限 absDeadline を超えない。 -/
+theorem phaseDeadline_le_abs (phaseStart configured absDeadline : Nat) :
+    phaseDeadline phaseStart configured absDeadline ≤ absDeadline :=
+  Nat.min_le_right _ _
+
+/-- 定時開始 (phaseStart + configured ≤ absDeadline) なら設定どおりの猶予を保つ。 -/
+theorem phaseDeadline_preserves_configured (phaseStart configured absDeadline : Nat)
+    (hOnTime : phaseStart + configured ≤ absDeadline) :
+    phaseDeadline phaseStart configured absDeadline = phaseStart + configured :=
+  Nat.min_eq_left hOnTime
+
+/-- 既に絶対上限に到達・超過している場合、待ち時間 (phaseDeadline - phaseStart) は 0。 -/
+theorem phaseDeadline_zero_wait_when_past (phaseStart configured absDeadline : Nat)
+    (hPast : absDeadline ≤ phaseStart) :
+    phaseDeadline phaseStart configured absDeadline - phaseStart = 0 := by
+  unfold phaseDeadline
+  omega
+
+/-- cleanup の 3 フェーズ (SIGTERM 猶予 → SIGKILL 回収待ち → drain join) に任意の遅延が入っても、
+    各フェーズの絶対期限はいずれも cleanupDeadline (= commitStartDeadline) 以下に収まる。 -/
+theorem cleanup_phases_bounded_under_arbitrary_delays
+    (cleanupStart cleanupDeadline graceCfg killWaitCfg drainCfg dTerm dKill dDrain : Nat) :
+    let termStart := cleanupStart + dTerm
+    let termDl := phaseDeadline termStart graceCfg cleanupDeadline
+    let killStart := termDl + dKill
+    let killDl := phaseDeadline killStart killWaitCfg cleanupDeadline
+    let drainStart := killDl + dDrain
+    let drainDl := phaseDeadline drainStart drainCfg cleanupDeadline
+    termDl ≤ cleanupDeadline ∧ killDl ≤ cleanupDeadline ∧ drainDl ≤ cleanupDeadline :=
+  ⟨phaseDeadline_le_abs _ _ _, phaseDeadline_le_abs _ _ _, phaseDeadline_le_abs _ _ _⟩
+
+/-- cleanup が commitStartDeadline までに完了すれば、commit 予約 (effectiveCommit) の全量が
+    endWorkDeadline まで残る。特に effectiveCommit > 0 なら初回 commit は時間切れにならない。 -/
+theorem commit_window_preserved_when_cleanup_bounded (b : TickBudget) (cleanupDone : Nat)
+    (hDone : cleanupDone ≤ b.commitStartDeadline) :
+    b.effectiveCommit ≤ b.endWorkDeadline - cleanupDone ∧
+    (0 < b.effectiveCommit → cleanupDone < b.endWorkDeadline) := by
+  unfold TickBudget.commitStartDeadline TickBudget.effectiveCommit TickBudget.workBudget
+    TickBudget.endWorkDeadline TickBudget.effectiveFinalize TickBudget.tickDeadline at *
+  omega
+
+/-- mirror 同期の DB busy timeout 上限: endWorkDeadline までの残り作業時間で cap する。 -/
+def cappedMirrorBusy (now endWorkDeadline configuredBusy : Nat) : Nat :=
+  min configuredBusy (endWorkDeadline - now)
+
+/-- 残り作業時間がある (now < endWorkDeadline) とき、mirror の最大待ち完了時刻は endWorkDeadline を超えない。 -/
+theorem mirror_wait_bounded_by_endWorkDeadline (now endWorkDeadline configuredBusy : Nat)
+    (hRem : now < endWorkDeadline) :
+    now + cappedMirrorBusy now endWorkDeadline configuredBusy ≤ endWorkDeadline := by
+  unfold cappedMirrorBusy
+  omega
+
+/-- 残り作業時間が無い (endWorkDeadline ≤ now) とき、mirror の残り予算は 0 で書き込みを開始しない。 -/
+theorem mirror_budget_zero_when_exhausted (now endWorkDeadline configuredBusy : Nat)
+    (hPast : endWorkDeadline ≤ now) :
+    cappedMirrorBusy now endWorkDeadline configuredBusy = 0 := by
+  unfold cappedMirrorBusy
+  omega
+
 -- 具体的なトレース検証 (#guard)
 #guard (do
   let init : CheckState := ⟨none, none, none, 0⟩
@@ -534,6 +647,21 @@ theorem fault_detection_at_threshold (chk : String) (threshold : Nat) (hth : 1 �
   guard ((syncFaultCount "a.sh" "b.sh" true s3).faultCount == 0)
   guard ((syncFaultCount "a.sh" "a.sh" false s3).faultCount == 0)
   guard ((syncFaultCount "a.sh" "a.sh" true s3).faultCount == 2)
+  -- 4 段階 tick 予算 (既定値: 240s / finalize 2s / commit 2s / cleanup 6.5s を ms で表現)
+  let b : TickBudget := ⟨0, 240000, 2000, 2000, 6500⟩
+  guard (b.tickDeadline == 240000)
+  guard (b.endWorkDeadline == 238000)
+  guard (b.commitStartDeadline == 236000)
+  guard (b.execDeadline == 229500)
+  -- 定時開始 (229.5s) では 5s の SIGTERM 猶予をそのまま維持
+  guard (phaseDeadline 229500 5000 b.commitStartDeadline == 234500)
+  -- 開始遅延 (233.5s) でも cleanup 期限 (236s) を超えず commit 予算 [236s, 238s] を保全
+  guard (phaseDeadline 233500 5000 b.commitStartDeadline == 236000)
+  -- 既に cleanup 期限超過 (236.5s) なら追加の待ち時間なし
+  guard (phaseDeadline 236500 5000 b.commitStartDeadline - 236500 == 0)
+  -- mirror 同期の busy timeout は endWorkDeadline (238s) で cap され、超過時は 0
+  guard (cappedMirrorBusy 237000 b.endWorkDeadline 5000 == 1000)
+  guard (cappedMirrorBusy 238500 b.endWorkDeadline 5000 == 0)
   pure true) == some true
 
 end CheckRunner
