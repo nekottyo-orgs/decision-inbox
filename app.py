@@ -1869,6 +1869,7 @@ CHECK_GIT_TIMEOUT_SEC = 5.0
 CHECK_MAX_TIMEOUT_SEC = 180.0
 CHECK_MAX_FAULT_THRESHOLD = (1 << 63) - 1
 CHECK_KILL_GRACE_SEC = 5.0
+CHECK_INTERRUPT_KILL_GRACE_SEC = 0.5
 CHECK_KILL_WAIT_SEC = 1.0
 CHECK_STDOUT_LIMIT = 65536
 CHECK_STDERR_LIMIT = 65536
@@ -2131,7 +2132,7 @@ def _terminate_process_group(process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAI
 
 
 def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace=0.5):
-    """プロセスグループで実行し、タイムアウト時はグループごと確実に終了させる。"""
+    """プロセスグループで実行し、タイムアウトや割り込み時はグループごと確実に終了させる。"""
     try:
         process = subprocess.Popen(
             argv, cwd=cwd, env=env,
@@ -2151,6 +2152,15 @@ def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace
             if process.stderr:
                 process.stderr.close()
         return None, b'', b'timeout', True
+    except BaseException:
+        # KeyboardInterrupt 等で抜ける前にプロセスグループを上限付きで停止・回収する
+        _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
+        with suppress(OSError, ValueError):
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+        raise
 
 
 def _run_git_checked(args, cwd, deadline, mono_fn):
@@ -2463,26 +2473,37 @@ def parse_check_jsonl(raw_stdout):
     return True, events
 
 
-def _drain_pipe(stream, limit, target):
-    chunks = []
+def _drain_pipe(stream, limit, state):
     total = 0
     try:
         while True:
             data = stream.read(4096)
             if not data:
+                state['eof'] = True
                 break
             if total < limit:
                 take = data[:limit - total]
-                chunks.append(take)
+                state['chunks'].append(take)
                 total += len(take)
+    except OSError:
+        state['error'] = True
     finally:
         with suppress(OSError):
             stream.close()
-    target.append(b''.join(chunks))
 
 
 def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC):
-    """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。"""
+    """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。
+
+    Policy:
+    - wait_until = min(cmd_mono_start + timeout, tick_deadline) をプロセス終了と stdout/stderr の EOF 回収の両方に適用する。
+    - wait_until 以降に観測された正常終了 (wait_budget == 0.0 で既に終了していた子を TimeoutExpired なしで回収した場合を含む) は
+      TimeoutExpired と同一の deadline miss として分類し (command timeout が支配的なら failed_timeout、そうでなければ aborted)、
+      exit code を捨てる。
+    - helper が stdout/stderr を開いたまま等で EOF 回収が wait_until 内に完了しない場合も、不完全な出力を parse せず
+      プロセスグループを終了させ deadline miss (または失敗) として記録する。
+    - KeyboardInterrupt 等の割り込み時は、tick lock 解放前にプロセスグループを上限付きで終了・回収してから再送出する。
+    """
     cmd_env = {**os.environ, **chk['env']}
     cmd_mono_start = mono_fn()
     if cmd_mono_start >= tick_deadline:
@@ -2501,33 +2522,71 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     except (OSError, ValueError) as error:
         return None, b'', str(error).encode('utf-8', errors='replace'), False, False
 
-    out_box = []
-    err_box = []
-    out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_box), daemon=True)
-    err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_box), daemon=True)
+    out_state = {'chunks': [], 'eof': False, 'error': False}
+    err_state = {'chunks': [], 'eof': False, 'error': False}
+    out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_state), daemon=True)
+    err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_state), daemon=True)
     out_thread.start()
     err_thread.start()
 
+    wait_until = min(timeout_at, tick_deadline)
+
+    def _classify_deadline_miss(observed_mono):
+        # 優先順位: failed_timeout > aborted。経過時間が timeout に達していれば tick 上限と同時でも failed_timeout
+        if (observed_mono - cmd_mono_start) >= chk['timeout'] or timeout_at <= tick_deadline:
+            return True, False
+        return False, True
+
     timed_out = False
     aborted = False
-    wait_until = min(timeout_at, tick_deadline)
-    wait_budget = max(0.0, wait_until - mono_fn())
+    capture_incomplete = False
     try:
-        process.wait(timeout=wait_budget)
-    except subprocess.TimeoutExpired:
-        now_m = mono_fn()
-        # 優先順位: failed_timeout > aborted。経過時間が timeout に達していれば同時でも failed_timeout
-        if (now_m - cmd_mono_start) >= chk['timeout'] or timeout_at <= tick_deadline:
-            timed_out = True
+        wait_budget = max(0.0, wait_until - mono_fn())
+        try:
+            process.wait(timeout=wait_budget)
+        except subprocess.TimeoutExpired:
+            timed_out, aborted = _classify_deadline_miss(mono_fn())
+            _terminate_process_group(process, kill_grace)
         else:
-            aborted = True
-        _terminate_process_group(process, kill_grace)
+            now_m = mono_fn()
+            if now_m >= wait_until:
+                # wait_until 以降に観測された完了は TimeoutExpired と同じく deadline miss とし exit code を捨てる
+                timed_out, aborted = _classify_deadline_miss(now_m)
+                _terminate_process_group(process, kill_grace)
+            else:
+                # stdout / stderr の EOF 回収にも同じ wait_until を適用する
+                for thread in (out_thread, err_thread):
+                    pipe_rem = max(0.0, wait_until - mono_fn())
+                    thread.join(timeout=pipe_rem)
+                    if thread.is_alive():
+                        break
+                now_m = mono_fn()
+                if out_thread.is_alive() or err_thread.is_alive():
+                    # pipe が deadline までに EOF へ到達しなかった: グループを停止し不完全出力を parse させない
+                    timed_out, aborted = _classify_deadline_miss(max(now_m, wait_until))
+                    _terminate_process_group(process, kill_grace)
+                elif not out_state['eof'] or not err_state['eof']:
+                    # EOF に到達しない読み取り異常: 空出力を ok_silent と誤認させない
+                    capture_incomplete = True
+                    _terminate_process_group(process, kill_grace)
+                elif now_m >= wait_until:
+                    timed_out, aborted = _classify_deadline_miss(now_m)
+                    _terminate_process_group(process, kill_grace)
 
-    out_thread.join(timeout=2.0)
-    err_thread.join(timeout=2.0)
-    raw_stdout = out_box[0] if out_box else b''
-    raw_stderr = err_box[0] if err_box else b''
-    exit_code = None if (timed_out or aborted) else process.returncode
+        # グループ停止後の drain thread 終了を短く上限付きで待ち、抜粋を可能な限り回収する
+        for thread in (out_thread, err_thread):
+            if thread.is_alive():
+                thread.join(timeout=0.5)
+    except BaseException:
+        _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
+        for thread in (out_thread, err_thread):
+            if thread.is_alive():
+                thread.join(timeout=0.5)
+        raise
+
+    raw_stdout = b''.join(list(out_state['chunks']))
+    raw_stderr = b''.join(list(err_state['chunks']))
+    exit_code = None if (timed_out or aborted or capture_incomplete) else process.returncode
     return exit_code, raw_stdout, raw_stderr, timed_out, aborted
 
 

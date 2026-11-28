@@ -19,12 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import (
     CHECK_FAULT_SKILL,
     Store,
+    _run_subprocess_bounded,
     _terminate_process_group,
     check_due_info,
     check_grace_seconds,
     check_list_data,
     check_lock_path,
     check_status_data,
+    commit_check_run,
     parse_check_jsonl,
     run_check_command,
     run_check_tick,
@@ -1500,6 +1502,226 @@ sys.exit(2)
         self.assertEqual(res4.returncode, 0, res4.stderr)
         self.assertEqual(self.query_one("SELECT fault_count FROM checks WHERE name='ambig'")['fault_count'], 1)
         self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE kind='fault'"), [])
+
+    def test_helper_holding_stdout_open_is_not_recorded_as_ok_silent(self):
+        helper_pid_file = self.root / 'stdout_holder.pid'
+        self.addCleanup(_cleanup_pid_file, helper_pid_file)
+        script = (
+            '#!/usr/bin/env python3\n'
+            'import json, subprocess, sys\n'
+            'print(json.dumps({"key": "k1", "title": "important event", "body": "do not drop"}), flush=True)\n'
+            'helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+            f'open({str(helper_pid_file)!r}, "w", encoding="utf-8").write(str(helper.pid))\n'
+            'sys.exit(0)\n'
+        )
+        # (a) command timeout が支配的 -> failed_timeout として記録され ok_silent にならない
+        self.commit_config(
+            '[[checks]]\nname = "holder_to"\ninterval = 60\ncommand = "scripts/holder.py"\ntimeout = 0.4\nskill = "s1"\n',
+            {'scripts/holder.py': script},
+        )
+        body, rc = run_check_tick(
+            self.db, self.config,
+            now_fn=lambda: 1700000000.0,
+            kill_grace=0.2,
+            deliver_fn=lambda c, t: True,
+        )
+        self.assertEqual((rc, body['status']), (0, 'ok'))
+        run = self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_to'")
+        self.assertEqual(run['outcome'], 'failed_timeout')
+        self.assertIsNone(run['exit_code'])
+        self.assertEqual(self.query_all('SELECT * FROM tasks'), [])
+        chk_row = self.query_one("SELECT last_outcome, fault_count FROM checks WHERE name='holder_to'")
+        self.assertEqual((chk_row['last_outcome'], chk_row['fault_count']), ('failed_timeout', 1))
+        helper_pid = int(helper_pid_file.read_text(encoding='utf-8').strip())
+        deadline = time.monotonic() + 2.0
+        while _pid_alive(helper_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(_pid_alive(helper_pid))
+
+        # (b) tick deadline が支配的 -> aborted として記録され checks 状態も進めない
+        helper_pid_file.unlink()
+        self.commit_config(
+            '[[checks]]\nname = "holder_ab"\ninterval = 60\ncommand = "scripts/holder.py"\ntimeout = 10\nskill = "s1"\n',
+        )
+        real_origin = [None]
+
+        def mono_fn():
+            if real_origin[0] is None:
+                return 0.0
+            return time.monotonic() - real_origin[0]
+
+        def start_on_check(*args, **kwargs):
+            if real_origin[0] is None:
+                real_origin[0] = time.monotonic()
+            return run_check_command(*args, **kwargs)
+
+        with mock.patch('app.run_check_command', side_effect=start_on_check):
+            body2, rc2 = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000200.0,
+                mono_fn=mono_fn,
+                tick_budget=0.4,
+                kill_grace=0.2,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc2, body2['status']), (0, 'aborted'))
+        run2 = self.query_one("SELECT outcome, exit_code FROM check_runs WHERE check_name='holder_ab'")
+        self.assertEqual(run2['outcome'], 'aborted')
+        self.assertIsNone(run2['exit_code'])
+        chk2 = self.query_one("SELECT last_started, last_outcome, fault_count FROM checks WHERE name='holder_ab'")
+        self.assertEqual((chk2['last_started'], chk2['last_outcome'], chk2['fault_count']), (None, None, 0))
+        helper_pid2 = int(helper_pid_file.read_text(encoding='utf-8').strip())
+        deadline2 = time.monotonic() + 2.0
+        while _pid_alive(helper_pid2) and time.monotonic() < deadline2:
+            time.sleep(0.02)
+        self.assertFalse(_pid_alive(helper_pid2))
+
+    def test_keyboard_interrupt_terminates_subprocess_groups_before_lock_release(self):
+        # (a) run_check_command / run_check_tick 中の KeyboardInterrupt で子グループを止めてから lock 解放
+        child_pid_file = self.root / 'int_check_child.pid'
+        self.addCleanup(_cleanup_pid_file, child_pid_file)
+        script = (
+            '#!/usr/bin/env python3\n'
+            'import subprocess, sys, time\n'
+            'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+            f'open({str(child_pid_file)!r}, "w", encoding="utf-8").write(str(child.pid))\n'
+            'time.sleep(60)\n'
+        )
+        self.commit_config(
+            '[[checks]]\nname = "int_chk"\ninterval = 60\ncommand = "scripts/int.py"\ntimeout = 30\nskill = "s1"\n',
+            {'scripts/int.py': script},
+        )
+        orig_wait = subprocess.Popen.wait
+        lock_file = check_lock_path(self.db)
+        lock_held_at_interrupt = []
+        interrupted = [False]
+
+        def interrupting_wait(proc_self, *args, **kwargs):
+            # 子が起動して PID を書くまで待ってから Ctrl-C (KeyboardInterrupt) を 1 回だけ発生させる
+            if not interrupted[0] and proc_self.args and any('int.py' in str(a) for a in proc_self.args):
+                interrupted[0] = True
+                deadline = time.monotonic() + 5.0
+                while not child_pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                # 割り込み発生時点では tick lock が保持されていること
+                fd = os.open(lock_file, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_held_at_interrupt.append(False)
+                    except OSError:
+                        lock_held_at_interrupt.append(True)
+                finally:
+                    os.close(fd)
+                raise KeyboardInterrupt()
+            return orig_wait(proc_self, *args, **kwargs)
+
+        with mock.patch.object(subprocess.Popen, 'wait', interrupting_wait):
+            with self.assertRaises(KeyboardInterrupt):
+                run_check_tick(
+                    self.db, self.config,
+                    now_fn=lambda: 1700000000.0,
+                    kill_grace=0.2,
+                    deliver_fn=lambda c, t: True,
+                )
+        self.assertEqual(lock_held_at_interrupt, [True])
+        child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
+        deadline = time.monotonic() + 2.0
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(_pid_alive(child_pid))
+        # tick 終了後に lock が解放されていること
+        fd = os.open(lock_file, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+        # (b) _run_subprocess_bounded (git / wake 用) でも KeyboardInterrupt で子グループを止めて再送出
+        bounded_pid_file = self.root / 'int_bounded_child.pid'
+        self.addCleanup(_cleanup_pid_file, bounded_pid_file)
+        bounded_script = self.root / 'bounded_sleep.py'
+        _write_exec(
+            bounded_script,
+            '#!/usr/bin/env python3\n'
+            'import subprocess, sys, time\n'
+            'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+            f'open({str(bounded_pid_file)!r}, "w", encoding="utf-8").write(str(child.pid))\n'
+            'time.sleep(60)\n',
+        )
+        orig_communicate = subprocess.Popen.communicate
+
+        def interrupting_communicate(proc_self, *args, **kwargs):
+            if proc_self.args and any('bounded_sleep.py' in str(a) for a in proc_self.args):
+                deadline = time.monotonic() + 5.0
+                while not bounded_pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                raise KeyboardInterrupt()
+            return orig_communicate(proc_self, *args, **kwargs)
+
+        with mock.patch.object(subprocess.Popen, 'communicate', interrupting_communicate):
+            with self.assertRaises(KeyboardInterrupt):
+                _run_subprocess_bounded([str(bounded_script)], timeout=30.0, kill_grace=0.2)
+        b_pid = int(bounded_pid_file.read_text(encoding='utf-8').strip())
+        deadline = time.monotonic() + 2.0
+        while _pid_alive(b_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(_pid_alive(b_pid))
+
+    def test_normal_exit_observed_after_wait_until_classified_as_deadline_miss(self):
+        done_marker = self.root / 'fast_done.flag'
+        script_path = self.repo / 'scripts/fast_emit.py'
+        _write_exec(
+            script_path,
+            '#!/usr/bin/env python3\n'
+            'import json\n'
+            'print(json.dumps({"key": "k1", "title": "late event", "body": "b"}), flush=True)\n'
+            f'open({str(done_marker)!r}, "w", encoding="utf-8").write("done")\n',
+        )
+
+        # wait_budget == 0.0 で process.wait() が既に終了した子を TimeoutExpired なしで回収する状況を再現
+        def run_case(timeout_sec, tick_deadline_offset):
+            if done_marker.exists():
+                done_marker.unlink()
+            calls = {'n': 0}
+
+            def mono_fn():
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    return 1000.0  # cmd_mono_start
+                if calls['n'] == 2:
+                    # Popen 後・process.wait() 直前: 子プロセスが完全に終了するまで待ってから wait_until を跨ぐ
+                    dl = time.monotonic() + 5.0
+                    while not done_marker.exists() and time.monotonic() < dl:
+                        time.sleep(0.01)
+                    time.sleep(0.05)
+                return 1000.0 + min(timeout_sec, tick_deadline_offset) + 0.5
+
+            wait_raised_timeout = []
+            orig_wait = subprocess.Popen.wait
+
+            def spy_wait(proc_self, *args, **kwargs):
+                try:
+                    return orig_wait(proc_self, *args, **kwargs)
+                except subprocess.TimeoutExpired:
+                    wait_raised_timeout.append(True)
+                    raise
+
+            chk = {'name': 'late', 'argv': [str(script_path)], 'timeout': timeout_sec, 'env': {}, 'clock_anomaly': False, 'skill': 's1', 'fault_threshold': 3}
+            with mock.patch.object(subprocess.Popen, 'wait', spy_wait):
+                res = run_check_command(chk, self.repo, 1000.0 + tick_deadline_offset, mono_fn=mono_fn, kill_grace=0.1)
+            self.assertEqual(wait_raised_timeout, [], 'test must exercise normal return from process.wait(timeout=0)')
+            return res
+
+        # (a) tick deadline が支配的 (timeout=10, tick_deadline=+5) -> aborted & exit_code=None
+        ec_a, _out_a, _err_a, to_a, ab_a = run_case(10.0, 5.0)
+        self.assertIsNone(ec_a)
+        self.assertEqual((to_a, ab_a), (False, True))
+
+        # (b) command timeout が支配的 (timeout=5, tick_deadline=+10) -> failed_timeout & exit_code=None
+        ec_b, _out_b, _err_b, to_b, ab_b = run_case(5.0, 10.0)
+        self.assertIsNone(ec_b)
+        self.assertEqual((to_b, ab_b), (True, False))
 
 
 if __name__ == '__main__':
