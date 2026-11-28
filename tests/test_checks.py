@@ -2647,6 +2647,75 @@ sys.exit(2)
         self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
         self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (res_d['tick_id'],))['status'], 'failed')
 
+        # (e) 決定的な backoff 後 deadline チェック:
+        #     初回 busy エラー後に残り時間 (>= 1ms) を残して確実に backoff sleep に入り、
+        #     backoff 中に注入時計が deadline へ到達したときは 2 回目の commit を開始しないこと
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+        if invocations_file.exists():
+            invocations_file.unlink()
+
+        clock_e = FakeClock(wall=1700000450.0, mono=1000.0)
+        commit_calls_e = []
+        sleep_calls_e = []
+        in_commit_retry_e = [False]
+        orig_sleep = time.sleep
+
+        def cmd_leaving_100ms_e(*args, **kwargs):
+            res = orig_run_cmd(*args, **kwargs)
+            # tick_budget=10.0, finalize_reserve=2.0 -> end_work_deadline=1008.0。残り 100ms にする
+            clock_e.advance(7.90)
+            return res
+
+        def commit_busy_once_then_would_succeed(*args, **kwargs):
+            commit_calls_e.append((clock_e.monotonic(), kwargs.get('busy_timeout_ms')))
+            if len(commit_calls_e) == 1:
+                # 20ms 消費して残り 80ms (> 1ms) のまま busy エラー -> 確実に backoff へ入る
+                clock_e.advance(0.02)
+                raise sqlite3.OperationalError('database is locked')
+            return orig_commit(*args, **kwargs)
+
+        def track_commit_retry_e(*args, **kwargs):
+            in_commit_retry_e[0] = True
+            try:
+                return orig_commit_retry(*args, **kwargs)
+            finally:
+                in_commit_retry_e[0] = False
+
+        def advance_to_deadline_during_backoff(sec):
+            if in_commit_retry_e[0]:
+                sleep_calls_e.append(sec)
+                # backoff 中に end_work_deadline (1008.0) へ到達させる
+                clock_e.advance(max(0.0, 1008.0 - clock_e.monotonic()))
+                return
+            orig_sleep(sec)
+
+        err_buf_e = io.StringIO()
+        with mock.patch('app.run_check_command', side_effect=cmd_leaving_100ms_e), \
+                mock.patch('app._commit_check_run_with_retry', side_effect=track_commit_retry_e), \
+                mock.patch('app.commit_check_run', side_effect=commit_busy_once_then_would_succeed), \
+                mock.patch('app.time.sleep', side_effect=advance_to_deadline_during_backoff), \
+                contextlib.redirect_stderr(err_buf_e):
+            res_e, rc_e = run_check_tick(
+                self.db, self.config,
+                now_fn=clock_e.now,
+                mono_fn=clock_e.monotonic,
+                tick_budget=10.0,
+                finalize_reserve=2.0,
+                commit_busy_timeout_ms=500,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual((rc_e, res_e['status']), (1, 'failed'))
+        self.assertEqual(len(sleep_calls_e), 1, 'first busy error must enter backoff sleep before deadline')
+        self.assertAlmostEqual(sleep_calls_e[0], 0.04, places=3)
+        self.assertEqual(len(commit_calls_e), 1, 'must not start a second commit after backoff reaches deadline')
+        self.assertEqual(self.query_all("SELECT * FROM check_runs WHERE check_name='onetime'"), [])
+        self.assertEqual(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'"), [])
+        self.assertEqual(self.query_one('SELECT status FROM check_ticks WHERE id=?', (res_e['tick_id'],))['status'], 'failed')
+
     def test_commit_retry_skips_initial_attempt_when_retry_deadline_already_passed(self):
         # 初回の commit 呼び出し時点で既に retry deadline を過ぎている場合は、
         # busy_timeout_ms=0 の即時試行すら行わず、保存せずに tick を failed にすること。
@@ -2899,8 +2968,13 @@ sys.exit(2)
 
             orig_wake = run_wake_pass
             wake_calls = [0]
+            deliver_calls = [0]
+            # 回収・候補取得やスケジューリング遅延で初回配送ガード前に 150ms 予算を使い切らないよう、
+            # スケジューリング時計は固定し、配送後の bookkeeping DB 競合は run_wake_pass の実時間上限で打ち切る。
+            clock = FakeClock(wall=tick_now, mono=1000.0)
 
             def deliver_then_lock_bookkeeping(cand, _timeout):
+                deliver_calls[0] += 1
                 t = threading.Thread(target=hold_writer, daemon=True)
                 holder[0] = t
                 t.start()
@@ -2922,7 +2996,8 @@ sys.exit(2)
                         contextlib.redirect_stderr(err_buf):
                     body, rc = run_check_tick(
                         self.db, self.config,
-                        now_fn=lambda: tick_now,
+                        now_fn=clock.now,
+                        mono_fn=clock.monotonic,
                         tick_budget=20.0,
                         wake_pass_budget=0.15,
                         wake_item_timeout=0.05,
@@ -2930,6 +3005,7 @@ sys.exit(2)
                     )
             finally:
                 cleanup()
+            self.assertEqual(deliver_calls[0], 1, 'delivery callback must run exactly once')
             return body, rc, err_buf.getvalue()
 
         # (a) 配送失敗 + bookkeeping DB 競合 -> wake_failed=1 として保存されタスクは未通知のまま残る
