@@ -50,7 +50,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 `Store.reconcile_lane` は `BEGIN IMMEDIATE` で SQLite の書き込みを直列化し、比較条件を `UPDATE` の `WHERE` に入れる。同値の確認も同じ transaction 内で行い、実装では `updated_at` を進めず既存の行を返す。実装テストでは 6 項目それぞれの不一致、空文字の比較、同じ行を観測した 2 つの CLI の競合を検査する。モデルの範囲は Cue 内の 1 行。Herdr の pane 起動・終了と一体の操作にはならない。
 
-完了を照合した caller は remaining・decision_id・updated_at を同時に指定できる。Lean の revision は task の更新時刻に対応し、`decisionSettled` は紐付いた判断が完了済みか取り下げ済みであることを表す。変更前の照合値や未処理の判断で done に移せないことを検査する。実装では同じ `UPDATE` で判断の現在の状態も検査する。PR と pane の状態の確認は caller が行う。
+完了を照合した caller は remaining・decision_id・updated_at を同時に指定できる。Lean の revision は task の更新時刻に対応し、`decisionSettled` は紐付いた判断が完了済みか取り下げ済みであることを表す。変更前の照合値や未処理の判断で done に移せないことを検査する。実装は task を更新するたびに同じ行の更新時刻を進め、lane を書く `UPDATE` で判断の現在の状態も検査する。PR と pane の状態の確認は caller が行う。
 
 ## 判断の一覧と詳細の読み取り
 

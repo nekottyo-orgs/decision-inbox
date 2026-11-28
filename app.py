@@ -59,6 +59,13 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 
+def timestamp_after(previous):
+    current = utc_now()
+    if current <= previous:
+        return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
+    return current
+
+
 JSON_TYPES = {str: 'string', list: 'array', dict: 'object', bool: 'boolean', int: 'number', float: 'number', type(None): 'null'}
 
 
@@ -552,11 +559,7 @@ class Store:
 
     def stamp(self, connection, identifier, previous=''):
         latest = connection.execute('SELECT MAX(recorded_at) FROM answer_history WHERE decision_id=?', (identifier,)).fetchone()[0]
-        previous = max(previous, latest or '')
-        current = utc_now()
-        if current <= previous:
-            current = (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
-        return current
+        return timestamp_after(max(previous, latest or ''))
 
     def record(self, connection, row, event):
         connection.execute('INSERT INTO answer_history(decision_id,event,recorded_at,answer) VALUES(?,?,?,?)',
@@ -738,7 +741,8 @@ class Store:
                 after = {**dict(row), **item}
                 check_task_rules(after['kind'], after['done_when'], after['decision_id'])
             columns = ''.join(f'{key}=?,' for key in item)
-            connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?', (*item.values(), utc_now(), identifier))
+            connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?',
+                               (*item.values(), timestamp_after(row['updated_at']), identifier))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def reconcile_lane(self, identifier, lane, machine='', expect=None, *, pane=None, expect_pane=None,
@@ -785,19 +789,19 @@ class Store:
         columns = ','.join(f'{key}=?' for key in assignment)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            if pane is not None:
-                # 再試行では現在の担当を確認し、同じ値なら活動時刻を進めず応答する。
-                row = connection.execute(f'SELECT * FROM tasks WHERE {where}', params).fetchone()
-                if row and all(row[key] == value for key, value in assignment.items()):
-                    return dict(row)
-            if not connection.execute(f'UPDATE tasks SET {columns},updated_at=? WHERE {where}',
-                                      (*assignment.values(), utc_now(), *params)).rowcount:
+            row = connection.execute(f'SELECT * FROM tasks WHERE {where}', params).fetchone()
+            if not row:
                 current = connection.execute('SELECT lane FROM tasks WHERE id=?', (identifier,)).fetchone()
                 if not current:
                     raise AppError(404, 'task が見つかりません')
                 if conditions.keys() == {'lane'}:
                     raise LaneConflict(409, f'lane が違うため書きませんでした (今は {current["lane"]}、--from は {expect})')
                 raise LaneConflict(409, 'task が比較条件と一致しないため書きませんでした')
+            # 再試行で同じ担当を書き込む場合は活動時刻を進めない。
+            if pane is not None and all(row[key] == value for key, value in assignment.items()):
+                return dict(row)
+            connection.execute(f'UPDATE tasks SET {columns},updated_at=? WHERE {where}',
+                               (*assignment.values(), timestamp_after(row['updated_at']), *params))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def delete_task(self, identifier):

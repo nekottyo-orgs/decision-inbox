@@ -419,8 +419,24 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.assertEqual(json.loads(applied.stdout)['lane'], 'done')
 
+    def test_時計が進まなくても_task_の変更前の時刻では完了できない(self):
+        store = Store(self.db)
+        with patch('app.utc_now', return_value='2026-11-29T00:00:00.000000+00:00'):
+            before = store.add_task({**TASK_DEFAULTS, 'id': 't1', 'title': '題', 'remaining': 'なし'})
+            edited = store.update_task('t1', {'result': '新しい調査結果'})
+            moved = store.reconcile_lane('t1', 'worker')
+        self.assertNotEqual(edited['updated_at'], before['updated_at'])
+        self.assertNotEqual(moved['updated_at'], edited['updated_at'])
+        stale = self.cli('reconcile-lane', '--id', 't1', '--lane', 'done', '--from', 'worker',
+                         '--from-remaining', 'なし', '--from-decision-id', '',
+                         '--from-updated-at', before['updated_at'])
+        self.assertEqual(stale.returncode, 3, stale.stderr)
+
     def test_紐付いた判断の現在の状態を見て完了を許可する(self):
         store = Store(self.db)
+        other = store.add(request_payload())
+        store.answer(other['id'], {'choice': 'minimal'})
+        store.complete(other['id'], store.claim('worker')['token'])
         decision = store.add(request_payload())
         answered = store.answer(decision['id'], {'choice': 'minimal'})
         added = self.cli('add', *ADD_KIND, '--id', 't1', '--title', '題', '--remaining', 'なし',
