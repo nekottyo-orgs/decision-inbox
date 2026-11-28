@@ -1710,9 +1710,23 @@ sys.exit(2)
             {'scripts/int.py': script},
         )
         orig_wait = subprocess.Popen.wait
+        orig_terminate = sys.modules['app']._terminate_process_group
         lock_file = check_lock_path(self.db)
         lock_held_at_interrupt = []
+        lock_held_after_cleanup = []
+        child_stopped_at_cleanup = []
         interrupted = [False]
+
+        def _check_lock_held(path):
+            fd = os.open(path, os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return False
+                except OSError:
+                    return True
+            finally:
+                os.close(fd)
 
         def interrupting_wait(proc_self, *args, **kwargs):
             # 子が起動して PID を書くまで待ってから Ctrl-C (KeyboardInterrupt) を 1 回だけ発生させる
@@ -1722,19 +1736,21 @@ sys.exit(2)
                 while not child_pid_file.exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 # 割り込み発生時点では tick lock が保持されていること
-                fd = os.open(lock_file, os.O_RDWR)
-                try:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        lock_held_at_interrupt.append(False)
-                    except OSError:
-                        lock_held_at_interrupt.append(True)
-                finally:
-                    os.close(fd)
+                lock_held_at_interrupt.append(_check_lock_held(lock_file))
                 raise KeyboardInterrupt()
             return orig_wait(proc_self, *args, **kwargs)
 
-        with mock.patch.object(subprocess.Popen, 'wait', interrupting_wait):
+        def spy_terminate_a(proc, *args, **kwargs):
+            try:
+                return orig_terminate(proc, *args, **kwargs)
+            finally:
+                # cleanup 完了直後 (tick へ制御が戻る前) に子孫が停止済みかつ tick lock がまだ保持されていること
+                c_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
+                child_stopped_at_cleanup.append(_pid_stopped(c_pid))
+                lock_held_after_cleanup.append(_check_lock_held(lock_file))
+
+        with mock.patch.object(subprocess.Popen, 'wait', interrupting_wait), \
+                mock.patch('app._terminate_process_group', side_effect=spy_terminate_a):
             with self.assertRaises(KeyboardInterrupt):
                 run_check_tick(
                     self.db, self.config,
@@ -1743,10 +1759,9 @@ sys.exit(2)
                     deliver_fn=lambda c, t: True,
                 )
         self.assertEqual(lock_held_at_interrupt, [True])
+        self.assertEqual(child_stopped_at_cleanup, [True])
+        self.assertEqual(lock_held_after_cleanup, [True])
         child_pid = int(child_pid_file.read_text(encoding='utf-8').strip())
-        deadline = time.monotonic() + 2.0
-        while _pid_alive(child_pid) and time.monotonic() < deadline:
-            time.sleep(0.02)
         self.assertFalse(_pid_alive(child_pid))
         # tick 終了後に lock が解放されていること
         fd = os.open(lock_file, os.O_RDWR)
@@ -1805,6 +1820,8 @@ sys.exit(2)
             )
             drain_calls = [0]
             drain_lock_held = []
+            drain_lock_held_after_cleanup = []
+            drain_child_stopped_at_cleanup = []
 
             def interrupting_thread_start(thread_self, *args, **kwargs):
                 if getattr(thread_self, '_target', None) is sys.modules['app']._drain_pipe:
@@ -1813,19 +1830,20 @@ sys.exit(2)
                         dl = time.monotonic() + 5.0
                         while not drain_pid_file.exists() and time.monotonic() < dl:
                             time.sleep(0.02)
-                        fd = os.open(lock_file, os.O_RDWR)
-                        try:
-                            try:
-                                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                                drain_lock_held.append(False)
-                            except OSError:
-                                drain_lock_held.append(True)
-                        finally:
-                            os.close(fd)
+                        drain_lock_held.append(_check_lock_held(lock_file))
                         raise KeyboardInterrupt()
                 return orig_thread_start(thread_self, *args, **kwargs)
 
-            with mock.patch.object(_threading.Thread, 'start', interrupting_thread_start):
+            def spy_terminate_c(proc, *args, **kwargs):
+                try:
+                    return orig_terminate(proc, *args, **kwargs)
+                finally:
+                    d_pid_now = int(drain_pid_file.read_text(encoding='utf-8').strip())
+                    drain_child_stopped_at_cleanup.append(_pid_stopped(d_pid_now))
+                    drain_lock_held_after_cleanup.append(_check_lock_held(lock_file))
+
+            with mock.patch.object(_threading.Thread, 'start', interrupting_thread_start), \
+                    mock.patch('app._terminate_process_group', side_effect=spy_terminate_c):
                 with self.assertRaises(KeyboardInterrupt):
                     run_check_tick(
                         self.db, self.config,
@@ -1834,10 +1852,9 @@ sys.exit(2)
                         deliver_fn=lambda c, t: True,
                     )
             self.assertEqual(drain_lock_held, [True], f'lock must be held on drain thread #{interrupt_on_call} interrupt')
+            self.assertEqual(drain_child_stopped_at_cleanup, [True], f'grandchild must be stopped before cleanup returns on drain thread #{interrupt_on_call}')
+            self.assertEqual(drain_lock_held_after_cleanup, [True], f'lock must remain held immediately after cleanup on drain thread #{interrupt_on_call}')
             d_pid = int(drain_pid_file.read_text(encoding='utf-8').strip())
-            dl = time.monotonic() + 2.0
-            while _pid_alive(d_pid) and time.monotonic() < dl:
-                time.sleep(0.02)
             self.assertFalse(_pid_alive(d_pid), f'grandchild survived drain thread #{interrupt_on_call} interrupt')
             fd = os.open(lock_file, os.O_RDWR)
             try:
