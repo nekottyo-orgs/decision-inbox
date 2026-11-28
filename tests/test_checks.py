@@ -64,6 +64,7 @@ CHECK_RUNNER_ENV_KEYS = (
     'FAKE_WAKE_SLEEP',
     'FAKE_ACTIVE_RC',
     'FAKE_SEND_RC',
+    'MODE',
 )
 
 
@@ -2690,12 +2691,14 @@ sys.exit(2)
             'CUE_CHECK_NOW': '123',
             'CUE_WAKE_RUN_ID': 'leaked-run',
             'CUE_CHECKS_CONFIG': '/tmp/leaked.toml',
+            'MODE': 'sleep',
         }):
             clean = self._cli_env()
-            for key in ('CUE_CHECK_TICK_BUDGET_SEC', 'CUE_CHECK_NOW', 'CUE_WAKE_RUN_ID', 'CUE_CHECKS_CONFIG'):
+            for key in ('CUE_CHECK_TICK_BUDGET_SEC', 'CUE_CHECK_NOW', 'CUE_WAKE_RUN_ID', 'CUE_CHECKS_CONFIG', 'MODE'):
                 self.assertNotIn(key, clean)
-            overridden = self._cli_env({'CUE_CHECK_NOW': '1700000999'})
+            overridden = self._cli_env({'CUE_CHECK_NOW': '1700000999', 'MODE': 'fail'})
             self.assertEqual(overridden['CUE_CHECK_NOW'], '1700000999')
+            self.assertEqual(overridden['MODE'], 'fail')
             self.assertNotIn('CUE_CHECK_TICK_BUDGET_SEC', overridden)
 
         # 3. 終了済みだが未 reap の zombie プロセスを停止済みとみなせること
