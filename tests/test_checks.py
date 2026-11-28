@@ -1863,49 +1863,57 @@ sys.exit(2)
                 os.close(fd)
 
     def test_normal_exit_observed_after_wait_until_classified_as_deadline_miss(self):
-        done_marker = self.root / 'fast_done.flag'
         script_path = self.repo / 'scripts/fast_emit.py'
         _write_exec(
             script_path,
             '#!/usr/bin/env python3\n'
             'import json\n'
-            'print(json.dumps({"key": "k1", "title": "late event", "body": "b"}), flush=True)\n'
-            f'open({str(done_marker)!r}, "w", encoding="utf-8").write("done")\n',
+            'print(json.dumps({"key": "k1", "title": "late event", "body": "b"}), flush=True)\n',
         )
 
         # wait_budget == 0.0 で process.wait() が既に終了した子を TimeoutExpired なしで回収する状況を再現
         def run_case(timeout_sec, tick_deadline_offset, *, observed_offset=None):
-            if done_marker.exists():
-                done_marker.unlink()
             calls = {'n': 0}
             obs = (min(timeout_sec, tick_deadline_offset) + 0.5) if observed_offset is None else observed_offset
+            launched = []
+            orig_popen = subprocess.Popen
+            orig_wait = subprocess.Popen.wait
+
+            def capture_popen(*args, **kwargs):
+                proc = orig_popen(*args, **kwargs)
+                launched.append(proc)
+                return proc
 
             def mono_fn():
                 calls['n'] += 1
                 if calls['n'] == 1:
                     return 1000.0  # cmd_mono_start
                 if calls['n'] == 2:
-                    # Popen 後・process.wait() 直前: 子プロセスが完全に終了するまで待ってから wait_until を跨ぐ
-                    dl = time.monotonic() + 5.0
-                    while not done_marker.exists() and time.monotonic() < dl:
-                        time.sleep(0.01)
-                    time.sleep(0.05)
+                    # Popen 後・process.wait() 直前: 子プロセスの終了を直接待ってから wait_until を跨ぐ
+                    self.assertEqual(len(launched), 1)
+                    self.assertEqual(orig_wait(launched[0], timeout=5.0), 0)
                 return 1000.0 + obs
 
             wait_raised_timeout = []
-            orig_wait = subprocess.Popen.wait
+            wait_zero_returns = []
 
             def spy_wait(proc_self, *args, **kwargs):
+                timeout_arg = kwargs.get('timeout', args[0] if args else None)
                 try:
-                    return orig_wait(proc_self, *args, **kwargs)
+                    rc = orig_wait(proc_self, *args, **kwargs)
                 except subprocess.TimeoutExpired:
                     wait_raised_timeout.append(True)
                     raise
+                if timeout_arg == 0.0:
+                    wait_zero_returns.append(rc)
+                return rc
 
             chk = {'name': 'late', 'argv': [str(script_path)], 'timeout': timeout_sec, 'env': {}, 'clock_anomaly': False, 'skill': 's1', 'fault_threshold': 3}
-            with mock.patch.object(subprocess.Popen, 'wait', spy_wait):
+            with mock.patch.object(subprocess, 'Popen', capture_popen), \
+                    mock.patch.object(orig_popen, 'wait', spy_wait):
                 res = run_check_command(chk, self.repo, 1000.0 + tick_deadline_offset, mono_fn=mono_fn, kill_grace=0.1)
             self.assertEqual(wait_raised_timeout, [], 'test must exercise normal return from process.wait(timeout=0)')
+            self.assertEqual(wait_zero_returns, [0], 'runner must invoke process.wait(timeout=0) and observe normal exit')
             return res
 
         # (a) tick deadline が支配的 (timeout=10, tick_deadline=+5) -> aborted & exit_code=None
