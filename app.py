@@ -59,6 +59,14 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 
+def timestamp_after(previous):
+    current = utc_now()
+    if current <= previous:
+        with suppress(ValueError):
+            return (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
+    return current
+
+
 JSON_TYPES = {str: 'string', list: 'array', dict: 'object', bool: 'boolean', int: 'number', float: 'number', type(None): 'null'}
 
 
@@ -552,11 +560,7 @@ class Store:
 
     def stamp(self, connection, identifier, previous=''):
         latest = connection.execute('SELECT MAX(recorded_at) FROM answer_history WHERE decision_id=?', (identifier,)).fetchone()[0]
-        previous = max(previous, latest or '')
-        current = utc_now()
-        if current <= previous:
-            current = (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
-        return current
+        return timestamp_after(max(previous, latest or ''))
 
     def record(self, connection, row, event):
         connection.execute('INSERT INTO answer_history(decision_id,event,recorded_at,answer) VALUES(?,?,?,?)',
@@ -738,11 +742,13 @@ class Store:
                 after = {**dict(row), **item}
                 check_task_rules(after['kind'], after['done_when'], after['decision_id'])
             columns = ''.join(f'{key}=?,' for key in item)
-            connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?', (*item.values(), utc_now(), identifier))
+            connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?',
+                               (*item.values(), timestamp_after(row['updated_at']), identifier))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def reconcile_lane(self, identifier, lane, machine='', expect=None, *, pane=None, expect_pane=None,
-                       expect_machine=None, expect_run=None, expect_request=None, expect_kind=None):
+                       expect_machine=None, expect_run=None, expect_request=None, expect_kind=None,
+                       expect_remaining=None, expect_decision_id=None, expect_updated_at=None):
         """reconciler が観測した値が現在も一致する場合だけ、指定された担当の欄をまとめて書く。"""
         for name, value, optional in (('lane', lane, False), ('--from', expect, True)):
             if value not in LANES and not (optional and value is None):
@@ -763,7 +769,20 @@ class Store:
             if conditions[key] is not None:
                 text(conditions[key], '--from-' + key, TASK_LIMITS[key], empty=True)
         conditions = {key: value for key, value in conditions.items() if value is not None}
-        where = 'id=?' + ''.join(f' AND {key}=?' for key in conditions)
+        snapshot = (expect_remaining, expect_decision_id, expect_updated_at)
+        if snapshot != (None, None, None):
+            if None in snapshot:
+                raise AppError(400, '--from-remaining、--from-decision-id、--from-updated-at は一緒に指定してください')
+            conditions.update(validate_task({'remaining': expect_remaining, 'decision_id': expect_decision_id}))
+            conditions['updated_at'] = text(expect_updated_at, '--from-updated-at', 64)
+        where = 'id=?' + ''.join(f' AND {key} IS ?' for key in conditions)
+        if expect_remaining is not None and lane == 'done':
+            # 紐付いた判断の状態は task の更新時刻と独立して変わる。
+            where += ''' AND (decision_id IS NULL OR EXISTS (
+                SELECT 1 FROM decisions WHERE id=tasks.decision_id AND (status='completed' OR EXISTS (
+                    SELECT 1 FROM decision_changes WHERE decision_id=tasks.decision_id AND event='withdraw'
+                ))
+            ))'''
         params = (identifier, *conditions.values())
         assignment = {'lane': lane, 'machine': machine}
         if pane is not None:
@@ -771,19 +790,19 @@ class Store:
         columns = ','.join(f'{key}=?' for key in assignment)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            if pane is not None:
-                # 再試行では現在の担当を確認し、同じ値なら活動時刻を進めず応答する。
-                row = connection.execute(f'SELECT * FROM tasks WHERE {where}', params).fetchone()
-                if row and all(row[key] == value for key, value in assignment.items()):
-                    return dict(row)
-            if not connection.execute(f'UPDATE tasks SET {columns},updated_at=? WHERE {where}',
-                                      (*assignment.values(), utc_now(), *params)).rowcount:
+            row = connection.execute(f'SELECT * FROM tasks WHERE {where}', params).fetchone()
+            if not row:
                 current = connection.execute('SELECT lane FROM tasks WHERE id=?', (identifier,)).fetchone()
                 if not current:
                     raise AppError(404, 'task が見つかりません')
                 if conditions.keys() == {'lane'}:
                     raise LaneConflict(409, f'lane が違うため書きませんでした (今は {current["lane"]}、--from は {expect})')
                 raise LaneConflict(409, 'task が比較条件と一致しないため書きませんでした')
+            # 再試行で同じ担当を書き込む場合は活動時刻を進めない。
+            if pane is not None and all(row[key] == value for key, value in assignment.items()):
+                return dict(row)
+            connection.execute(f'UPDATE tasks SET {columns},updated_at=? WHERE {where}',
+                               (*assignment.values(), timestamp_after(row['updated_at']), *params))
             return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
 
     def delete_task(self, identifier):
@@ -1519,6 +1538,8 @@ def run_task(store, args):
             args.id, args.lane, args.machine, args.expect, pane=args.pane, expect_pane=args.expect_pane,
             expect_machine=args.expect_machine, expect_run=args.expect_run,
             expect_request=args.expect_request, expect_kind=args.expect_kind,
+            expect_remaining=args.expect_remaining, expect_decision_id=args.expect_decision_id,
+            expect_updated_at=args.expect_updated_at,
         )
     if args.task_command == 'update':
         payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision, 'kind': args.kind, 'done_when': args.done_when}
@@ -1941,6 +1962,10 @@ def main(argv=None):
             for key in ('pane', 'machine', 'run', 'request', 'kind'):
                 scope_help = '。--from-run / --from-request / --from-kind は一緒に指定' if key in ('run', 'request', 'kind') else ''
                 sub.add_argument('--from-' + key, dest='expect_' + key, help=f'書く前の {key}。空文字も比較する{scope_help}')
+            snapshot_help = '。--from-remaining / --from-decision-id / --from-updated-at は一緒に指定'
+            sub.add_argument('--from-remaining', dest='expect_remaining', help='書く前の remaining。空文字も比較する' + snapshot_help)
+            sub.add_argument('--from-decision-id', dest='expect_decision_id', help='書く前の decision_id。空文字は関連付けなし' + snapshot_help)
+            sub.add_argument('--from-updated-at', dest='expect_updated_at', help='書く前の updated_at' + snapshot_help)
         if name == 'list':
             sub.add_argument('--lane')
             sub.add_argument('--json', action='store_true')
