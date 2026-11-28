@@ -28,6 +28,7 @@ from app import (
     check_status_data,
     commit_check_run,
     parse_check_jsonl,
+    prune_check_history,
     run_check_command,
     run_check_tick,
     run_wake_pass,
@@ -1722,6 +1723,311 @@ sys.exit(2)
         ec_b, _out_b, _err_b, to_b, ab_b = run_case(5.0, 10.0)
         self.assertIsNone(ec_b)
         self.assertEqual((to_b, ab_b), (True, False))
+
+    def test_end_wake_and_pruning_charged_against_tick_deadline_with_finalize_reserve(self):
+        self.commit_config(
+            '[[checks]]\nname = "ev"\ninterval = 60\ncommand = "scripts/emit.py"\ntimeout = 10\nskill = "s1"\n',
+            {
+                'scripts/emit.py': (
+                    '#!/usr/bin/env python3\nimport json\n'
+                    'print(json.dumps({"key": "k1", "title": "t1", "body": "b1"}))\n'
+                    'print(json.dumps({"key": "k2", "title": "t2", "body": "b2"}))\n'
+                ),
+            },
+        )
+        # 初期 DB を作って 31 日前の古い履歴を仕込む
+        base_now = 1700000000.0
+        old_iso = datetime.fromtimestamp(base_now - 31 * 86400, timezone.utc).isoformat(timespec='microseconds')
+        run_check_tick(self.db, self.config, now_fn=lambda: base_now - 1000.0, deliver_fn=lambda c, t: True)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute('DELETE FROM check_ticks')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+            cur = conn.execute(
+                "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, ?, 'ok', 0, 0, 0)",
+                (old_iso, old_iso),
+            )
+            old_tick_id = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO check_runs(tick_id, check_name, started_at, finished_at, exit_code, outcome) VALUES(?, 'ev', ?, ?, 0, 'ok_silent')",
+                (old_tick_id, old_iso, old_iso),
+            )
+            old_run_id = cur.lastrowid
+
+        # (a) 最後の check が tick 開始 239 秒で完了 (budget=240s, reserve=2s -> end_work_deadline=238s)
+        # end wake も pruning も新規の 20s 予算を得ずにスキップされ、最終 status 記録だけ完了すること
+        clock = FakeClock(wall=base_now, mono=1000.0)
+        delivered = []
+
+        def slow_check_advancing_to_239(*args, **kwargs):
+            res = run_check_command(*args, **kwargs)
+            clock.advance(239.0)
+            return res
+
+        def record_deliver(cand, _timeout):
+            delivered.append(cand['task_id'])
+            return True
+
+        err_buf = io.StringIO()
+        with mock.patch('app.run_check_command', side_effect=slow_check_advancing_to_239), contextlib.redirect_stderr(err_buf):
+            body, rc = run_check_tick(
+                self.db, self.config,
+                now_fn=clock.now,
+                mono_fn=clock.monotonic,
+                tick_budget=240.0,
+                wake_pass_budget=20.0,
+                wake_item_timeout=5.0,
+                deliver_fn=record_deliver,
+            )
+        self.assertEqual((rc, body['status']), (0, 'ok'))
+        self.assertEqual(delivered, [])
+        self.assertEqual(body['unnotified_tasks'], 2)
+        self.assertIn('truncated=True', err_buf.getvalue())
+        # pruning は走っていない (239s >= end_work_deadline=238s)
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (old_run_id,)))
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_ticks WHERE id=?', (old_tick_id,)))
+
+        # (b) 残り 8s (t=230s, end_work_deadline=238s): end wake は 20s でなく 8s に制限され、
+        # 1 件目 (4s) の後で残り 4s < item_timeout(5s) により 2 件目を打ち切る。
+        # さらに pruning は deadline=238s までに実行できるバッチだけ実行する
+        clock2 = FakeClock(wall=base_now + 200.0, mono=2000.0)
+        delivered2 = []
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            # 開始時 wake ではなく終了時 wake を試すため、タスクを一旦消し check を due に戻す
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+
+        def check_advancing_to_230(*args, **kwargs):
+            res = run_check_command(*args, **kwargs)
+            clock2.advance(230.0)
+            return res
+
+        def deliver_taking_4s(cand, _timeout):
+            delivered2.append(cand['task_id'])
+            clock2.advance(4.0)
+            return True
+
+        with mock.patch('app.run_check_command', side_effect=check_advancing_to_230), contextlib.redirect_stderr(io.StringIO()):
+            body2, rc2 = run_check_tick(
+                self.db, self.config,
+                now_fn=clock2.now,
+                mono_fn=clock2.monotonic,
+                tick_budget=240.0,
+                wake_pass_budget=20.0,
+                wake_item_timeout=5.0,
+                deliver_fn=deliver_taking_4s,
+            )
+        self.assertEqual((rc2, body2['status']), (0, 'ok'))
+        self.assertEqual(len(delivered2), 1)
+        self.assertEqual(body2['unnotified_tasks'], 1)
+        # 234s < 238s なので pruning は実行されて古い行が消える
+        self.assertIsNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (old_run_id,)))
+        self.assertIsNone(self.query_one('SELECT id FROM check_ticks WHERE id=?', (old_tick_id,)))
+
+        # (c) prune_check_history 自体も deadline 到達で残バッチを打ち切る
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            for _ in range(2):
+                conn.execute(
+                    "INSERT INTO check_runs(tick_id, check_name, started_at, finished_at, exit_code, outcome) VALUES(1, 'ev', ?, ?, 0, 'ok_silent')",
+                    (old_iso, old_iso),
+                )
+        prune_ticks = [0.0, 10.0, 10.0]  # 1 バッチ目開始時は 0.0 < 5.0、2 バッチ目開始時は 10.0 >= 5.0
+        prune_idx = {'i': 0}
+
+        def prune_mono():
+            val = prune_ticks[min(prune_idx['i'], len(prune_ticks) - 1)]
+            prune_idx['i'] += 1
+            return val
+
+        finished_all = prune_check_history(
+            self.db, current_tick_id=999999,
+            cutoff_iso=datetime.fromtimestamp(base_now - 1000.0, timezone.utc).isoformat(timespec='microseconds'),
+            batch_size=1, deadline=5.0, mono_fn=prune_mono,
+        )
+        self.assertFalse(finished_all)
+        remaining_old = self.query_all('SELECT id FROM check_runs WHERE started_at = ?', (old_iso,))
+        self.assertEqual(len(remaining_old), 1)
+
+    def test_prune_preserves_parent_tick_of_retained_runs_until_runs_expire(self):
+        self.commit_config(
+            '[[checks]]\nname = "p1"\ninterval = 60\ncommand = "scripts/ok.sh"\ntimeout = 10\nskill = "s1"\n',
+            {'scripts/ok.sh': '#!/bin/sh\nexit 0\n'},
+        )
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+
+        iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec='microseconds')
+        t_tick = 1690000000.0  # 12:00:00 相当
+        t_cutoff_mid = t_tick + 30.0  # 12:00:30 相当
+        t_run = t_tick + 60.0  # 12:01:00 相当
+        t_cutoff_after = t_tick + 120.0  # 12:02:00 相当
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, ?, 'ok', 0, 0, 0)",
+                (iso(t_tick), iso(t_run + 5.0)),
+            )
+            parent_tick_id = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO check_runs(tick_id, check_name, started_at, finished_at, exit_code, outcome) VALUES(?, 'p1', ?, ?, 0, 'fired')",
+                (parent_tick_id, iso(t_run), iso(t_run + 1.0)),
+            )
+            retained_run_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO check_run_events(run_id, dedup_key, outcome, task_id) VALUES(?, 'k1', 'fired', 't_ret')",
+                (retained_run_id,),
+            )
+
+        # cutoff が tick と run の間にあるとき: run・event が保持されるため親 tick も消さない
+        prune_check_history(self.db, current_tick_id=999999, cutoff_iso=iso(t_cutoff_mid))
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (retained_run_id,)))
+        self.assertEqual(len(self.query_all('SELECT * FROM check_run_events WHERE run_id=?', (retained_run_id,))), 1)
+        self.assertIsNotNone(self.query_one('SELECT id FROM check_ticks WHERE id=?', (parent_tick_id,)))
+
+        # 最後の run が期限切れになった後は run・event・親 tick がすべて prune される
+        prune_check_history(self.db, current_tick_id=999999, cutoff_iso=iso(t_cutoff_after))
+        self.assertIsNone(self.query_one('SELECT id FROM check_runs WHERE id=?', (retained_run_id,)))
+        self.assertEqual(self.query_all('SELECT * FROM check_run_events WHERE run_id=?', (retained_run_id,)), [])
+        self.assertIsNone(self.query_one('SELECT id FROM check_ticks WHERE id=?', (parent_tick_id,)))
+
+    def test_commit_contention_retries_without_rerunning_command_and_fails_tick_if_unpersistable(self):
+        import threading
+
+        invocations_file = self.root / 'invocations.txt'
+        self.commit_config(
+            '[[checks]]\nname = "onetime"\ninterval = 60\ncommand = "scripts/onetime.py"\ntimeout = 10\nskill = "s1"\n',
+            {
+                'scripts/onetime.py': (
+                    '#!/usr/bin/env python3\nimport json, pathlib\n'
+                    f'p = pathlib.Path({str(invocations_file)!r})\n'
+                    'n = int(p.read_text()) + 1 if p.exists() else 1\n'
+                    'p.write_text(str(n))\n'
+                    'if n == 1:\n'
+                    '    print(json.dumps({"key": "once", "title": "one-time event", "body": "valuable"}))\n'
+                ),
+            },
+        )
+        # DB だけ先に初期化して、onetime は未実行のままにする
+        run_check_tick(self.db, self.config, now_fn=lambda: 1700000000.0, deliver_fn=lambda c, t: True)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+        if invocations_file.exists():
+            invocations_file.unlink()
+
+        # (a) 一時的な DB ロック競合: command を再実行せず commit をリトライして成功結果を保存する
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_writer(hold_sec):
+            conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                lock_acquired.set()
+                release_lock.wait(timeout=hold_sec)
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                conn.close()
+
+        orig_commit = commit_check_run
+        commit_attempts = [0]
+        holder_thread = [None]
+
+        def commit_with_transient_lock(*args, **kwargs):
+            commit_attempts[0] += 1
+            if commit_attempts[0] == 1:
+                t = threading.Thread(target=hold_writer, args=(0.25,), daemon=True)
+                holder_thread[0] = t
+                t.start()
+                self.assertTrue(lock_acquired.wait(timeout=3.0))
+            return orig_commit(*args, **kwargs)
+
+        with mock.patch('app.commit_check_run', side_effect=commit_with_transient_lock):
+            res_ok, rc_ok = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000100.0,
+                tick_budget=15.0,
+                commit_busy_timeout_ms=80,
+                deliver_fn=lambda c, t: True,
+            )
+        if holder_thread[0] is not None:
+            release_lock.set()
+            holder_thread[0].join(timeout=3.0)
+
+        self.assertEqual((rc_ok, res_ok['status']), (0, 'ok'))
+        self.assertGreaterEqual(commit_attempts[0], 2, 'commit should have retried after busy timeout')
+        self.assertEqual(int(invocations_file.read_text()), 1, 'one-time command must not be re-executed')
+        self.assertEqual(len(self.query_all("SELECT * FROM check_tasks WHERE dedup_key='once'")), 1)
+        self.assertEqual(self.query_one("SELECT outcome FROM check_runs WHERE check_name='onetime'")['outcome'], 'fired')
+
+        # (b) 残り budget を超える恒常的な競合 -> その後 writer が解放されても ok/exit 0 にせず failed tick & 非 0 終了
+        with contextlib.closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM check_tasks')
+            conn.execute('DELETE FROM tasks')
+            conn.execute('DELETE FROM check_runs')
+            conn.execute("UPDATE checks SET last_started=NULL, last_actual_started_at=NULL, last_outcome=NULL")
+        invocations_file.unlink()
+
+        err_buf = io.StringIO()
+        lock_acquired2 = threading.Event()
+        release_lock2 = threading.Event()
+        holder2 = [None]
+
+        def hold_writer_until_released():
+            conn = sqlite3.connect(self.db, timeout=5.0, isolation_level=None)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                lock_acquired2.set()
+                release_lock2.wait(timeout=10.0)
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                conn.close()
+
+        orig_run_cmd = run_check_command
+
+        def start_writer_after_command(*args, **kwargs):
+            res = orig_run_cmd(*args, **kwargs)
+            t = threading.Thread(target=hold_writer_until_released, daemon=True)
+            holder2[0] = t
+            t.start()
+            self.assertTrue(lock_acquired2.wait(timeout=3.0))
+            return res
+
+        # commit が失敗してリトライを諦めた直後に writer を解放する (finalization が走れる状況を作る)
+        orig_commit_retry = sys.modules['app']._commit_check_run_with_retry
+
+        def release_after_commit_fails(*args, **kwargs):
+            try:
+                return orig_commit_retry(*args, **kwargs)
+            finally:
+                release_lock2.set()
+                if holder2[0] is not None:
+                    holder2[0].join(timeout=3.0)
+
+        with mock.patch('app.run_check_command', side_effect=start_writer_after_command), \
+                mock.patch('app._commit_check_run_with_retry', side_effect=release_after_commit_fails), \
+                contextlib.redirect_stderr(err_buf):
+            res_fail, rc_fail = run_check_tick(
+                self.db, self.config,
+                now_fn=lambda: 1700000200.0,
+                tick_budget=0.6,
+                finalize_reserve=0.25,
+                commit_busy_timeout_ms=60,
+                deliver_fn=lambda c, t: True,
+            )
+        self.assertEqual(rc_fail, 1)
+        self.assertEqual(res_fail['status'], 'failed')
+        self.assertEqual(int(invocations_file.read_text()), 1)
+        tick_row = self.query_one('SELECT status FROM check_ticks WHERE id=?', (res_fail['tick_id'],))
+        self.assertEqual(tick_row['status'], 'failed')
+        self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
+        self.assertIn('failed to commit check run', err_buf.getvalue())
 
 
 if __name__ == '__main__':

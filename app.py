@@ -1862,6 +1862,8 @@ def list_claims(store, directory, identifier=None):
 
 
 CHECK_TICK_BUDGET_SEC = 240.0
+CHECK_FINALIZE_RESERVE_SEC = 2.0
+CHECK_COMMIT_BUSY_TIMEOUT_MS = 5000
 CHECK_WAKE_PASS_BUDGET_SEC = 20.0
 CHECK_WAKE_ITEM_TIMEOUT_SEC = 5.0
 CHECK_WAKE_CB_LIMIT = 2
@@ -2009,6 +2011,7 @@ def ensure_check_schema(db_path):
                 clock_anomaly INTEGER NOT NULL DEFAULT 0)''')
             connection.execute('CREATE INDEX IF NOT EXISTS check_runs_started ON check_runs(started_at)')
             connection.execute('CREATE INDEX IF NOT EXISTS check_runs_check ON check_runs(check_name, id)')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_runs_tick ON check_runs(tick_id)')
             connection.execute('''CREATE TABLE IF NOT EXISTS check_run_events (
                 id INTEGER PRIMARY KEY,
                 run_id INTEGER NOT NULL,
@@ -2590,9 +2593,20 @@ def run_check_command(chk, config_dir, tick_deadline, *, mono_fn=time.monotonic,
     return exit_code, raw_stdout, raw_stderr, timed_out, aborted
 
 
+def _is_sqlite_retryable_contention(error):
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    errcode = getattr(error, 'sqlite_errorcode', None)
+    if errcode is not None and (errcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    msg = str(error).lower()
+    return 'locked' in msg or 'busy' in msg
+
+
 def commit_check_run(
     db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
     *, exit_code, raw_stdout, raw_stderr, timed_out, aborted,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
 ):
     """1 回の check 実行結果を 1 つの BEGIN IMMEDIATE トランザクションで確定する。
     aborted の場合は check_runs の INSERT のみを行い、checks の実行状態カラムは一切更新しない。"""
@@ -2612,7 +2626,7 @@ def commit_check_run(
         valid, events = parse_check_jsonl(raw_stdout)
         pre_outcome = None if valid else 'failed_output'
 
-    with _check_db(db_path) as connection:
+    with _check_db(db_path, busy_timeout_ms=busy_timeout_ms) as connection:
         connection.execute('BEGIN IMMEDIATE')
         if pre_outcome == 'aborted':
             cursor = connection.execute(
@@ -2855,9 +2869,50 @@ def run_wake_pass(
     return failed_ids, truncated, attempted
 
 
-def prune_check_history(db_path, current_tick_id, cutoff_iso, *, batch_size=CHECK_PRUNE_BATCH):
-    """30 日を超えた check_runs / check_run_events / check_ticks を小さいバッチに分けて削除する。"""
+def _commit_check_run_with_retry(
+    db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
+    *, exit_code, raw_stdout, raw_stderr, timed_out, aborted,
+    retry_deadline, mono_fn, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+):
+    """SQLite の一時的な書き込み競合 (locked / busy) に対し、command を再実行せず残り budget 内で commit を再試行する。"""
+    retry_mono_start = mono_fn()
+    retry_budget = max(0.0, retry_deadline - retry_mono_start)
+    retry_real_deadline = time.monotonic() + retry_budget
     while True:
+        mono_rem = retry_deadline - mono_fn()
+        real_rem = retry_real_deadline - time.monotonic()
+        rem = min(mono_rem, real_rem)
+        attempt_busy_ms = min(
+            int(busy_timeout_ms),
+            max(50, int(rem * 1000)) if rem > 0 else min(int(busy_timeout_ms), 500),
+        )
+        try:
+            return commit_check_run(
+                db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
+                exit_code=exit_code, raw_stdout=raw_stdout, raw_stderr=raw_stderr,
+                timed_out=timed_out, aborted=aborted,
+                busy_timeout_ms=attempt_busy_ms,
+            )
+        except sqlite3.Error as db_error:
+            if not _is_sqlite_retryable_contention(db_error):
+                raise
+            mono_rem = retry_deadline - mono_fn()
+            real_rem = retry_real_deadline - time.monotonic()
+            rem = min(mono_rem, real_rem)
+            if rem <= 0:
+                raise
+            time.sleep(min(0.05, rem))
+
+
+def prune_check_history(
+    db_path, current_tick_id, cutoff_iso, *,
+    batch_size=CHECK_PRUNE_BATCH, deadline=None, mono_fn=time.monotonic,
+):
+    """30 日を超えた check_runs / check_run_events / check_ticks を小さいバッチに分けて削除する。
+    deadline が指定されている場合は残り budget 内のバッチのみ実行し、保持される run を持つ親 tick は削除しない。"""
+    while True:
+        if deadline is not None and mono_fn() >= deadline:
+            return False
         with _check_db(db_path) as connection:
             connection.execute('BEGIN IMMEDIATE')
             run_ids = [
@@ -2874,12 +2929,18 @@ def prune_check_history(db_path, current_tick_id, cutoff_iso, *, batch_size=CHEC
             connection.execute(f'DELETE FROM check_runs WHERE id IN ({marks})', run_ids)
 
     while True:
+        if deadline is not None and mono_fn() >= deadline:
+            return False
         with _check_db(db_path) as connection:
             connection.execute('BEGIN IMMEDIATE')
             tick_ids = [
                 row['id']
                 for row in connection.execute(
-                    'SELECT id FROM check_ticks WHERE started_at < ? AND id != ? ORDER BY id LIMIT ?',
+                    '''SELECT id FROM check_ticks
+                       WHERE started_at < ?
+                         AND id != ?
+                         AND NOT EXISTS (SELECT 1 FROM check_runs WHERE check_runs.tick_id = check_ticks.id)
+                       ORDER BY id LIMIT ?''',
                     (cutoff_iso, current_tick_id, batch_size),
                 )
             ]
@@ -2887,6 +2948,7 @@ def prune_check_history(db_path, current_tick_id, cutoff_iso, *, batch_size=CHEC
                 break
             marks = ','.join('?' * len(tick_ids))
             connection.execute(f'DELETE FROM check_ticks WHERE id IN ({marks})', tick_ids)
+    return True
 
 
 def run_check_tick(
@@ -2897,6 +2959,8 @@ def run_check_tick(
     wake_pass_budget=CHECK_WAKE_PASS_BUDGET_SEC,
     wake_item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
     kill_grace=CHECK_KILL_GRACE_SEC,
+    finalize_reserve=None,
+    commit_busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
     deliver_fn=None,
 ):
     """app.py check tick の本体。設計書 (issue-701-v9) の処理順 (1)〜(9) を厳密に実行する。"""
@@ -2997,8 +3061,15 @@ def run_check_tick(
         # (6) due な check の実行
         due_checks = select_due_checks(db_path, checks_cfg, tick_started_ts)
         tick_deadline = mono_start + tick_budget
+        effective_reserve = (
+            min(CHECK_FINALIZE_RESERVE_SEC, max(0.0, float(tick_budget) * 0.1))
+            if finalize_reserve is None
+            else max(0.0, float(finalize_reserve))
+        )
+        end_work_deadline = tick_deadline - effective_reserve
         checks_deferred = 0
         tick_status = 'ok'
+        tick_exit_code = 0
 
         if (tick_deadline - mono_fn()) <= 0:
             # step (6) 開始時点で残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
@@ -3023,38 +3094,50 @@ def run_check_tick(
                 )
                 finished_run_iso = now_iso_fn()
                 try:
-                    run_result = commit_check_run(
+                    run_result = _commit_check_run_with_retry(
                         db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_run_iso,
                         exit_code=exit_code, raw_stdout=raw_stdout, raw_stderr=raw_stderr,
                         timed_out=timed_out, aborted=aborted,
+                        retry_deadline=end_work_deadline, mono_fn=mono_fn,
+                        busy_timeout_ms=commit_busy_timeout_ms,
                     )
                 except sqlite3.Error as db_error:
                     print(f"error: failed to commit check run {chk['name']!r}: {db_error}", file=sys.stderr)
-                    if aborted:
-                        checks_deferred += len(due_checks) - idx - 1
-                        tick_status = 'aborted'
-                        break
-                    continue
+                    checks_deferred += len(due_checks) - idx - 1
+                    tick_status = 'failed'
+                    tick_exit_code = 1
+                    break
 
                 if run_result['outcome'] == 'aborted':
                     checks_deferred += len(due_checks) - idx - 1
                     tick_status = 'aborted'
                     break
 
-        # (7) tick 終了時 wake と (8) prune (step (6) が aborted の場合は飛ばす)
-        if tick_status != 'aborted':
-            end_failed, end_truncated, _ = run_wake_pass(
-                db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
-                run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
-                skip_task_ids=start_failed,
-                pass_budget=wake_pass_budget, item_timeout=wake_item_timeout,
-                deliver_fn=deliver_fn,
-            )
-            all_failed |= end_failed
-            any_wake_truncated = any_wake_truncated or end_truncated
+        # (7) tick 終了時 wake と (8) prune (step (6) が aborted / failed の場合は飛ばす。
+        # end 側の任意作業は tick の残り budget (finalize 予約を除く) 内に制限する)
+        end_wake_skipped_by_budget = False
+        if tick_status == 'ok':
+            remaining_for_end = max(0.0, end_work_deadline - mono_fn())
+            if remaining_for_end > 0:
+                end_wake_budget = min(wake_pass_budget, remaining_for_end)
+                end_failed, end_truncated, _ = run_wake_pass(
+                    db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
+                    run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
+                    skip_task_ids=start_failed,
+                    pass_budget=end_wake_budget, item_timeout=wake_item_timeout,
+                    deliver_fn=deliver_fn,
+                )
+                all_failed |= end_failed
+                any_wake_truncated = any_wake_truncated or end_truncated
+            else:
+                end_wake_skipped_by_budget = True
 
-            cutoff_iso = _iso_utc(tick_started_ts - CHECK_RETENTION_DAYS * 86400)
-            prune_check_history(db_path, tick_id, cutoff_iso)
+            if mono_fn() < end_work_deadline:
+                cutoff_iso = _iso_utc(tick_started_ts - CHECK_RETENTION_DAYS * 86400)
+                prune_check_history(
+                    db_path, tick_id, cutoff_iso,
+                    deadline=end_work_deadline, mono_fn=mono_fn,
+                )
 
         # (9) check_ticks を最終 status に UPDATE
         finished_iso = now_iso_fn()
@@ -3066,6 +3149,9 @@ def run_check_tick(
                 (finished_iso, tick_status, len(all_failed), unnotified, checks_deferred, tick_id),
             )
 
+        if end_wake_skipped_by_budget and unnotified > 0:
+            any_wake_truncated = True
+
         if all_failed or any_wake_truncated:
             print(
                 f'warning: check tick wake issue (wake_failed={len(all_failed)}, truncated={any_wake_truncated}, unnotified={unnotified})',
@@ -3076,7 +3162,7 @@ def run_check_tick(
             'tick_id': tick_id, 'status': tick_status, 'started_at': tick_started_iso,
             'finished_at': finished_iso, 'wake_failed': len(all_failed),
             'unnotified_tasks': unnotified, 'checks_deferred': checks_deferred,
-        }, 0
+        }, tick_exit_code
     finally:
         with suppress(OSError):
             os.close(lock_fd)
