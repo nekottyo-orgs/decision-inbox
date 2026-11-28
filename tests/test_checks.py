@@ -240,6 +240,36 @@ sys.exit(2)
         finally:
             os.close(fd)
 
+    def test_skip_on_legacy_db_without_check_ticks_warns_without_running_ddl(self):
+        # 既存 Store DB (check_ticks 表なし・WAL 未切替) を用意して flock を保持したまま tick を実行
+        Store(self.db)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            mode_before = conn.execute('PRAGMA journal_mode').fetchone()[0].lower()
+            tables_before = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn('check_ticks', tables_before)
+
+        lock_file = check_lock_path(self.db)
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            res = self.cli('check', 'tick', '--config', str(self.config))
+            self.assertEqual(res.returncode, 0)
+            body = json.loads(res.stdout)
+            self.assertEqual(body['status'], 'skipped')
+            self.assertIsNone(body['tick_id'])
+            self.assertIn('warning: check tick skipped', res.stderr)
+        finally:
+            os.close(fd)
+
+        # skip 経路では DDL も WAL 切替も実行されないこと
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            mode_after = conn.execute('PRAGMA journal_mode').fetchone()[0].lower()
+            tables_after = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertEqual(mode_after, mode_before)
+        for tbl in ('checks', 'check_runs', 'check_run_events', 'check_ticks', 'check_tasks'):
+            self.assertNotIn(tbl, tables_after)
+
     def test_symlink_db_path_shares_lockfile_with_real_path(self):
         self.commit_config(
             '[[checks]]\nname = "c1"\ninterval = 300\ncommand = "scripts/ok.sh"\ntimeout = 30\nskill = "s1"\n',
